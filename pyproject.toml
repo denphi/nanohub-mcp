@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nanohub-mcp"
+dynamic = ["version"]
+description = "MCP (Model Context Protocol) server library for nanoHUB tools"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "nanoHUB", email = "support@nanohub.org"}
+]
+maintainers = [
+    {name = "nanoHUB", email = "support@nanohub.org"}
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "nanohub",
+    "hubzero",
+    "ai",
+    "llm",
+    "tools",
+    "sse",
+    "server-sent-events"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.6",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+requires-python = ">=3.6"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "black>=23.0",
+    "mypy>=1.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://nanohub.org"
+Documentation = "https://nanohub.org/documentation"
+Repository = "https://github.com/nanohub/nanohub-mcp"
+Issues = "https://github.com/nanohub/nanohub-mcp/issues"
+
+[project.scripts]
+nanohub-mcp = "nanohubmcp.cli:main"
+start_mcp = "nanohubmcp.cli:start_mcp_main"
+
+[tool.setuptools.dynamic]
+version = {attr = "nanohubmcp._version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["nanohubmcp*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py36", "py37", "py38", "py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I", "N", "UP"]
+
+[tool.mypy]
+python_version = "3.6"
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
