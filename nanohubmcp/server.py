@@ -490,10 +490,13 @@ class MCPServer(object):
                     if response:
                         server_instance._broadcast(response)
 
+                    body = b"{\"status\":\"accepted\"}"
                     self.send_response(202)
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
+                    self.wfile.write(body)
 
                 except Exception as e:
                     print("Error handling POST: {}".format(e))
