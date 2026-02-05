@@ -175,8 +175,8 @@ def shutdown(signum, frame):
             proc.terminate()
 
 
-def write_mcp_runner(app_path, host, port):
-    # type: (str, str, int) -> str
+def write_mcp_runner(app_path, host, port, path_prefix=""):
+    # type: (str, str, int, str) -> str
     """
     Create a temporary Python runner script for the MCP server.
 
@@ -184,6 +184,7 @@ def write_mcp_runner(app_path, host, port):
         app_path: Path to the user's MCP app file
         host: Host to bind to
         port: Port to listen on
+        path_prefix: URL path prefix for proxy environments
 
     Returns:
         str: Path to the generated temporary runner script.
@@ -198,6 +199,7 @@ app_dir = {app_dir!r}
 app_path = {app_path!r}
 host = {host!r}
 port = {port!r}
+path_prefix = {path_prefix!r}
 
 # Add app directory to path
 if app_dir not in sys.path:
@@ -214,11 +216,11 @@ spec.loader.exec_module(module)
 if hasattr(module, "server"):
     server = module.server
     print("MCP Server ready!", flush=True)
-    server.run(host=host, port=port)
+    server.run(host=host, port=port, path_prefix=path_prefix)
 else:
     print("Error: No 'server' variable found in app file", flush=True)
     sys.exit(1)
-""".format(app_dir=app_dir, app_path=app_path, host=host, port=port, mod=mod)
+""".format(app_dir=app_dir, app_path=app_path, host=host, port=port, path_prefix=path_prefix, mod=mod)
 
     fd, path = tempfile.mkstemp(prefix="mcp_runner_", suffix=".py")
     with os.fdopen(fd, "w") as f:
@@ -413,17 +415,23 @@ def _start_with_proxy(app_path, args):
 
     if wrwroxy_version:
         # wrwroxy available: MCP on 8001, proxy on 8000
+        # wrwroxy strips the prefix, so the MCP server sees clean paths
         mcp_port = 8001
         proxy_port = 8000
+        path_prefix = ""
     else:
         # No wrwroxy: MCP listens directly on 8000
+        # Requests arrive with the full weber prefix, so the server must handle it
         print("Warning: No wrwroxy version found, running MCP server directly on port 8000", flush=True)
         mcp_port = 8000
+        path_prefix = p_path
 
     print("Proxy URL : {}".format(p_url), flush=True)
     print("MCP port  : {}".format(mcp_port), flush=True)
     if wrwroxy_version:
         print("Proxy port: {}".format(proxy_port), flush=True)
+    if path_prefix:
+        print("Path prefix: {}".format(path_prefix), flush=True)
 
     # Set up environment for subprocess
     env = os.environ.copy()
@@ -431,7 +439,7 @@ def _start_with_proxy(app_path, args):
     env["PYTHONPATH"] = app_dir + os.pathsep + env.get("PYTHONPATH", "")
 
     # Create runner script
-    runner = write_mcp_runner(app_path, args.host, mcp_port)
+    runner = write_mcp_runner(app_path, args.host, mcp_port, path_prefix=path_prefix)
 
     # Launch MCP server
     print("Starting MCP server", flush=True)

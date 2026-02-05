@@ -402,17 +402,35 @@ class MCPServer(object):
         for client_queue in self._clients:
             client_queue.append(json_str)
 
-    def run(self, host="0.0.0.0", port=8000):
-        # type: (str, int) -> None
-        """Start the MCP server."""
+    def run(self, host="0.0.0.0", port=8000, path_prefix=""):
+        # type: (str, int, str) -> None
+        """Start the MCP server.
+
+        Args:
+            host: Host to bind to.
+            port: Port to listen on.
+            path_prefix: URL path prefix (e.g. '/weber/.../') for proxy environments.
+                         Routes will be matched with or without this prefix.
+        """
         server_instance = self
+        _prefix = path_prefix.rstrip("/") if path_prefix else ""
 
         class MCPRequestHandler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
                 print("[{}] {}".format(self.log_date_time_string(), format % args))
 
+            def _strip_prefix(self):
+                """Strip the path prefix to get the local route."""
+                path = self.path
+                if _prefix and path.startswith(_prefix):
+                    path = path[len(_prefix):]
+                if not path.startswith("/"):
+                    path = "/" + path
+                return path
+
             def do_GET(self):
-                if self.path.endswith("/sse") or self.path == "/sse":
+                path = self._strip_prefix()
+                if path.rstrip("/") == "/sse" or path == "/sse":
                     self._handle_sse()
                 else:
                     self.send_response(200)
