@@ -373,9 +373,10 @@ def _find_wrwroxy():
         return None
 
     # Collect all wrwroxy-* entries
+    # The 'use' output format is "package-version:" so strip trailing colons
     versions = []
     for token in available.split():
-        token = token.strip()
+        token = token.strip().rstrip(":")
         if token.startswith("wrwroxy-"):
             versions.append(token)
 
