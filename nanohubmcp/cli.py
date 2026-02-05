@@ -353,6 +353,41 @@ def _start_directly(app_path, args):
         server.run(host=args.host, port=args.port)
 
 
+def _find_wrwroxy():
+    # type: () -> str or None
+    """
+    Find an available wrwroxy version using 'use'.
+
+    The 'use' command prints available packages to stderr.
+    Returns the version string (e.g. 'wrwroxy-0.3') or None if not found.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["bash", "-lc", "use"],
+            capture_output=True, text=True, timeout=10
+        )
+        available = result.stderr.strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+    # Collect all wrwroxy-* entries
+    versions = []
+    for token in available.split():
+        token = token.strip()
+        if token.startswith("wrwroxy-"):
+            versions.append(token)
+
+    if not versions:
+        return None
+
+    # Sort descending so the newest version is tried first
+    versions.sort(reverse=True)
+    print("Available wrwroxy versions: {}".format(", ".join(versions)), flush=True)
+    return versions[0]
+
+
 def _start_with_proxy(app_path, args):
     # type: (str, argparse.Namespace) -> int
     """Start MCP server with wrwroxy on nanoHUB."""
@@ -372,13 +407,22 @@ def _start_with_proxy(app_path, args):
         print("Warning: Could not get proxy configuration, falling back to direct mode", flush=True)
         return _start_directly(app_path, args)
 
-    # MCP runs on 8001, proxy on 8000
-    mcp_port = 8001
-    proxy_port = 8000
+    # Check if wrwroxy is available
+    wrwroxy_version = _find_wrwroxy()
+
+    if wrwroxy_version:
+        # wrwroxy available: MCP on 8001, proxy on 8000
+        mcp_port = 8001
+        proxy_port = 8000
+    else:
+        # No wrwroxy: MCP listens directly on 8000
+        print("Warning: No wrwroxy version found, running MCP server directly on port 8000", flush=True)
+        mcp_port = 8000
 
     print("Proxy URL : {}".format(p_url), flush=True)
     print("MCP port  : {}".format(mcp_port), flush=True)
-    print("Proxy port: {}".format(proxy_port), flush=True)
+    if wrwroxy_version:
+        print("Proxy port: {}".format(proxy_port), flush=True)
 
     # Set up environment for subprocess
     env = os.environ.copy()
@@ -392,23 +436,28 @@ def _start_with_proxy(app_path, args):
     print("Starting MCP server", flush=True)
     mcpProcess = Popen([python_executable, runner], env=env)
 
-    # Launch wrwroxy reverse proxy
-    wrw_cmd = (
-        "use -e wrwroxy-0.2 && "
-        "exec wrwroxy "
-        "--listenHost 0.0.0.0 "
-        "--listenPort {} "
-        "--forwardHost 127.0.0.1 "
-        "--forwardPort {} ".format(proxy_port, mcp_port)
-    )
-    if args.debug:
-        wrw_cmd += " --stream-log"
+    # Launch wrwroxy reverse proxy (only if available)
+    if wrwroxy_version:
+        wrw_cmd = (
+            "use -e {version} && "
+            "exec wrwroxy "
+            "--listenHost 0.0.0.0 "
+            "--listenPort {proxy_port} "
+            "--forwardHost 127.0.0.1 "
+            "--forwardPort {mcp_port} ".format(
+                version=wrwroxy_version,
+                proxy_port=proxy_port,
+                mcp_port=mcp_port,
+            )
+        )
+        if args.debug:
+            wrw_cmd += " --stream-log"
 
-    print("Starting wrwroxy", flush=True)
-    wrw_env = os.environ.copy()
-    session, _ = get_session()
-    wrw_env['SESSION'] = session
-    wrwProcess = Popen(["bash", "-lc", wrw_cmd], env=wrw_env)
+        print("Starting {} proxy".format(wrwroxy_version), flush=True)
+        wrw_env = os.environ.copy()
+        session, _ = get_session()
+        wrw_env['SESSION'] = session
+        wrwProcess = Popen(["bash", "-lc", wrw_cmd], env=wrw_env)
 
     print("MCP Server ready! Access it at: {}".format(p_url), flush=True)
     print("SSE endpoint: {}sse".format(p_url), flush=True)
@@ -419,11 +468,6 @@ def _start_with_proxy(app_path, args):
     return rc
 
 
-def main():
-    """Main entry point for 'nanohub-mcp' command (alias for start_mcp)."""
-    start_mcp_main()
-
-
 if __name__ == "__main__":
     # Register signal handlers for graceful shutdown
     for s in (signal.SIGINT, signal.SIGTERM):
@@ -432,4 +476,4 @@ if __name__ == "__main__":
     if hasattr(signal, 'SIGHUP'):
         signal.signal(signal.SIGHUP, shutdown)
 
-    main()
+    start_mcp_main()

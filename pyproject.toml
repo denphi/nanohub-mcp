@@ -61,7 +61,6 @@ Repository = "https://github.com/nanohub/nanohub-mcp"
 Issues = "https://github.com/nanohub/nanohub-mcp/issues"
 
 [project.scripts]
-nanohub-mcp = "nanohubmcp.cli:main"
 start_mcp = "nanohubmcp.cli:start_mcp_main"
 
 [tool.setuptools.dynamic]

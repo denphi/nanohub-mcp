@@ -86,7 +86,6 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "nanohub-mcp=nanohubmcp.cli:main",
             "start_mcp=nanohubmcp.cli:start_mcp_main",
         ],
     },
