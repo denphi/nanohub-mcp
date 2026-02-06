@@ -127,6 +127,98 @@ Direct tool call:
      -H "Content-Type: application/json" \
      -d '{"a": 7, "b": 3}'
 
+Using the nanoHUB API
+---------------------
+
+Use the nanoHUB API when calling tools from outside a nanoHUB session. All endpoints require a Bearer token.
+
+**Base URL:**
+
+.. code-block:: text
+
+   https://nanohub.org
+
+**Recommended: Streamable HTTP (auto-session)**
+
+.. code-block:: bash
+
+   API_BASE="https://nanohub.org"
+   TOOL="mcpdemo"
+   TOKEN="your_token"
+
+   # Get connection info (creates or reuses a session)
+   curl -H "Authorization: Bearer $TOKEN" \
+     "$API_BASE/api/mcp/$TOOL/mcp"
+
+   # Initialize
+   curl -H "Authorization: Bearer $TOKEN" -X POST "$API_BASE/api/mcp/$TOOL/mcp" \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"example-client","version":"0.1.0"}}}'
+
+   # List tools
+   curl -H "Authorization: Bearer $TOKEN" -X POST "$API_BASE/api/mcp/$TOOL/mcp" \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+
+   # Call a tool
+   curl -H "Authorization: Bearer $TOKEN" -X POST "$API_BASE/api/mcp/$TOOL/mcp" \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}'
+
+**Direct JSON-RPC (session-aware)**
+
+Use these endpoints if you want to pin or reuse a session id:
+
+.. code-block:: text
+
+   POST /api/mcp/{tool}           # creates a session if not provided
+   POST /api/mcp/{tool}/{session} # uses an existing session
+
+**Direct tool calls (REST/OpenAPI style)**
+
+.. code-block:: bash
+
+   # Call a tool directly
+   curl -H "Authorization: Bearer $TOKEN" -X POST "$API_BASE/api/mcp/$TOOL/tools/add" \
+     -H "Content-Type: application/json" \
+     -d '{"a": 7, "b": 3}'
+
+   # Fetch OpenAPI schema for the tool
+   curl -H "Authorization: Bearer $TOKEN" \
+     "$API_BASE/api/mcp/$TOOL/openapi.json"
+
+**SSE connection info**
+
+If you need SSE transport, the API will return the proxy endpoint and cookie you must use:
+
+.. code-block:: bash
+
+   curl -H "Authorization: Bearer $TOKEN" \
+     "$API_BASE/api/mcp/$TOOL/sse"
+
+The response includes ``sse_endpoint``, ``post_endpoint``, and ``cookie_header``. Connect to
+``sse_endpoint`` with the cookie header and POST JSON-RPC to ``post_endpoint``.
+
+**Revision selection**
+
+Most endpoints accept an optional ``revision`` query parameter (``default``, ``dev``, ``test``,
+or a specific version). Example:
+
+.. code-block:: bash
+
+   curl -H "Authorization: Bearer $TOKEN" \
+     "$API_BASE/api/mcp/$TOOL/mcp?revision=dev"
+
+**Reference client**
+
+See ``App/nanohub_mcp_client.py`` for a complete stdio-to-nanoHUB MCP bridge. It uses:
+
+.. code-block:: text
+
+   NANOHUB_TOKEN=...   # API token (required)
+   NANOHUB_API=...     # Base URL (default: https://nanohub.org)
+   NANOHUB_TOOLS=...   # Comma-separated tool list (default: mcpdemo)
+
 
 Local Development
 -----------------
