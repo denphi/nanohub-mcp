@@ -7,7 +7,7 @@ name = "nanohub-mcp"
 dynamic = ["version"]
 description = "MCP (Model Context Protocol) server library for nanoHUB tools"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "nanoHUB", email = "support@nanohub.org"}
 ]
@@ -29,7 +29,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.6",

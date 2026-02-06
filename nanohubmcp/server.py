@@ -70,6 +70,12 @@ class MCPServer(object):
             return "Tell me about {}".format(topic)
 
         server.run()
+
+    Proxy Support:
+        When running behind a reverse proxy that rewrites URIs (like weber),
+
+        server = MCPServer("my-tool")
+
     """
 
     def __init__(
@@ -78,6 +84,13 @@ class MCPServer(object):
         version="1.0.0"  # type: str
     ):
         # type: (...) -> None
+        """
+        Initialize an MCP server.
+
+        Args:
+            name: Server name
+            version: Server version
+        """
         self.name = name
         self.version = version
 
@@ -316,17 +329,22 @@ class MCPServer(object):
                         }
 
             elif method == "resources/list":
-                result = {
-                    "resources": [r["definition"].to_dict() for r in self._resources.values()]
-                }
+                resources = []
+                for r in self._resources.values():
+                    resource_dict = r["definition"].to_dict()
+                    resources.append(resource_dict)
+                result = {"resources": resources}
 
             elif method == "resources/read":
                 uri = params.get("uri")
 
-                if uri not in self._resources:
+                # Strip proxy prefix from URI for lookup
+                lookup_uri = self._strip_proxy_prefix(uri) if uri else uri
+
+                if lookup_uri not in self._resources:
                     error = {"code": -32601, "message": "Resource not found: {}".format(uri)}
                 else:
-                    handler = self._resources[uri]["handler"]
+                    handler = self._resources[lookup_uri]["handler"]
                     try:
                         content = self._call_handler(handler, msg_id)
 
@@ -430,8 +448,18 @@ class MCPServer(object):
 
             def do_GET(self):
                 path = self._strip_prefix()
-                if path.rstrip("/") == "/sse" or path == "/sse":
+                # Remove query string for path matching
+                path_only = path.split("?")[0]
+
+                if path_only.rstrip("/") == "/sse" or path_only == "/sse":
                     self._handle_sse()
+                elif path_only.rstrip("/") == "/mcp" or path_only == "/mcp":
+                    # Streamable HTTP - GET returns SSE stream for responses
+                    self._handle_streamable_http_get()
+                elif path_only == "/openapi.json":
+                    self._handle_openapi()
+                elif path_only == "/.well-known/mcp.json":
+                    self._handle_mcp_discovery()
                 else:
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
@@ -443,7 +471,12 @@ class MCPServer(object):
                         "status": "running",
                         "tools": len(server_instance._tools),
                         "resources": len(server_instance._resources),
-                        "prompts": len(server_instance._prompts)
+                        "prompts": len(server_instance._prompts),
+                        "endpoints": {
+                            "sse": "/sse",
+                            "mcp": "/mcp",
+                            "openapi": "/openapi.json"
+                        }
                     }
                     self.wfile.write(json.dumps(info).encode("utf-8"))
 
@@ -479,19 +512,35 @@ class MCPServer(object):
 
             def do_POST(self):
                 try:
+                    path = self._strip_prefix()
+                    path_only = path.split("?")[0]
                     content_length = int(self.headers.get("Content-Length", 0))
                     post_data = self.rfile.read(content_length)
                     request = json.loads(post_data.decode("utf-8"))
 
+                    # Check for direct tool call via /tools/{name}
+                    if path_only.startswith("/tools/"):
+                        tool_name = path_only[7:]  # Strip "/tools/"
+                        self._handle_direct_tool_call(tool_name, request)
+                        return
+
+                    # Standard MCP JSON-RPC handling (for /mcp and root POST)
                     print("Received: {}".format(request.get("method", "unknown")))
 
                     response = server_instance._handle_request(request)
 
+                    # Broadcast to SSE clients
                     if response:
                         server_instance._broadcast(response)
 
-                    body = b"{\"status\":\"accepted\"}"
-                    self.send_response(202)
+                    # Return response synchronously (for non-SSE clients)
+                    if response:
+                        body = json.dumps(response).encode("utf-8")
+                        self.send_response(200)
+                    else:
+                        body = b"{\"status\":\"accepted\"}"
+                        self.send_response(202)
+
                     self.send_header("Access-Control-Allow-Origin", "*")
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
@@ -503,11 +552,167 @@ class MCPServer(object):
                     traceback.print_exc()
                     self.send_error(500, str(e))
 
+            def _handle_direct_tool_call(self, tool_name, arguments):
+                """Handle direct REST-style tool call (OpenAPI compatible)."""
+                if tool_name not in server_instance._tools:
+                    self.send_error(404, "Tool not found: {}".format(tool_name))
+                    return
+
+                try:
+                    handler = server_instance._tools[tool_name]["handler"]
+                    result = server_instance._call_handler(handler, None, arguments)
+
+                    # Format result
+                    if isinstance(result, dict):
+                        body = json.dumps(result).encode("utf-8")
+                    else:
+                        body = json.dumps({"result": str(result)}).encode("utf-8")
+
+                    self.send_response(200)
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+                except Exception as e:
+                    error_body = json.dumps({"error": str(e)}).encode("utf-8")
+                    self.send_response(500)
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(error_body)))
+                    self.end_headers()
+                    self.wfile.write(error_body)
+
+            def _handle_streamable_http_get(self):
+                """Handle Streamable HTTP GET - returns SSE stream for async responses."""
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "keep-alive")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+
+                client_queue = []
+                server_instance._clients.append(client_queue)
+
+                try:
+                    # Send endpoint event per MCP Streamable HTTP spec
+                    self.wfile.write(b"event: endpoint\ndata: /mcp\n\n")
+                    self.wfile.flush()
+
+                    while True:
+                        if client_queue:
+                            msg = client_queue.pop(0)
+                            self.wfile.write("event: message\ndata: {}\n\n".format(msg).encode("utf-8"))
+                            self.wfile.flush()
+                        time.sleep(0.05)
+                except Exception as e:
+                    print("Streamable HTTP client disconnected: {}".format(e))
+                finally:
+                    if client_queue in server_instance._clients:
+                        server_instance._clients.remove(client_queue)
+
+            def _handle_openapi(self):
+                """Return OpenAPI schema for tool discovery."""
+                tools_paths = {}
+                for tool_name, tool_info in server_instance._tools.items():
+                    tool_def = tool_info["definition"]
+                    schema = tool_def.inputSchema if hasattr(tool_def, 'inputSchema') else {}
+
+                    tools_paths["/tools/{}".format(tool_name)] = {
+                        "post": {
+                            "operationId": tool_name,
+                            "summary": tool_def.description if hasattr(tool_def, 'description') else tool_name,
+                            "requestBody": {
+                                "required": True,
+                                "content": {
+                                    "application/json": {
+                                        "schema": schema
+                                    }
+                                }
+                            },
+                            "responses": {
+                                "200": {
+                                    "description": "Tool result",
+                                    "content": {
+                                        "application/json": {
+                                            "schema": {"type": "object"}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                openapi = {
+                    "openapi": "3.1.0",
+                    "info": {
+                        "title": server_instance.name,
+                        "version": server_instance.version,
+                        "description": "MCP Server exposing tools as OpenAPI endpoints"
+                    },
+                    "paths": {
+                        "/mcp": {
+                            "get": {
+                                "operationId": "mcp_sse",
+                                "summary": "MCP Streamable HTTP SSE endpoint",
+                                "responses": {"200": {"description": "SSE stream"}}
+                            },
+                            "post": {
+                                "operationId": "mcp_message",
+                                "summary": "Send MCP JSON-RPC message",
+                                "requestBody": {
+                                    "content": {
+                                        "application/json": {
+                                            "schema": {"type": "object"}
+                                        }
+                                    }
+                                },
+                                "responses": {"200": {"description": "JSON-RPC response"}}
+                            }
+                        },
+                        **tools_paths
+                    }
+                }
+
+                body = json.dumps(openapi).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _handle_mcp_discovery(self):
+                """Return MCP discovery document."""
+                discovery = {
+                    "mcpVersion": "2024-11-05",
+                    "serverInfo": {
+                        "name": server_instance.name,
+                        "version": server_instance.version
+                    },
+                    "capabilities": server_instance._get_capabilities().to_dict(),
+                    "transports": [
+                        {"type": "sse", "endpoint": "/sse"},
+                        {"type": "streamable-http", "endpoint": "/mcp"}
+                    ]
+                }
+
+                body = json.dumps(discovery).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def do_OPTIONS(self):
                 self.send_response(200)
                 self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
                 self.end_headers()
 
         server = ThreadingHTTPServer((host, port), MCPRequestHandler)
@@ -515,7 +720,12 @@ class MCPServer(object):
         print("  Tools: {}".format(len(self._tools)))
         print("  Resources: {}".format(len(self._resources)))
         print("  Prompts: {}".format(len(self._prompts)))
-        print("  SSE endpoint: http://{}:{}/sse".format(host, port))
+        print("Endpoints:")
+        print("  SSE transport:        http://{}:{}/sse".format(host, port))
+        print("  Streamable HTTP:      http://{}:{}/mcp".format(host, port))
+        print("  OpenAPI schema:       http://{}:{}/openapi.json".format(host, port))
+        print("  MCP discovery:        http://{}:{}/.well-known/mcp.json".format(host, port))
+        print("  Direct tool calls:    http://{}:{}/tools/<name>".format(host, port))
 
         try:
             server.serve_forever()
