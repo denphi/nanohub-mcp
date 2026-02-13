@@ -350,13 +350,13 @@ class ServerCapabilities(object):
         # type: () -> Dict[str, Any]
         caps = {}
         if self.tools:
-            caps["tools"] = {}
+            caps["tools"] = {"listChanged": False}  # Not empty to ensure {} in JSON
         if self.resources:
-            caps["resources"] = {}
+            caps["resources"] = {"listChanged": False, "subscribe": False}
         if self.prompts:
-            caps["prompts"] = {}
+            caps["prompts"] = {"listChanged": False}
         if self.logging:
-            caps["logging"] = {}
+            caps["logging"] = {"listChanged": False}
         return caps
 
 
