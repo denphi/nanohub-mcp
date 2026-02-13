@@ -30,6 +30,11 @@ except ImportError:
     from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
     from SocketServer import ThreadingMixIn
 
+try:
+    from urllib.parse import unquote
+except ImportError:
+    from urllib import unquote
+
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from .types import (
@@ -98,6 +103,59 @@ class MCPServer(object):
         self._resources = {}  # type: Dict[str, Dict[str, Any]]
         self._prompts = {}  # type: Dict[str, Dict[str, Any]]
         self._clients = []  # type: List[List]
+        self._path_prefix = ""  # type: str
+
+    def _strip_proxy_prefix(self, uri):
+        # type: (str) -> str
+        """
+        Normalize proxied resource URIs to registered resource keys.
+
+        Some proxy/client stacks may pass a full proxied URL/path instead of the
+        raw MCP resource URI. This method attempts a safe normalization by
+        matching known resource URIs.
+        """
+        if not uri or not isinstance(uri, str):
+            return uri
+
+        # Exact-match fast path.
+        if uri in self._resources:
+            return uri
+
+        # Try common normalizations before suffix matching.
+        candidates = [uri.strip()]
+        if self._path_prefix:
+            prefix = self._path_prefix.rstrip("/")
+            if prefix and candidates[0].startswith(prefix):
+                stripped = candidates[0][len(prefix):]
+                candidates.append(stripped if stripped.startswith("/") else "/" + stripped)
+
+        decoded = unquote(candidates[0])
+        if decoded not in candidates:
+            candidates.append(decoded)
+
+        # Remove query/fragment and leading slashes variants.
+        normalized_candidates = []
+        for candidate in candidates:
+            base = candidate.split("?", 1)[0].split("#", 1)[0]
+            for value in (candidate, base, base.lstrip("/")):
+                if value and value not in normalized_candidates:
+                    normalized_candidates.append(value)
+
+        # Exact match after normalization.
+        for candidate in normalized_candidates:
+            if candidate in self._resources:
+                return candidate
+
+        # Fallback: match by registered URI suffix (prefer longest match).
+        resource_uris = sorted(self._resources.keys(), key=len, reverse=True)
+        for candidate in normalized_candidates:
+            for resource_uri in resource_uris:
+                if candidate.endswith(resource_uri):
+                    return resource_uri
+                if candidate.endswith("/" + resource_uri):
+                    return resource_uri
+
+        return uri
 
     def _register_tool_function(self, func):
         # type: (Callable) -> None
@@ -432,6 +490,7 @@ class MCPServer(object):
         """
         server_instance = self
         _prefix = path_prefix.rstrip("/") if path_prefix else ""
+        self._path_prefix = _prefix
 
         class MCPRequestHandler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):

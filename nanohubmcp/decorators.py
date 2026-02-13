@@ -37,6 +37,146 @@ def _python_type_to_json_schema(py_type):
     return {"type": "string"}
 
 
+def _split_top_level_commas(value):
+    # type: (str) -> List[str]
+    """Split comma-separated values while respecting nested generics."""
+    parts = []
+    current = []
+    depth = 0
+
+    for ch in value:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}" and depth > 0:
+            depth -= 1
+
+        if ch == "," and depth == 0:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+
+        current.append(ch)
+
+    part = "".join(current).strip()
+    if part:
+        parts.append(part)
+
+    return parts
+
+
+def _type_expr_to_json_schema(type_expr):
+    # type: (str) -> Dict[str, Any]
+    """Convert a type-comment expression string to JSON Schema."""
+    normalized = (type_expr or "").replace("typing.", "").replace(" ", "")
+    if not normalized:
+        return {"type": "string"}
+
+    primitive_types = {
+        "str": "string",
+        "bytes": "string",
+        "int": "integer",
+        "float": "number",
+        "bool": "boolean",
+        "list": "array",
+        "dict": "object",
+        "tuple": "array",
+        "set": "array",
+        "Any": "string",
+    }
+    if normalized in primitive_types:
+        return {"type": primitive_types[normalized]}
+
+    if normalized in ("None", "NoneType", "type(None)"):
+        return {"type": "null"}
+
+    if normalized.startswith("Optional[") and normalized.endswith("]"):
+        inner = normalized[len("Optional["):-1]
+        return _type_expr_to_json_schema(inner)
+
+    if normalized.startswith("Union[") and normalized.endswith("]"):
+        inner = normalized[len("Union["):-1]
+        options = _split_top_level_commas(inner)
+        option_types = []
+        for opt in options:
+            if opt in ("None", "NoneType", "type(None)"):
+                continue
+            schema = _type_expr_to_json_schema(opt)
+            if "type" in schema:
+                option_types.append(schema["type"])
+        option_types = sorted(set(option_types))
+        if len(option_types) == 1:
+            return {"type": option_types[0]}
+        return {"type": "string"}
+
+    array_prefixes = (
+        "List[", "list[", "Tuple[", "tuple[", "Set[", "set[", "Sequence[", "Iterable["
+    )
+    for prefix in array_prefixes:
+        if normalized.startswith(prefix) and normalized.endswith("]"):
+            return {"type": "array"}
+
+    object_prefixes = ("Dict[", "dict[", "Mapping[", "MutableMapping[")
+    for prefix in object_prefixes:
+        if normalized.startswith(prefix) and normalized.endswith("]"):
+            return {"type": "object"}
+
+    return {"type": "string"}
+
+
+def _python_value_to_json_schema(value):
+    # type: (Any) -> Dict[str, Any]
+    """Best-effort schema inference from a Python default value."""
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, int):
+        return {"type": "integer"}
+    if isinstance(value, float):
+        return {"type": "number"}
+    if isinstance(value, (list, tuple, set)):
+        return {"type": "array"}
+    if isinstance(value, dict):
+        return {"type": "object"}
+    if isinstance(value, str):
+        return {"type": "string"}
+    return {"type": "string"}
+
+
+def _type_comment_schemas(func):
+    # type: (Callable) -> Dict[str, Dict[str, Any]]
+    """Extract parameter schemas from Python 3.6-style function type comments."""
+    try:
+        source = inspect.getsource(func)
+    except (IOError, OSError, TypeError):
+        return {}
+
+    type_comment = None
+    for line in source.splitlines():
+        if "# type:" in line:
+            type_comment = line.split("# type:", 1)[1].strip()
+            break
+
+    if not type_comment or "->" not in type_comment:
+        return {}
+
+    signature_part = type_comment.split("->", 1)[0].strip()
+    if not signature_part.startswith("(") or not signature_part.endswith(")"):
+        return {}
+
+    args_part = signature_part[1:-1].strip()
+    arg_types = _split_top_level_commas(args_part) if args_part else []
+    param_names = list(inspect.signature(func).parameters.keys())
+
+    if len(arg_types) != len(param_names):
+        return {}
+
+    return {
+        param_name: _type_expr_to_json_schema(type_expr)
+        for param_name, type_expr in zip(param_names, arg_types)
+    }
+
+
 def _generate_input_schema(func, exclude_params=None):
     # type: (Callable, Optional[Set[str]]) -> Dict[str, Any]
     """Generate JSON Schema from function signature."""
@@ -51,6 +191,7 @@ def _generate_input_schema(func, exclude_params=None):
             hints = get_type_hints(func)
         except Exception:
             hints = {}
+    comment_schemas = _type_comment_schemas(func)
 
     properties = {}
     required = []
@@ -66,6 +207,10 @@ def _generate_input_schema(func, exclude_params=None):
             prop = _python_type_to_json_schema(hints[name])
         elif param.annotation is not inspect.Parameter.empty:
             prop = _python_type_to_json_schema(param.annotation)
+        elif name in comment_schemas:
+            prop = comment_schemas[name]
+        elif param.default is not inspect.Parameter.empty and param.default is not None:
+            prop = _python_value_to_json_schema(param.default)
         else:
             prop = {"type": "string"}
 

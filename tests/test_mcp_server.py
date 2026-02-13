@@ -179,9 +179,15 @@ def test_tools_list():
     status, body = _post("/", {"jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}})
     assert status == 200
     assert body["id"] == 10
-    tool_names = [t["name"] for t in body["result"]["tools"]]
+    tools = body["result"]["tools"]
+    tool_names = [t["name"] for t in tools]
     assert "add" in tool_names
     assert "divide" in tool_names
+
+    add_tool = [t for t in tools if t["name"] == "add"][0]
+    add_properties = add_tool["inputSchema"]["properties"]
+    assert add_properties["a"]["type"] == "number"
+    assert add_properties["b"]["type"] == "number"
 
 
 def test_tools_call_add():
