@@ -451,6 +451,9 @@ class MCPServer(object):
                     except Exception as e:
                         error = {"code": -32603, "message": str(e)}
 
+            elif method == "logging/setLevel":
+                result = {}
+
             else:
                 error = {"code": -32601, "message": "Method not found: {}".format(method)}
 

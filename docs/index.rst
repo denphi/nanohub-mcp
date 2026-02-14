@@ -26,6 +26,7 @@ Installation
 
    quickstart
    examples
+   clients
    api
    testing
    endpoints

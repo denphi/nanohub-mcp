@@ -86,6 +86,14 @@ Test it:
 
 Full source: ``examples/simple/start_mcp.py``
 
+**Sample prompts to try with an AI client:**
+
+   *"What is 1234 raised to the power of 5?"*
+
+   *"Divide 100 by 7 and then multiply the result by 3."*
+
+   *"What happens when I try to divide 42 by zero?"*
+
 
 Data Analysis
 -------------
@@ -242,6 +250,16 @@ Test it:
      -d '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"data://samples/temperatures"}}'
 
 Full source: ``examples/data_analysis/start_mcp.py``
+
+**Sample prompts to try with an AI client:**
+
+   *"Calculate the mean, median and standard deviation for: 4, 8, 15, 16, 23, 42"*
+
+   *"What is the Pearson correlation between these two datasets: x = 1,2,3,4,5 and y = 2.1, 3.9, 6.2, 7.8, 10.1? Is there a strong relationship?"*
+
+   *"Normalize the dataset 10, 50, 200, 500, 1000 using z-score and explain what the values mean."*
+
+   *"Read the temperature dataset and tell me which month is the hottest and coldest, and fit a linear regression to the data."*
 
 
 Physics Simulator
@@ -400,3 +418,33 @@ Test it:
      -d '{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"constants://physics"}}'
 
 Full source: ``examples/simulator/start_mcp.py``
+
+**Sample prompts to try with an AI client:**
+
+   *"A soccer player kicks a ball with an initial velocity of 25 m/s at an angle of 35 degrees.
+   Calculate how far away the ball will land (range) and the maximum height it reaches."*
+
+   *"Calculate the relativistic energy and momentum for a proton traveling at 90% the speed of
+   light (velocity = 269,813,212 m/s). What is its Lorentz factor?"*
+
+   *"I have a balloon with 2 moles of Helium gas. The pressure inside is 101325 Pa (1 atm) and
+   the temperature is 25 degrees Celsius (298.15 K). What is the volume of the balloon in liters?"*
+
+   *"A sound wave in air has a frequency of 440 Hz (Note A4). Assuming the speed of sound is
+   343 m/s, what is the wavelength and period of this wave?"*
+
+   *"Analyze a simple harmonic oscillator with a 2 kg mass attached to a spring with a constant
+   of 50 N/m. The maximum displacement (amplitude) is 0.5 meters. What is the position, velocity,
+   and total energy of the system at time t = 1.5 seconds?"*
+
+   *"Read the* ``physical_constants`` *resource to tell me the exact value of the Boltzmann
+   constant and the Planck constant used by the simulator."*
+
+   *"First, calculate the time of flight for a projectile launched at 30 m/s at 45 degrees. Then,
+   use that total flight time as the time input for a harmonic oscillator with mass=1 kg,
+   spring_constant=10, amplitude=1. What is the position of the oscillator at the exact moment
+   the projectile hits the ground?"*
+
+   *"Calculate the volume of 1 mole of an ideal gas at 300 K and 100,000 Pa. Then, if we treat a
+   single gas particle as having a rest mass of 6.64e-27 kg (Helium-4) moving at 1000 m/s, what
+   is its relativistic kinetic energy?"*
