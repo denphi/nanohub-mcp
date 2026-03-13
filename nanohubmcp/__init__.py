@@ -27,7 +27,7 @@ Run with:
 """
 
 from .server import MCPServer
-from .decorators import tool, resource, prompt
+from .decorators import tool, async_tool, resource, prompt
 from .context import Context
 from .types import (
     Tool,
@@ -54,6 +54,7 @@ from ._version import __version__
 __all__ = [
     "MCPServer",
     "tool",
+    "async_tool",
     "resource",
     "prompt",
     "Context",

@@ -12,6 +12,7 @@ A zero-dependency Python library for creating `Model Context Protocol (MCP) <htt
 - Direct REST-style tool calls
 - nanoHUB proxy integration out of the box
 - Context injection for logging and progress reporting
+- Async tools for long-running jobs (no proxy timeout)
 
 Installation
 ------------

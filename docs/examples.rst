@@ -1,6 +1,85 @@
 Examples
 ========
 
+Long-Running Async Tool
+-----------------------
+
+Use ``@server.async_tool()`` for tools that take longer than the reverse proxy timeout (typically 30 s).
+The server returns a ``job_id`` immediately and the client polls for the result.
+
+.. code-block:: python
+
+   import time
+   from nanohubmcp import MCPServer
+
+   server = MCPServer("async-demo", version="1.0.0")
+
+   @server.async_tool()
+   def run_heavy_job(input_data, iterations=100):
+       # type: (str, int) -> str
+       """Run a heavy computation that takes a while. Returns a job_id immediately."""
+       time.sleep(int(iterations))   # simulate slow work
+       return "Processed: {} after {} iterations".format(input_data, iterations)
+
+   @server.tool()
+   def quick_check():
+       """Fast tool — unaffected by async_tool changes."""
+       return "ok"
+
+   if __name__ == "__main__":
+       server.run(port=8000)
+
+**Step 1 — start the job:**
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8000/ \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_heavy_job","arguments":{"input_data":"my_dataset","iterations":5}}}'
+
+.. code-block:: json
+
+   {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "result": {
+       "content": [{"type": "text", "text": "{\"status\": \"running\", \"job_id\": \"abc-123\", \"message\": \"Job started. Poll with get_job_result(job_id=\\\"abc-123\\\")\"}"}],
+       "isError": false
+     }
+   }
+
+**Step 2 — poll until done:**
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8000/ \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_job_result","arguments":{"job_id":"abc-123"}}}'
+
+While running:
+
+.. code-block:: json
+
+   {"status": "running", "job_id": "abc-123"}
+
+When complete:
+
+.. code-block:: json
+
+   {"status": "done", "job_id": "abc-123", "result": "Processed: my_dataset after 5 iterations"}
+
+On error:
+
+.. code-block:: json
+
+   {"status": "error", "job_id": "abc-123", "error": "...error message..."}
+
+.. note::
+
+   ``get_job_result`` is automatically available on every server — no registration needed.
+   An AI client (e.g. Claude) will call it automatically after receiving a ``job_id``.
+
+
 Simple Calculator
 -----------------
 

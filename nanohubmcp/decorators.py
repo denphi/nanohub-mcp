@@ -227,6 +227,42 @@ def _generate_input_schema(func, exclude_params=None):
     }
 
 
+def async_tool(
+    name=None,  # type: Optional[str]
+    description=None,  # type: Optional[str]
+    tags=None,  # type: Optional[Set[str]]
+    meta=None,  # type: Optional[Dict[str, Any]]
+    input_schema=None  # type: Optional[Dict[str, Any]]
+):
+    # type: (...) -> Callable
+    """
+    Decorator to register a long-running function as an async MCP tool.
+
+    When called, the server returns a job_id immediately instead of blocking.
+    The client can poll for the result using the built-in ``get_job_result`` tool.
+
+    Usage is identical to ``@tool``::
+
+        @server.async_tool()
+        def run_simulation(verilog_code: str, design_name: str) -> str:
+            # may take minutes — will not block the HTTP response
+            ...
+            return result_string
+    """
+    def decorator(func):
+        # type: (Callable) -> Callable
+        decorated = tool(name, description, tags, meta, input_schema)(func)
+        decorated._mcp_async_tool = True
+        return decorated
+
+    if callable(name):
+        func = name
+        name = None
+        return decorator(func)
+
+    return decorator
+
+
 def tool(
     name=None,  # type: Optional[str]
     description=None,  # type: Optional[str]

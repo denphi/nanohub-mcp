@@ -10,6 +10,7 @@ A zero-dependency Python library for creating [Model Context Protocol (MCP)](htt
 - Direct REST-style tool calls
 - nanoHUB proxy integration out of the box
 - Context injection for logging and progress reporting
+- Async tools for long-running jobs (no proxy timeout)
 
 ## Installation
 
@@ -362,6 +363,58 @@ def add(a, b):
 def my_func(a, b):
     return a + b
 ```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `name` | str | function name | Tool name |
+| `description` | str | docstring | Tool description |
+| `tags` | set | `None` | Tags for categorization |
+| `meta` | dict | `None` | Metadata dictionary |
+| `input_schema` | dict | auto-generated | JSON Schema for inputs |
+
+### @server.async_tool()
+
+Register a long-running function as an async MCP tool. The server returns a `job_id` immediately instead of blocking. Use this for any tool that may exceed the reverse proxy timeout (typically 30–60 seconds).
+
+```python
+from nanohubmcp import MCPServer
+
+server = MCPServer("my-server")
+
+@server.async_tool()
+def run_simulation(verilog_code: str, design_name: str) -> str:
+    """Run a long RTL-to-GDSII flow. Can take up to 10 minutes."""
+    # ... long-running work ...
+    return result
+```
+
+Calling `run_simulation` responds immediately with a job ID:
+
+```json
+{
+  "status": "running",
+  "job_id": "550e8400-e29b-41d4-a716-446655440000",
+  "message": "Job started. Poll with get_job_result(job_id=\"...\")"
+}
+```
+
+The client then polls using the built-in `get_job_result` tool (automatically registered on every server):
+
+```bash
+curl -X POST http://localhost:8000/ \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_job_result","arguments":{"job_id":"550e8400-..."}}}'
+```
+
+Returns `{"status": "running"}` while in progress, then:
+
+```json
+{ "status": "done", "job_id": "...", "result": "..." }
+```
+
+Or on failure: `{"status": "error", "job_id": "...", "error": "..."}`.
+
+Accepts the same parameters as `@server.tool()`:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|

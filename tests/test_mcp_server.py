@@ -124,7 +124,7 @@ def test_server_info():
     assert status == 200
     assert body["name"] == "test-calculator"
     assert body["status"] == "running"
-    assert body["tools"] == 2
+    assert body["tools"] >= 2  # includes built-in get_job_result
     assert body["resources"] == 1
     assert body["prompts"] == 1
     assert "endpoints" in body
@@ -311,15 +311,14 @@ def test_notification_returns_accepted():
 
 
 def test_mcp_post_initialize():
-    """POST /mcp also handles JSON-RPC requests."""
+    """POST /mcp handles JSON-RPC requests asynchronously and returns 202."""
     status, body = _post("/mcp", {"jsonrpc": "2.0", "id": 100, "method": "initialize", "params": {}})
-    assert status == 200
-    assert body["id"] == 100
-    assert "protocolVersion" in body["result"]
+    assert status == 202
+    assert body["status"] == "accepted"
 
 
 def test_mcp_post_tools_call():
-    """POST /mcp handles tool calls."""
+    """POST /mcp handles tool calls asynchronously and returns 202."""
     status, body = _post(
         "/mcp",
         {
@@ -329,9 +328,8 @@ def test_mcp_post_tools_call():
             "params": {"name": "add", "arguments": {"a": 10, "b": 20}},
         },
     )
-    assert status == 200
-    assert body["id"] == 101
-    assert "30" in body["result"]["content"][0]["text"]
+    assert status == 202
+    assert body["status"] == "accepted"
 
 
 # ---------------------------------------------------------------------------

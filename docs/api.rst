@@ -107,6 +107,85 @@ With explicit options:
      - JSON Schema for inputs
 
 
+@server.async_tool()
+---------------------
+
+Register a long-running function as an async MCP tool. When called, the server returns a ``job_id`` immediately (within milliseconds) instead of blocking the HTTP connection. The actual work runs in a background thread. The client polls for the result using the built-in ``get_job_result`` tool.
+
+Use this for any tool that may exceed the reverse proxy timeout (typically 30–60 seconds).
+
+.. code-block:: python
+
+   from nanohubmcp import MCPServer
+
+   server = MCPServer("my-server")
+
+   @server.async_tool()
+   def run_simulation(verilog_code, design_name):
+       # type: (str, str) -> str
+       """Run a long RTL-to-GDSII flow. Can take up to 10 minutes."""
+       # ... long-running work ...
+       return result
+
+Calling ``run_simulation`` returns immediately:
+
+.. code-block:: json
+
+   {
+     "status": "running",
+     "job_id": "550e8400-e29b-41d4-a716-446655440000",
+     "message": "Job started. Poll with get_job_result(job_id=\"...\")"
+   }
+
+The client then polls with the built-in ``get_job_result`` tool until complete:
+
+.. code-block:: json
+
+   { "status": "done", "job_id": "...", "result": "..." }
+
+Or on failure:
+
+.. code-block:: json
+
+   { "status": "error", "job_id": "...", "error": "..." }
+
+The decorator accepts the same parameters as ``@server.tool()``:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 15 10 15 60
+
+   * - Parameter
+     - Type
+     - Default
+     - Description
+   * - ``name``
+     - str
+     - function name
+     - Tool name
+   * - ``description``
+     - str
+     - docstring
+     - Tool description
+   * - ``tags``
+     - set
+     - ``None``
+     - Tags for categorization
+   * - ``meta``
+     - dict
+     - ``None``
+     - Metadata dictionary
+   * - ``input_schema``
+     - dict
+     - auto-generated
+     - JSON Schema for inputs
+
+.. note::
+
+   Every server automatically registers a built-in ``get_job_result(job_id)`` tool.
+   It is always present in ``tools/list`` and requires no configuration.
+
+
 @server.resource()
 -------------------
 

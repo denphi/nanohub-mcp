@@ -20,7 +20,9 @@ import json
 import os
 import sys
 import time
+import threading
 import traceback
+import uuid
 
 try:
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -43,7 +45,7 @@ from .types import (
     PromptResult, Message, Role,
     ServerCapabilities, ServerInfo
 )
-from .decorators import tool, resource, prompt
+from .decorators import tool, async_tool, resource, prompt
 from .context import Context
 
 
@@ -104,6 +106,84 @@ class MCPServer(object):
         self._prompts = {}  # type: Dict[str, Dict[str, Any]]
         self._clients = []  # type: List[List]
         self._path_prefix = ""  # type: str
+        # job_id -> {"status": "running"|"done"|"error", "result": Any}
+        self._jobs = {}  # type: Dict[str, Dict[str, Any]]
+        self._jobs_lock = threading.Lock()
+        self._register_get_job_result()
+
+    def _register_get_job_result(self):
+        # type: () -> None
+        """Auto-register the built-in get_job_result polling tool."""
+        server_instance = self
+
+        def get_job_result(job_id):
+            # type: (str) -> Dict[str, Any]
+            """Poll the result of a long-running async tool call.
+
+            Returns status 'running' while the job is in progress, or the final
+            result/error once it completes.
+
+            Args:
+                job_id: The job ID returned by an async tool call.
+            """
+            with server_instance._jobs_lock:
+                job = server_instance._jobs.get(job_id)
+            if job is None:
+                return {"status": "not_found", "job_id": job_id}
+            if job["status"] == "running":
+                return {"status": "running", "job_id": job_id}
+            if job["status"] == "error":
+                return {"status": "error", "job_id": job_id, "error": job["result"]}
+            return {"status": "done", "job_id": job_id, "result": job["result"]}
+
+        decorated = tool(
+            name="get_job_result",
+            description=(
+                "Poll the result of a long-running async tool call. "
+                "Pass the job_id returned by an async tool. "
+                "Returns {\"status\": \"running\"} until complete, then the final result."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"job_id": {"type": "string"}},
+                "required": ["job_id"]
+            }
+        )(get_job_result)
+        self._register_tool_function(decorated)
+
+    def _start_async_tool_job(self, handler, msg_id, arguments):
+        # type: (Any, Any, Dict[str, Any]) -> str
+        """Spawn a background thread for an async tool; return a job_id immediately."""
+        job_id = str(uuid.uuid4())
+        with self._jobs_lock:
+            self._jobs[job_id] = {"status": "running", "result": None}
+
+        server_instance = self
+
+        def _run():
+            try:
+                call_result = self._call_handler(handler, msg_id, arguments)
+                if isinstance(call_result, ToolResult):
+                    # Unwrap to a plain value so get_job_result can serialise it
+                    items = call_result.to_dict().get("content", [])
+                    result = items[0]["text"] if len(items) == 1 else call_result.to_dict()
+                elif isinstance(call_result, dict):
+                    result = call_result
+                else:
+                    result = str(call_result)
+                with server_instance._jobs_lock:
+                    server_instance._jobs[job_id]["status"] = "done"
+                    server_instance._jobs[job_id]["result"] = result
+            except Exception as e:
+                with server_instance._jobs_lock:
+                    server_instance._jobs[job_id]["status"] = "error"
+                    server_instance._jobs[job_id]["result"] = str(e)
+                traceback.print_exc()
+
+        t = threading.Thread(target=_run)
+        t.daemon = True
+        t.start()
+        return job_id
 
     def _strip_proxy_prefix(self, uri):
         # type: (str) -> str
@@ -167,7 +247,8 @@ class MCPServer(object):
                 description=func._mcp_tool_description,
                 inputSchema=func._mcp_tool_input_schema
             ),
-            "handler": func
+            "handler": func,
+            "is_async": getattr(func, "_mcp_async_tool", False),
         }
 
     def _register_resource_function(self, func):
@@ -220,6 +301,42 @@ class MCPServer(object):
         def decorator(func):
             # type: (Callable) -> Callable
             decorated = tool(name, description, tags, meta, input_schema)(func)
+            self._register_tool_function(decorated)
+            return decorated
+
+        if callable(name):
+            func = name
+            name = None
+            return decorator(func)
+
+        return decorator
+
+    def async_tool(
+        self,
+        name=None,  # type: Optional[str]
+        description=None,  # type: Optional[str]
+        tags=None,  # type: Optional[Set[str]]
+        meta=None,  # type: Optional[Dict[str, Any]]
+        input_schema=None  # type: Optional[Dict[str, Any]]
+    ):
+        # type: (...) -> Callable
+        """
+        Decorator to register a long-running tool that returns a job_id immediately.
+
+        The server runs the function in a background thread and the client polls
+        for the result using the built-in ``get_job_result`` tool.
+
+        Usage::
+
+            @server.async_tool()
+            def run_openlane(verilog_code: str, design_name: str) -> str:
+                # takes minutes — won't block the HTTP response
+                ...
+                return result
+        """
+        def decorator(func):
+            # type: (Callable) -> Callable
+            decorated = async_tool(name, description, tags, meta, input_schema)(func)
             self._register_tool_function(decorated)
             return decorated
 
@@ -363,28 +480,42 @@ class MCPServer(object):
                 if tool_name not in self._tools:
                     error = {"code": -32601, "message": "Tool not found: {}".format(tool_name)}
                 else:
-                    handler = self._tools[tool_name]["handler"]
-                    try:
-                        call_result = self._call_handler(handler, msg_id, arguments)
+                    tool_entry = self._tools[tool_name]
+                    handler = tool_entry["handler"]
 
-                        # Wrap result in proper format
-                        if isinstance(call_result, ToolResult):
-                            result = call_result.to_dict()
-                        elif isinstance(call_result, dict):
-                            result = {
-                                "content": [{"type": "text", "text": json.dumps(call_result)}],
-                                "isError": False
-                            }
-                        else:
-                            result = {
-                                "content": [{"type": "text", "text": str(call_result)}],
-                                "isError": False
-                            }
-                    except Exception as e:
+                    if tool_entry.get("is_async"):
+                        # Return a job_id immediately; client polls with get_job_result
+                        job_id = self._start_async_tool_job(handler, msg_id, arguments)
                         result = {
-                            "content": [{"type": "text", "text": str(e)}],
-                            "isError": True
+                            "content": [{"type": "text", "text": json.dumps({
+                                "status": "running",
+                                "job_id": job_id,
+                                "message": "Job started. Poll with get_job_result(job_id=\"{}\")".format(job_id)
+                            })}],
+                            "isError": False
                         }
+                    else:
+                        try:
+                            call_result = self._call_handler(handler, msg_id, arguments)
+
+                            # Wrap result in proper format
+                            if isinstance(call_result, ToolResult):
+                                result = call_result.to_dict()
+                            elif isinstance(call_result, dict):
+                                result = {
+                                    "content": [{"type": "text", "text": json.dumps(call_result)}],
+                                    "isError": False
+                                }
+                            else:
+                                result = {
+                                    "content": [{"type": "text", "text": str(call_result)}],
+                                    "isError": False
+                                }
+                        except Exception as e:
+                            result = {
+                                "content": [{"type": "text", "text": str(e)}],
+                                "isError": True
+                            }
 
             elif method == "resources/list":
                 resources = []
@@ -589,18 +720,44 @@ class MCPServer(object):
                     # Standard MCP JSON-RPC handling (for /mcp and root POST)
                     print("Received: {}".format(request.get("method", "unknown")))
 
+                    if path_only in ("/mcp", "/mcp/"):
+                        # Asynchronous execution to prevent timeout on SSE connections
+                        import threading
+                        def async_handler():
+                            try:
+                                resp = server_instance._handle_request(request)
+                                if resp:
+                                    server_instance._broadcast(resp)
+                            except Exception as e:
+                                print("Error in async handler: {}".format(e))
+                                traceback.print_exc()
+
+                        t = threading.Thread(target=async_handler)
+                        t.daemon = True
+                        t.start()
+                        
+                        # Return 202 Accepted immediately
+                        body = b'{"status":"accepted"}'
+                        self.send_response(202)
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+
+                    # Synchronous execution for simple REST-like clients
                     response = server_instance._handle_request(request)
 
                     # Broadcast to SSE clients
                     if response:
                         server_instance._broadcast(response)
 
-                    # Return response synchronously (for non-SSE clients)
                     if response:
                         body = json.dumps(response).encode("utf-8")
                         self.send_response(200)
                     else:
-                        body = b"{\"status\":\"accepted\"}"
+                        body = b'{"status":"accepted"}'
                         self.send_response(202)
 
                     self.send_header("Access-Control-Allow-Origin", "*")
