@@ -721,29 +721,51 @@ class MCPServer(object):
                     print("Received: {}".format(request.get("method", "unknown")))
 
                     if path_only in ("/mcp", "/mcp/"):
-                        # Asynchronous execution to prevent timeout on SSE connections
-                        import threading
-                        def async_handler():
-                            try:
-                                resp = server_instance._handle_request(request)
-                                if resp:
-                                    server_instance._broadcast(resp)
-                            except Exception as e:
-                                print("Error in async handler: {}".format(e))
-                                traceback.print_exc()
+                        # Fast methods (initialize, tools/list, ping, etc.) are handled
+                        # synchronously so proxy clients get the response on the HTTP reply.
+                        # Slow tool calls (tools/call) go async to avoid proxy timeouts;
+                        # the response is broadcast to SSE clients instead.
+                        method = request.get("method", "")
+                        tool_name = request.get("params", {}).get("name", "")
+                        tool_entry = server_instance._tools.get(tool_name, {})
+                        is_slow = method == "tools/call" and tool_entry.get("is_async", False)
 
-                        t = threading.Thread(target=async_handler)
-                        t.daemon = True
-                        t.start()
-                        
-                        # Return 202 Accepted immediately
-                        body = b'{"status":"accepted"}'
-                        self.send_response(202)
-                        self.send_header("Access-Control-Allow-Origin", "*")
-                        self.send_header("Content-Type", "application/json")
-                        self.send_header("Content-Length", str(len(body)))
-                        self.end_headers()
-                        self.wfile.write(body)
+                        if is_slow:
+                            def async_handler():
+                                try:
+                                    resp = server_instance._handle_request(request)
+                                    if resp:
+                                        server_instance._broadcast(resp)
+                                except Exception as e:
+                                    print("Error in async handler: {}".format(e))
+                                    traceback.print_exc()
+
+                            t = threading.Thread(target=async_handler)
+                            t.daemon = True
+                            t.start()
+
+                            body = b'{"status":"accepted"}'
+                            self.send_response(202)
+                            self.send_header("Access-Control-Allow-Origin", "*")
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                        else:
+                            response = server_instance._handle_request(request)
+                            if response:
+                                server_instance._broadcast(response)
+                                body = json.dumps(response).encode("utf-8")
+                                self.send_response(200)
+                            else:
+                                body = b'{"status":"accepted"}'
+                                self.send_response(202)
+
+                            self.send_header("Access-Control-Allow-Origin", "*")
+                            self.send_header("Content-Type", "application/json")
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
                         return
 
                     # Synchronous execution for simple REST-like clients
