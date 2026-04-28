@@ -1,6 +1,6 @@
 """
 MCP Type definitions following the Model Context Protocol specification.
-Compatible with Python 3.6+ and aligned with FastMCP API.
+Compatible with Python 3.7+ and aligned with FastMCP API.
 """
 
 from typing import Any, Dict, List, Optional, Union

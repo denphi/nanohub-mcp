@@ -18,7 +18,7 @@ import sys
 # Add package path for development
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from nanohubmcp import MCPServer, Context
+from nanohubmcp import MCPServer, Context, ToolResult
 
 # Create server instance
 server = MCPServer("data-analysis", version="1.0.0")
@@ -40,10 +40,13 @@ def descriptive_stats(data):
     Returns:
         Dictionary with mean, median, std, min, max, etc.
     """
-    values = [float(x.strip()) for x in data.split(",")]
+    try:
+        values = [float(x.strip()) for x in data.split(",") if x.strip()]
+    except ValueError as e:
+        return ToolResult(content="Could not parse '{}': {}".format(data, e), is_error=True)
     n = len(values)
     if n == 0:
-        return {"error": "Empty dataset"}
+        return ToolResult(content="Empty dataset", is_error=True)
 
     sorted_data = sorted(values)
     mean = sum(values) / n
@@ -83,14 +86,14 @@ def correlation(x_data, y_data):
     Returns:
         Correlation coefficient and related statistics
     """
-    x = [float(v.strip()) for v in x_data.split(",")]
-    y = [float(v.strip()) for v in y_data.split(",")]
+    x = [float(v.strip()) for v in x_data.split(",") if v.strip()]
+    y = [float(v.strip()) for v in y_data.split(",") if v.strip()]
 
     n = len(x)
     if n != len(y):
-        return {"error": "Datasets must have the same length"}
+        return ToolResult(content="Datasets must have the same length", is_error=True)
     if n < 2:
-        return {"error": "Need at least 2 data points"}
+        return ToolResult(content="Need at least 2 data points", is_error=True)
 
     mean_x = sum(x) / n
     mean_y = sum(y) / n
@@ -100,7 +103,7 @@ def correlation(x_data, y_data):
     std_y = math.sqrt(sum((yi - mean_y) ** 2 for yi in y) / n)
 
     if std_x == 0 or std_y == 0:
-        return {"error": "Standard deviation is zero"}
+        return ToolResult(content="Standard deviation is zero", is_error=True)
 
     r = cov / (std_x * std_y)
 
@@ -125,14 +128,14 @@ def linear_regression(x_data, y_data):
     Returns:
         Slope, intercept, and regression statistics
     """
-    x = [float(v.strip()) for v in x_data.split(",")]
-    y = [float(v.strip()) for v in y_data.split(",")]
+    x = [float(v.strip()) for v in x_data.split(",") if v.strip()]
+    y = [float(v.strip()) for v in y_data.split(",") if v.strip()]
 
     n = len(x)
     if n != len(y):
-        return {"error": "Datasets must have the same length"}
+        return ToolResult(content="Datasets must have the same length", is_error=True)
     if n < 2:
-        return {"error": "Need at least 2 data points"}
+        return ToolResult(content="Need at least 2 data points", is_error=True)
 
     mean_x = sum(x) / n
     mean_y = sum(y) / n
@@ -141,7 +144,9 @@ def linear_regression(x_data, y_data):
     denominator = sum((xi - mean_x) ** 2 for xi in x)
 
     if denominator == 0:
-        return {"error": "Cannot compute regression (x values are constant)"}
+        return ToolResult(
+            content="Cannot compute regression (x values are constant)", is_error=True
+        )
 
     slope = numerator / denominator
     intercept = mean_y - slope * mean_x
@@ -174,10 +179,10 @@ def normalize(data, method="minmax"):
     Returns:
         Normalized data and normalization parameters
     """
-    values = [float(x.strip()) for x in data.split(",")]
+    values = [float(x.strip()) for x in data.split(",") if x.strip()]
     n = len(values)
     if n == 0:
-        return {"error": "Empty dataset"}
+        return ToolResult(content="Empty dataset", is_error=True)
 
     if method == "minmax":
         min_val = min(values)
@@ -213,7 +218,10 @@ def normalize(data, method="minmax"):
         }
 
     else:
-        return {"error": "Unknown method. Use 'minmax' or 'zscore'"}
+        return ToolResult(
+            content="Unknown method '{}'. Use 'minmax' or 'zscore'".format(method),
+            is_error=True,
+        )
 
 
 # =============================================================================

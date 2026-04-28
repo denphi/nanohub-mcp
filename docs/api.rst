@@ -288,7 +288,8 @@ Register a function as an MCP prompt template.
 Context
 -------
 
-Tools can receive a ``Context`` object for logging and progress reporting. Add a ``ctx`` (or ``context``) parameter as the first argument:
+Tools can receive a ``Context`` object for logging, progress reporting, and client interactions such as elicitation.
+Add a ``ctx`` (or ``context``) parameter as the first argument:
 
 .. code-block:: python
 
@@ -303,6 +304,21 @@ Tools can receive a ``Context`` object for logging and progress reporting. Add a
        ctx.info("Computing {}^{}".format(base, exponent))
        ctx.report_progress(0.5, total=1.0, message="Computing...")
        return float(base) ** float(exponent)
+
+   @server.tool()
+   def ask_for_label(ctx):
+       # type: (Context) -> dict
+       """Ask the MCP client to collect a label from the user."""
+       return ctx.elicit(
+           "Enter a label",
+           {
+               "type": "object",
+               "properties": {
+                   "label": {"type": "string", "title": "Label"}
+               },
+               "required": ["label"]
+           }
+       )
 
 **Context methods:**
 
@@ -322,6 +338,20 @@ Tools can receive a ``Context`` object for logging and progress reporting. Add a
      - Log an error-level message
    * - ``ctx.report_progress(progress, total=None, message=None)``
      - Report progress to connected clients
+   * - ``ctx.elicit(message, requested_schema=None, timeout=60)``
+     - Request form-mode user input through a client that declared the ``elicitation`` capability
+   * - ``ctx.elicit_url(message, url, elicitation_id=None, timeout=60)``
+     - Request URL-mode elicitation for sensitive or out-of-band flows
+   * - ``ctx.sample(params, timeout=60)``
+     - Request LLM sampling from a client that declared the ``sampling`` capability
+   * - ``ctx.list_roots(timeout=60)``
+     - Request roots from a client that declared the ``roots`` capability
+
+.. note::
+
+   ``ctx.elicit(...)`` requires the client to initialize with the ``elicitation`` capability.
+   Form-mode elicitation should only be used for non-sensitive data. Use ``ctx.elicit_url(...)``
+   when the user needs to enter credentials, API keys, tokens, payment details, or other secrets.
 
 
 Return Types

@@ -33,13 +33,23 @@ class Context(object):
         self,
         server=None,  # type: Optional[MCPServer]
         request_id=None,  # type: Optional[str]
-        meta=None  # type: Optional[Dict[str, Any]]
+        session_id=None,  # type: Optional[str]
+        meta=None,  # type: Optional[Dict[str, Any]]
+        progress_token=None  # type: Optional[Any]
     ):
         # type: (...) -> None
         self._server = server
         self._request_id = request_id
+        self._session_id = session_id
         self._meta = meta or {}
+        self._progress_token = progress_token
         self._log_messages = []  # type: List[Dict[str, Any]]
+
+    @property
+    def progress_token(self):
+        # type: () -> Optional[Any]
+        """Token associated with this request for progress notifications."""
+        return self._progress_token
 
     @property
     def server(self):
@@ -52,6 +62,12 @@ class Context(object):
         # type: () -> Optional[str]
         """Get the current request ID."""
         return self._request_id
+
+    @property
+    def session_id(self):
+        # type: () -> Optional[str]
+        """Get the current client session ID."""
+        return self._session_id
 
     @property
     def meta(self):
@@ -96,6 +112,47 @@ class Context(object):
         """Get all logged messages for this context."""
         return self._log_messages
 
+    def elicit(self, message, requested_schema=None, timeout=60):
+        # type: (str, Optional[Dict[str, Any]], int) -> Dict[str, Any]
+        """Request structured user input from the connected MCP client."""
+        if not self._server:
+            raise RuntimeError("Context is not attached to a server")
+        return self._server.request_elicitation(
+            session_id=self._session_id,
+            message=message,
+            requested_schema=requested_schema,
+            mode="form",
+            timeout=timeout
+        )
+
+    def elicit_url(self, message, url, elicitation_id=None, timeout=60):
+        # type: (str, str, Optional[str], int) -> Dict[str, Any]
+        """Request URL-mode elicitation from the connected MCP client."""
+        if not self._server:
+            raise RuntimeError("Context is not attached to a server")
+        return self._server.request_elicitation(
+            session_id=self._session_id,
+            message=message,
+            mode="url",
+            url=url,
+            elicitation_id=elicitation_id,
+            timeout=timeout
+        )
+
+    def sample(self, params, timeout=60):
+        # type: (Dict[str, Any], int) -> Dict[str, Any]
+        """Request sampling from the connected MCP client."""
+        if not self._server:
+            raise RuntimeError("Context is not attached to a server")
+        return self._server.request_sampling(self._session_id, params, timeout=timeout)
+
+    def list_roots(self, timeout=60):
+        # type: (int) -> Dict[str, Any]
+        """Request roots from the connected MCP client."""
+        if not self._server:
+            raise RuntimeError("Context is not attached to a server")
+        return self._server.request_roots(self._session_id, timeout=timeout)
+
     def report_progress(self, progress, total=None, message=None):
         # type: (float, Optional[float], Optional[str]) -> None
         """
@@ -115,13 +172,20 @@ class Context(object):
 
         self.info("Progress: {}".format(progress_info))
 
-        # If server is available, could broadcast progress to clients
-        if self._server and hasattr(self._server, "_broadcast"):
+        # MCP spec: notifications/progress must carry the progressToken that
+        # the client originally sent in the request's _meta.progressToken so
+        # the client can correlate the notification with its in-flight call.
+        # If no token was provided, suppress the broadcast — emitting an
+        # uncorrelated notification would just be noise to the client.
+        if (
+            self._progress_token is not None
+            and self._server
+            and hasattr(self._server, "_broadcast")
+        ):
+            params = {"progressToken": self._progress_token}
+            params.update(progress_info)
             self._server._broadcast({
                 "jsonrpc": "2.0",
                 "method": "notifications/progress",
-                "params": {
-                    "requestId": self._request_id,
-                    **progress_info
-                }
-            })
+                "params": params
+            }, session_id=self._session_id)

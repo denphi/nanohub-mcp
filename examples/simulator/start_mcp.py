@@ -18,7 +18,7 @@ import sys
 # Add package path for development
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from nanohubmcp import MCPServer, Context
+from nanohubmcp import MCPServer, Context, ToolResult
 
 # Create server instance
 server = MCPServer("physics-simulator", version="1.0.0")
@@ -59,7 +59,8 @@ def projectile_motion(v0, angle, h0=0):
     # -0.5*g*t^2 + vy*t + h0 = 0
     discriminant = vy**2 + 2 * GRAVITY * h0
     if discriminant < 0:
-        return {"error": "Invalid parameters"}
+        return ToolResult(content="Invalid parameters (negative discriminant)",
+                          is_error=True)
 
     t_flight = (vy + math.sqrt(discriminant)) / GRAVITY
 
@@ -203,7 +204,10 @@ def ideal_gas(pressure=None, volume=None, n_moles=None, temperature=None):
     # Count provided values
     provided = sum(x is not None for x in [pressure, volume, n_moles, temperature])
     if provided != 3:
-        return {"error": "Provide exactly 3 of: pressure, volume, n_moles, temperature"}
+        return ToolResult(
+            content="Provide exactly 3 of: pressure, volume, n_moles, temperature",
+            is_error=True,
+        )
 
     if pressure is None:
         P = float(n_moles) * R * float(temperature) / float(volume)
@@ -254,7 +258,8 @@ def relativistic_energy(ctx, rest_mass, velocity):
     v = float(velocity)
 
     if abs(v) >= SPEED_OF_LIGHT:
-        return {"error": "Velocity must be less than speed of light"}
+        return ToolResult(content="Velocity must be less than speed of light",
+                          is_error=True)
 
     ctx.info("Calculating relativistic properties for v = {} m/s".format(v))
 

@@ -66,6 +66,37 @@ def calculate(expression):
     ]
 
 
+@server.tool()
+def progress_tool(ctx):
+    """Emit a progress notification then return."""
+    ctx.report_progress(0.5, total=1.0, message="halfway")
+    return "done"
+
+
+@server.tool()
+def progress_token_echo(ctx):
+    """Emit progress and return the token the context observed."""
+    ctx.report_progress(0.25, total=1.0)
+    return {"token": ctx.progress_token}
+
+
+@server.tool()
+def ask_user(ctx):
+    """Request a value through MCP elicitation."""
+    result = ctx.elicit(
+        "Choose a project name",
+        {
+            "type": "object",
+            "properties": {
+                "project": {"type": "string"}
+            },
+            "required": ["project"]
+        },
+        timeout=5
+    )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -124,7 +155,7 @@ def test_server_info():
     assert status == 200
     assert body["name"] == "test-calculator"
     assert body["status"] == "running"
-    assert body["tools"] >= 2  # includes built-in get_job_result
+    assert body["tools"] >= 2  # add, divide, ask_user, progress_tool
     assert body["resources"] == 1
     assert body["prompts"] == 1
     assert "endpoints" in body
@@ -151,12 +182,14 @@ def test_sse_connection():
 
 
 def test_streamable_http_get():
-    """GET /mcp returns an SSE stream with an endpoint event."""
-    status, content_type, lines = _read_sse("/mcp")
+    """GET /mcp returns an SSE stream with open + endpoint events."""
+    status, content_type, lines = _read_sse("/mcp", lines_to_read=6)
     assert status == 200
     assert "text/event-stream" in content_type
-    assert "event: endpoint" in lines[0]
-    assert "data: /mcp" in lines[1]
+    assert "event: open" in lines[0]
+    # After "event: open", "data: {}", blank line, "event: endpoint", "data: ..."
+    endpoint_idx = next(i for i, line in enumerate(lines) if "event: endpoint" in line)
+    assert lines[endpoint_idx + 1].startswith("data: /mcp?session_id=")
 
 
 # ---------------------------------------------------------------------------
@@ -311,14 +344,15 @@ def test_notification_returns_accepted():
 
 
 def test_mcp_post_initialize():
-    """POST /mcp handles JSON-RPC requests asynchronously and returns 202."""
+    """POST /mcp returns fast JSON-RPC responses synchronously."""
     status, body = _post("/mcp", {"jsonrpc": "2.0", "id": 100, "method": "initialize", "params": {}})
-    assert status == 202
-    assert body["status"] == "accepted"
+    assert status == 200
+    assert body["id"] == 100
+    assert body["result"]["serverInfo"]["name"] == "test-calculator"
 
 
 def test_mcp_post_tools_call():
-    """POST /mcp handles tool calls asynchronously and returns 202."""
+    """POST /mcp returns non-async tool calls synchronously."""
     status, body = _post(
         "/mcp",
         {
@@ -328,8 +362,10 @@ def test_mcp_post_tools_call():
             "params": {"name": "add", "arguments": {"a": 10, "b": 20}},
         },
     )
-    assert status == 202
-    assert body["status"] == "accepted"
+    assert status == 200
+    assert body["id"] == 101
+    assert body["result"]["isError"] is False
+    assert "30" in body["result"]["content"][0]["text"]
 
 
 # ---------------------------------------------------------------------------
@@ -400,28 +436,457 @@ def test_mcp_discovery():
 # ---------------------------------------------------------------------------
 
 
-def test_sse_receives_broadcast():
-    """SSE stream receives broadcast when POST is made."""
+def test_sse_receives_session_response_only():
+    """SSE stream receives only responses for its session."""
     conn_sse = HTTPConnection("127.0.0.1", PORT, timeout=5)
     conn_sse.request("GET", "/sse")
     resp_sse = conn_sse.getresponse()
-    # Read the open event
+    session_id = resp_sse.getheader("Mcp-Session-Id")
+    assert session_id
+
     resp_sse.readline()  # event: open
     resp_sse.readline()  # data: {}
     resp_sse.readline()  # empty line
+    resp_sse.readline()  # event: endpoint
+    resp_sse.readline()  # data: /?session_id=...
+    resp_sse.readline()  # empty line
 
-    # Send a request
-    _post("/", {"jsonrpc": "2.0", "id": 200, "method": "ping", "params": {}})
+    conn_other = HTTPConnection("127.0.0.1", PORT, timeout=1)
+    conn_other.request("GET", "/sse")
+    resp_other = conn_other.getresponse()
+    other_session_id = resp_other.getheader("Mcp-Session-Id")
+    assert other_session_id and other_session_id != session_id
+    for _ in range(6):
+        resp_other.readline()
 
-    # Read broadcast from SSE
+    _post("/?session_id={}".format(session_id), {
+        "jsonrpc": "2.0",
+        "id": 200,
+        "method": "ping",
+        "params": {}
+    })
+
     event_line = resp_sse.readline().decode("utf-8").strip()
     data_line = resp_sse.readline().decode("utf-8").strip()
     conn_sse.close()
+
+    try:
+        leaked_line = resp_other.readline()
+    except Exception:
+        leaked_line = b""
+    conn_other.close()
 
     assert event_line == "event: message"
     assert data_line.startswith("data: ")
     response = json.loads(data_line[6:])
     assert response["id"] == 200
+    assert leaked_line == b""
+
+
+def test_tool_can_request_elicitation_from_client():
+    """A tool can send elicitation/create and wait for the client response."""
+    conn_sse = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn_sse.request("GET", "/mcp")
+    resp_sse = conn_sse.getresponse()
+    session_id = resp_sse.getheader("Mcp-Session-Id")
+    assert session_id
+    resp_sse.readline()  # event: open
+    resp_sse.readline()  # data: {}
+    resp_sse.readline()  # empty line
+    resp_sse.readline()  # event: endpoint
+    resp_sse.readline()  # data: /mcp?session_id=...
+    resp_sse.readline()  # empty line
+
+    status, body = _post(
+        "/mcp?session_id={}".format(session_id),
+        {
+            "jsonrpc": "2.0",
+            "id": 300,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"elicitation": {"form": {}}},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"}
+            },
+        },
+    )
+    assert status == 200
+    assert body["result"]["protocolVersion"] == "2025-11-25"
+    resp_sse.readline()  # event: message
+    resp_sse.readline()  # data: initialize response
+    resp_sse.readline()  # empty line
+
+    tool_result = []
+
+    def call_tool():
+        tool_result.append(_post(
+            "/mcp?session_id={}".format(session_id),
+            {
+                "jsonrpc": "2.0",
+                "id": 301,
+                "method": "tools/call",
+                "params": {"name": "ask_user", "arguments": {}},
+            },
+        ))
+
+    thread = threading.Thread(target=call_tool)
+    thread.daemon = True
+    thread.start()
+
+    event_line = resp_sse.readline().decode("utf-8").strip()
+    data_line = resp_sse.readline().decode("utf-8").strip()
+    assert event_line == "event: message"
+    request = json.loads(data_line[6:])
+    assert request["method"] == "elicitation/create"
+    assert request["params"]["mode"] == "form"
+    assert request["params"]["requestedSchema"]["required"] == ["project"]
+
+    status, body = _post(
+        "/mcp?session_id={}".format(session_id),
+        {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "action": "accept",
+                "content": {"project": "demo"}
+            },
+        },
+    )
+    assert status == 202
+    assert body["status"] == "accepted"
+
+    thread.join(5)
+    conn_sse.close()
+    assert tool_result
+    status, body = tool_result[0]
+    assert status == 200
+    assert body["id"] == 301
+    content = json.loads(body["result"]["content"][0]["text"])
+    assert content["action"] == "accept"
+    assert content["content"]["project"] == "demo"
+
+
+def test_report_progress_broadcasts_to_session_sse():
+    """Regression: ctx.report_progress must reach the client's SSE stream.
+
+    Previously _broadcast became a no-op without a session_id, and
+    Context.report_progress passed none — so notifications were silently
+    dropped. This test asserts the notification arrives on /mcp's SSE.
+    """
+    conn_sse = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn_sse.request("GET", "/mcp")
+    resp_sse = conn_sse.getresponse()
+    session_id = resp_sse.getheader("Mcp-Session-Id")
+    assert session_id
+    resp_sse.readline()  # event: open
+    resp_sse.readline()  # data: {}
+    resp_sse.readline()  # empty
+    resp_sse.readline()  # event: endpoint
+    resp_sse.readline()  # data: /mcp?session_id=...
+    resp_sse.readline()  # empty
+
+    tool_result = []
+
+    def call_tool():
+        tool_result.append(_post(
+            "/mcp?session_id={}".format(session_id),
+            {
+                "jsonrpc": "2.0",
+                "id": 401,
+                "method": "tools/call",
+                "params": {
+                    "name": "progress_tool",
+                    "arguments": {},
+                    # Per MCP spec: progressToken in _meta enables progress
+                    # notifications. Without it the server suppresses them.
+                    "_meta": {"progressToken": "tok-401"},
+                },
+            },
+        ))
+
+    thread = threading.Thread(target=call_tool)
+    thread.daemon = True
+    thread.start()
+
+    # Drain SSE looking for the progress notification
+    saw_progress = False
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        line = resp_sse.readline().decode("utf-8").strip()
+        if not line:
+            continue
+        if line.startswith("data: "):
+            payload = json.loads(line[6:])
+            if payload.get("method") == "notifications/progress":
+                params = payload.get("params", {})
+                assert params.get("progressToken") == "tok-401"
+                assert "requestId" not in params
+                assert params.get("progress") == 0.5
+                assert params.get("total") == 1.0
+                assert params.get("message") == "halfway"
+                saw_progress = True
+                break
+
+    thread.join(3)
+    conn_sse.close()
+    assert saw_progress, "report_progress did not reach the SSE stream"
+
+
+def test_report_progress_suppressed_without_token():
+    """Without a progressToken, report_progress must not emit a notification."""
+    from nanohubmcp.server import MCPServer
+    from nanohubmcp.context import Context
+
+    emitted = []
+
+    class FakeServer(MCPServer):
+        def _broadcast(self, message, session_id=None):
+            emitted.append((message, session_id))
+
+    s = FakeServer("noprog")
+    ctx = Context(server=s, request_id="r", session_id="sess", progress_token=None)
+    ctx.report_progress(0.5, total=1.0)
+    assert emitted == []
+
+    ctx2 = Context(server=s, request_id="r", session_id="sess", progress_token="tok-1")
+    ctx2.report_progress(0.5, total=1.0)
+    assert len(emitted) == 1
+    msg, sid = emitted[0]
+    assert msg["params"]["progressToken"] == "tok-1"
+    assert sid == "sess"
+
+
+def test_jsonrpc_empty_method_returns_minus_32600():
+    """Missing/empty method is Invalid Request, not Method Not Found."""
+    status, body = _post("/", {"jsonrpc": "2.0", "id": 77, "method": ""})
+    assert status == 200
+    assert body["error"]["code"] == -32600
+
+
+def test_notification_invalid_params_gets_no_reply():
+    """Notifications (no id) must never receive an error response body."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    data = json.dumps({"jsonrpc": "2.0", "method": "ping", "params": "bad"}).encode("utf-8")
+    conn.request("POST", "/", body=data,
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    raw = resp.read()
+    conn.close()
+    # Server returns 202 accepted with a status body, no JSON-RPC envelope.
+    assert resp.status == 202
+    assert b"error" not in raw
+
+
+def test_request_client_fails_fast_without_stream():
+    """Server-to-client requests must error immediately if no SSE is connected."""
+    import pytest
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("nostream")
+    # Mark client as supporting elicitation so we get past the capability check
+    s._sessions["sess-x"] = {"capabilities": {"elicitation": {"form": {}}}}
+
+    with pytest.raises(RuntimeError) as excinfo:
+        s.request_elicitation(
+            session_id="sess-x",
+            message="hi",
+            requested_schema={"type": "object", "properties": {}, "required": []},
+            timeout=10,
+        )
+    assert "No active client stream" in str(excinfo.value)
+
+
+def test_session_state_cleared_on_disconnect():
+    """When the last SSE queue closes, _sessions and pending entries are dropped."""
+    from nanohubmcp.server import MCPServer, _SSEQueue
+
+    s = MCPServer("cleanup")
+    s._sessions["sess-y"] = {"capabilities": {"sampling": {}}}
+    s._pending_client_requests["sess-y:server-1"] = {
+        "event": threading.Event(),
+        "response": None,
+    }
+    q = _SSEQueue()
+    s._register_client("sess-y", q)
+
+    s._unregister_client("sess-y", q)
+
+    assert "sess-y" not in s._clients
+    assert "sess-y" not in s._sessions
+    assert "sess-y:server-1" not in s._pending_client_requests
+
+
+def test_direct_tool_call_rejects_context_tool():
+    """Regression: /tools/<name> must refuse tools that need an MCP session."""
+    status, body = _post("/tools/progress_tool", {})
+    assert status == 409
+    assert "MCP session" in body["error"]
+
+
+def test_post_malformed_json_returns_400():
+    """Bad JSON in the request body produces 400, not 500."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.request(
+        "POST", "/mcp", body=b"{not json",
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 400
+
+
+def test_post_invalid_content_length_returns_400():
+    """A non-integer Content-Length header produces 400."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    # Use raw socket since HTTPConnection enforces numeric content-length
+    conn.putrequest("POST", "/mcp")
+    conn.putheader("Content-Type", "application/json")
+    conn.putheader("Content-Length", "abc")
+    conn.endheaders()
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 400
+
+
+def test_post_unknown_path_returns_404_without_reading_body():
+    """POST to an unknown path is rejected before reading the body."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}).encode("utf-8")
+    conn.request("POST", "/no-such-endpoint", body=data,
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 404
+
+
+def test_tools_call_non_object_arguments_returns_minus_32602():
+    """tools/call with arguments=<string> produces -32602, not -32603."""
+    status, body = _post("/", {
+        "jsonrpc": "2.0", "id": 88, "method": "tools/call",
+        "params": {"name": "add", "arguments": "not-an-object"},
+    })
+    assert status == 200
+    assert body["error"]["code"] == -32602
+    assert "object" in body["error"]["message"]
+
+
+def test_get_unknown_path_returns_404():
+    """GET to an unknown path 404s instead of returning server info."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.request("GET", "/no-such-thing")
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 404
+
+
+def test_get_favicon_returns_204():
+    """Browsers probing for /favicon.ico get a cheap 204."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.request("GET", "/favicon.ico")
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 204
+
+
+def test_jsonrpc_invalid_params_returns_minus_32602():
+    """Non-object params produce a JSON-RPC -32602 error, not a 500."""
+    status, body = _post("/", {"jsonrpc": "2.0", "id": 99, "method": "ping", "params": "nope"})
+    assert status == 200
+    assert body["id"] == 99
+    assert body["error"]["code"] == -32602
+    assert "object" in body["error"]["message"]
+
+
+def test_post_oversized_body_returns_413():
+    """A body larger than MAX_REQUEST_BYTES is refused with 413."""
+    from nanohubmcp.server import MAX_REQUEST_BYTES
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.putrequest("POST", "/mcp")
+    conn.putheader("Content-Type", "application/json")
+    conn.putheader("Content-Length", str(MAX_REQUEST_BYTES + 1))
+    conn.endheaders()
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 413
+
+
+def test_direct_tool_call_rejects_non_object_body():
+    """POST /tools/<name> with a non-object body returns 400."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.request(
+        "POST",
+        "/tools/add",
+        body=b"[1, 2, 3]",
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    raw = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 400
+    body = json.loads(raw)
+    assert "JSON object" in body["error"]
+
+
+def test_direct_tool_call_unknown_kwarg_is_400():
+    """Unexpected kwargs surface as 400, not 500."""
+    status, body = _post("/tools/add", {"a": 1, "b": 2, "extra": "boom"})
+    assert status == 400
+    assert "extra" in body["error"] or "unexpected" in body["error"].lower()
+
+
+def test_async_job_consumed_after_first_successful_poll():
+    """get_job_result must drop terminal jobs so memory doesn't leak."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("jobsrv")
+
+    @s.async_tool()
+    def slow():
+        return "done"
+
+    with s._jobs_lock:
+        s._jobs["jid-1"] = {"status": "done", "result": "ok"}
+
+    # First poll returns the result and removes the entry
+    handler = s._tools["get_job_result"]["handler"]
+    first = handler(job_id="jid-1")
+    assert first["status"] == "done"
+    assert first["result"] == "ok"
+    assert "jid-1" not in s._jobs
+
+    # Second poll sees a not_found
+    second = handler(job_id="jid-1")
+    assert second["status"] == "not_found"
+
+
+def test_get_job_result_not_registered_without_async_tools():
+    """Servers without any @async_tool must not advertise get_job_result."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("noasync")
+
+    @s.tool()
+    def add(a, b):
+        return a + b
+
+    assert "get_job_result" not in s._tools
+    assert s._job_polling_registered is False
+
+
+def test_openapi_omits_context_tools():
+    """OpenAPI schema must not advertise context-only tools as REST endpoints."""
+    status, body = _get("/openapi.json")
+    assert status == 200
+    paths = body.get("paths", {})
+    assert "/tools/add" in paths
+    assert "/tools/progress_tool" not in paths
+    assert "/tools/ask_user" not in paths
 
 
 # ---------------------------------------------------------------------------

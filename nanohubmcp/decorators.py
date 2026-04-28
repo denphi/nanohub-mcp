@@ -1,6 +1,6 @@
 """
 Decorators for defining MCP tools, resources, and prompts.
-Compatible with Python 3.6+ and aligned with FastMCP API.
+Compatible with Python 3.7+ and aligned with FastMCP API.
 """
 
 from __future__ import print_function
@@ -9,7 +9,7 @@ import inspect
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Set
 
-# get_type_hints may fail on some Python 3.6 edge cases
+# get_type_hints may fail on exotic callables; keep an Optional reference.
 try:
     from typing import get_type_hints
 except ImportError:

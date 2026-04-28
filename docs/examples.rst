@@ -80,6 +80,164 @@ On error:
    An AI client (e.g. Claude) will call it automatically after receiving a ``job_id``.
 
 
+Elicitation
+------------
+
+Elicitation lets a tool ask the connected MCP client to collect additional user input during a tool call.
+The client must advertise the ``elicitation`` capability during initialization. The server then sends an
+``elicitation/create`` request over the session stream and waits for the client response.
+
+.. code-block:: python
+
+   from nanohubmcp import MCPServer, Context
+
+   server = MCPServer("elicitation-demo", version="1.0.0")
+
+   @server.tool()
+   def create_project(ctx):
+       # type: (Context) -> dict
+       """Ask the user for project details before creating a project."""
+       response = ctx.elicit(
+           "Choose a project name",
+           {
+               "type": "object",
+               "properties": {
+                   "project_name": {
+                       "type": "string",
+                       "title": "Project name",
+                       "minLength": 3
+                   },
+                   "visibility": {
+                       "type": "string",
+                       "title": "Visibility",
+                       "enum": ["private", "shared"],
+                       "default": "private"
+                   }
+               },
+               "required": ["project_name"]
+           },
+           timeout=60
+       )
+
+       if response.get("action") != "accept":
+           return {
+               "created": False,
+               "reason": response.get("action", "cancel")
+           }
+
+       content = response.get("content", {})
+       return {
+           "created": True,
+           "project_name": content.get("project_name"),
+           "visibility": content.get("visibility", "private")
+       }
+
+   if __name__ == "__main__":
+       server.run(port=8000)
+
+**Protocol flow:**
+
+1. The client opens the stream and gets a session id.
+
+.. code-block:: bash
+
+   curl -N http://localhost:8000/mcp
+
+.. code-block:: text
+
+   event: endpoint
+   data: /mcp?session_id=abc-123
+
+2. The client initializes and declares elicitation support.
+
+.. code-block:: bash
+
+   curl -X POST "http://localhost:8000/mcp?session_id=abc-123" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "jsonrpc": "2.0",
+       "id": 1,
+       "method": "initialize",
+       "params": {
+         "protocolVersion": "2025-11-25",
+         "capabilities": {
+           "elicitation": {
+             "form": {}
+           }
+         },
+         "clientInfo": {
+           "name": "example-client",
+           "version": "1.0.0"
+         }
+       }
+     }'
+
+3. The client calls the tool.
+
+.. code-block:: bash
+
+   curl -X POST "http://localhost:8000/mcp?session_id=abc-123" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "jsonrpc": "2.0",
+       "id": 2,
+       "method": "tools/call",
+       "params": {
+         "name": "create_project",
+         "arguments": {}
+       }
+     }'
+
+4. While the tool call is waiting, the stream receives the server request.
+
+.. code-block:: json
+
+   {
+     "jsonrpc": "2.0",
+     "id": "server-...",
+     "method": "elicitation/create",
+     "params": {
+       "mode": "form",
+       "message": "Choose a project name",
+       "requestedSchema": {
+         "type": "object",
+         "properties": {
+           "project_name": {"type": "string", "title": "Project name", "minLength": 3},
+           "visibility": {"type": "string", "title": "Visibility", "enum": ["private", "shared"], "default": "private"}
+         },
+         "required": ["project_name"]
+       }
+     }
+   }
+
+5. The client shows a form to the user, then posts the response using the same ``id``.
+
+.. code-block:: bash
+
+   curl -X POST "http://localhost:8000/mcp?session_id=abc-123" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "jsonrpc": "2.0",
+       "id": "server-...",
+       "result": {
+         "action": "accept",
+         "content": {
+           "project_name": "demo-project",
+           "visibility": "shared"
+         }
+       }
+     }'
+
+The original ``tools/call`` then completes with the accepted form data. Clients may also return
+``{"action": "decline"}`` or ``{"action": "cancel"}``, and the tool should handle those cases.
+
+.. note::
+
+   Form-mode elicitation must not be used for secrets such as API keys, passwords, access tokens,
+   or payment credentials. Use ``ctx.elicit_url(...)`` for flows where sensitive information should
+   be collected outside the MCP client.
+
+
 Simple Calculator
 -----------------
 

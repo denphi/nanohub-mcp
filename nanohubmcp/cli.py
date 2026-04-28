@@ -12,6 +12,7 @@ On nanoHUB:
 from __future__ import print_function
 
 import argparse
+import atexit
 import json
 import os
 import signal
@@ -143,7 +144,7 @@ def get_proxy_addr():
     if not os.path.exists(fn):
         return None, None, None
 
-    url = fxp = fxc = None
+    url = fxp = fxc = full_port = None
     with open(fn) as f:
         for line in f:
             if line.startswith("hub_url"):
@@ -225,6 +226,16 @@ else:
     fd, path = tempfile.mkstemp(prefix="mcp_runner_", suffix=".py")
     with os.fdopen(fd, "w") as f:
         f.write(runner_code)
+
+    # Remove the runner on interpreter exit so repeated invocations don't
+    # leak temp files into /tmp.
+    def _cleanup(p=path):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    atexit.register(_cleanup)
+
     return path
 
 
