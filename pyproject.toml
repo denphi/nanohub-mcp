@@ -7,7 +7,7 @@ name = "nanohub-mcp"
 dynamic = ["version"]
 description = "MCP (Model Context Protocol) server library for nanoHUB tools"
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 authors = [
     {name = "nanoHUB", email = "support@nanohub.org"}
 ]
