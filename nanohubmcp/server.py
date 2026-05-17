@@ -49,7 +49,13 @@ from .decorators import tool, async_tool, resource, prompt
 from .context import Context
 
 
-SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2024-11-05"]
+SUPPORTED_PROTOCOL_VERSIONS = ["2026-01-26", "2025-11-25", "2025-06-18", "2024-11-05"]
+
+# MCP Apps extension (https://github.com/modelcontextprotocol/ext-apps).
+# Servers advertising this extension can attach UI resources to tools via
+# `_meta.ui.resourceUri` and serve `text/html;profile=mcp-app` resources.
+MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
+MCP_APPS_MIME_TYPE = "text/html;profile=mcp-app"
 
 # Seconds between SSE heartbeats — keeps idle connections alive through proxies
 # (nginx, wrwroxy, etc.) that drop connections after ~30-60s of inactivity.
@@ -299,7 +305,8 @@ class MCPServer(object):
             "definition": Tool(
                 name=name,
                 description=func._mcp_tool_description,
-                inputSchema=func._mcp_tool_input_schema
+                inputSchema=func._mcp_tool_input_schema,
+                meta=getattr(func, "_mcp_tool_meta", None) or {},
             ),
             "handler": func,
             "is_async": is_async,
@@ -323,7 +330,8 @@ class MCPServer(object):
                 uri=uri,
                 name=func._mcp_resource_name,
                 description=func._mcp_resource_description,
-                mimeType=func._mcp_resource_mime_type
+                mimeType=func._mcp_resource_mime_type,
+                meta=getattr(func, "_mcp_resource_meta", None) or {},
             ),
             "handler": func
         }
@@ -473,12 +481,32 @@ class MCPServer(object):
     def _get_capabilities(self):
         # type: () -> ServerCapabilities
         """Get server capabilities based on registered handlers."""
+        extensions = {}
+        if self._has_mcp_app_resources():
+            # Advertise mcp-apps support so capable hosts know they can render
+            # the UI resources attached to our tools.
+            extensions[MCP_APPS_EXTENSION_ID] = {
+                "mimeTypes": [MCP_APPS_MIME_TYPE]
+            }
         return ServerCapabilities(
             tools=len(self._tools) > 0,
             resources=len(self._resources) > 0,
             prompts=len(self._prompts) > 0,
-            logging=True
+            logging=True,
+            extensions=extensions,
         )
+
+    def _has_mcp_app_resources(self):
+        # type: () -> bool
+        """True if any registered resource is an MCP App (ui:// HTML template)."""
+        for entry in self._resources.values():
+            definition = entry["definition"]
+            mime = getattr(definition, "mimeType", None) or ""
+            if "profile=mcp-app" in mime:
+                return True
+            if getattr(definition, "uri", "").startswith("ui://"):
+                return True
+        return False
 
     def _context_param_name(self, func):
         # type: (Callable) -> Optional[str]
@@ -849,7 +877,11 @@ class MCPServer(object):
                 if lookup_uri not in self._resources:
                     error = {"code": -32601, "message": "Resource not found: {}".format(uri)}
                 else:
-                    handler = self._resources[lookup_uri]["handler"]
+                    entry = self._resources[lookup_uri]
+                    handler = entry["handler"]
+                    definition = entry["definition"]
+                    res_mime = getattr(definition, "mimeType", None)
+                    res_meta = getattr(definition, "meta", None) or {}
                     try:
                         content = self._call_handler(
                             handler, msg_id,
@@ -874,6 +906,18 @@ class MCPServer(object):
                                     "text": str(content)
                                 }]
                             }
+
+                        # Decorate each content entry with the registered
+                        # mimeType and `_meta` (mcp-apps CSP, permissions,
+                        # etc.). Don't override values the handler already
+                        # supplied via ResourceContent.
+                        for item in result.get("contents", []):
+                            if not isinstance(item, dict):
+                                continue
+                            if res_mime and "mimeType" not in item:
+                                item["mimeType"] = res_mime
+                            if res_meta and "_meta" not in item:
+                                item["_meta"] = res_meta
                     except Exception as e:
                         traceback.print_exc()
                         error = {"code": -32603, "message": str(e)}

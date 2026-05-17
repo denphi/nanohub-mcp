@@ -34,7 +34,8 @@ BOLTZMANN_CONSTANT = 1.380649e-23  # J/K
 # TOOLS
 # =============================================================================
 
-@server.tool()
+@server.tool(meta={"ui": {"resourceUri": "ui://physics-simulator/projectile",
+                          "visibility": ["model", "app"]}})
 def projectile_motion(v0, angle, h0=0):
     # type: (float, float, float) -> dict
     """
@@ -89,7 +90,8 @@ def projectile_motion(v0, angle, h0=0):
     }
 
 
-@server.tool()
+@server.tool(meta={"ui": {"resourceUri": "ui://physics-simulator/oscillator",
+                          "visibility": ["model", "app"]}})
 def harmonic_oscillator(mass, spring_constant, amplitude, time):
     # type: (float, float, float, float) -> dict
     """
@@ -281,6 +283,279 @@ def relativistic_energy(ctx, rest_mass, velocity):
         "total_energy_J": total_energy,
         "momentum_kg_m_s": momentum
     }
+
+
+# =============================================================================
+# MCP APPS (UI resources, per https://github.com/modelcontextprotocol/ext-apps)
+# =============================================================================
+
+_MCP_APP_MIME = "text/html;profile=mcp-app"
+
+# Shared JS bridge: every app talks to the host via JSON-RPC over postMessage.
+# `tool-result` notifications carry structuredContent (preferred) and a
+# `content` array as a text fallback when structured data is absent.
+#
+# The HTML templates embed this bridge by interpolating the literal token
+# `__BRIDGE__` (see `.replace("__BRIDGE__", _MCP_BRIDGE_JS)` below). Don't put
+# that string anywhere else in the HTML or it will be substituted too.
+#
+# NOTE on `postMessage` origins: this example uses `'*'` for simplicity. In
+# production, scope the target origin to the host-allocated sandbox domain
+# advertised via `_meta.ui.domain` (see the mcp-apps spec). `'*'` is fine for
+# local dev but lets any embedding frame receive messages this view sends.
+_MCP_BRIDGE_JS = r"""
+<script>
+  let _nextId = 1;
+  const _pending = new Map();
+  // Example only — see the Python comment above about scoping this origin.
+  const _hostOrigin = "*";
+  function rpc(method, params) {
+    const id = _nextId++;
+    return new Promise((resolve, reject) => {
+      _pending.set(id, { resolve, reject });
+      window.parent.postMessage({ jsonrpc: "2.0", id, method, params: params || {} }, _hostOrigin);
+    });
+  }
+  function notify(method, params) {
+    window.parent.postMessage({ jsonrpc: "2.0", method, params: params || {} }, _hostOrigin);
+  }
+  window.addEventListener("message", (event) => {
+    const msg = event.data;
+    if (!msg || typeof msg !== "object") return;
+    if (msg.id !== undefined && _pending.has(msg.id)) {
+      const { resolve, reject } = _pending.get(msg.id);
+      _pending.delete(msg.id);
+      if (msg.error) reject(new Error(msg.error.message || "RPC error"));
+      else resolve(msg.result);
+      return;
+    }
+    if (msg.method === "ui/notifications/tool-result" && typeof window.onToolResult === "function") {
+      window.onToolResult(msg.params || {});
+    }
+    if (msg.method === "ui/notifications/tool-input" && typeof window.onToolInput === "function") {
+      window.onToolInput(msg.params || {});
+    }
+  });
+  function extractResult(params) {
+    if (params && params.structuredContent) return params.structuredContent;
+    const content = (params && params.content) || [];
+    for (const item of content) {
+      if (item.type === "text") {
+        try { return JSON.parse(item.text); } catch (_) { return { text: item.text }; }
+      }
+    }
+    return {};
+  }
+  async function run(tool, args) {
+    const res = await rpc("tools/call", { name: tool, arguments: args });
+    return extractResult(res);
+  }
+  // True when this view is embedded by an mcp-apps host. Apps should wait for
+  // `ui/notifications/tool-result` instead of eagerly calling the tool, so they
+  // don't race the host's first invocation.
+  const isEmbedded = window.parent !== window;
+  function reportSize() {
+    notify("ui/notifications/size-changed", {
+      width: document.documentElement.scrollWidth,
+      height: document.documentElement.scrollHeight,
+    });
+  }
+  rpc("ui/initialize", {
+    capabilities: {},
+    clientInfo: { name: "physics-simulator-app", version: "1.0.0" },
+    protocolVersion: "2026-01-26",
+  }).then(() => notify("ui/notifications/initialized", {}))
+    .catch(() => {});
+  new ResizeObserver(reportSize).observe(document.documentElement);
+</script>
+""".strip()
+
+_PROJECTILE_APP_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Projectile Motion</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#0b1020;color:#e6ecff}
+ h2{margin:0 0 12px 0;font-size:18px}
+ form{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;margin-bottom:12px}
+ input{background:#1a2244;color:#e6ecff;border:1px solid #2a3470;border-radius:4px;padding:6px}
+ button{background:#4f7cff;color:#fff;border:0;border-radius:4px;padding:8px 14px;cursor:pointer;grid-column:1/-1}
+ button:hover{background:#3d68e8}
+ canvas{background:#070b1a;border:1px solid #2a3470;border-radius:4px;display:block;width:100%;height:260px}
+ .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px;font-size:13px}
+ .stat{background:#141a35;padding:8px;border-radius:4px}
+ .stat b{display:block;color:#8aa0ff;font-weight:500;font-size:11px;text-transform:uppercase}
+</style></head>
+<body>
+  <h2>Projectile Motion</h2>
+  <form id="f">
+    <label for="v0">v<sub>0</sub> (m/s)</label><input id="v0" type="number" value="30" step="1">
+    <label for="angle">angle (deg)</label><input id="angle" type="number" value="45" step="1">
+    <label for="h0">h<sub>0</sub> (m)</label><input id="h0" type="number" value="0" step="0.5">
+    <button type="submit">Simulate</button>
+  </form>
+  <canvas id="plot" width="600" height="260"></canvas>
+  <div class="stats">
+    <div class="stat"><b>Range</b><span id="r">—</span> m</div>
+    <div class="stat"><b>Max height</b><span id="h">—</span> m</div>
+    <div class="stat"><b>Flight time</b><span id="t">—</span> s</div>
+  </div>
+__BRIDGE__
+<script>
+  const $ = (id) => document.getElementById(id);
+  function draw(traj){
+    const c = $("plot"), ctx = c.getContext("2d");
+    ctx.clearRect(0,0,c.width,c.height);
+    if (!traj || !traj.length) return;
+    const xs = traj.map(p=>p.x), ys = traj.map(p=>p.y);
+    const xmax = Math.max(...xs, 1), ymax = Math.max(...ys, 1);
+    const pad = 24;
+    const sx = (c.width - 2*pad) / xmax;
+    const sy = (c.height - 2*pad) / ymax;
+    ctx.strokeStyle = "#2a3470"; ctx.beginPath();
+    ctx.moveTo(pad, c.height-pad); ctx.lineTo(c.width-pad, c.height-pad);
+    ctx.moveTo(pad, c.height-pad); ctx.lineTo(pad, pad); ctx.stroke();
+    ctx.strokeStyle = "#4f7cff"; ctx.lineWidth = 2; ctx.beginPath();
+    traj.forEach((p,i) => {
+      const x = pad + p.x*sx, y = c.height - pad - p.y*sy;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  }
+  function render(r){
+    if (!r || !r.trajectory) return;
+    $("r").textContent = r.range;
+    $("h").textContent = r.max_height;
+    $("t").textContent = r.time_of_flight;
+    draw(r.trajectory);
+  }
+  async function simulate(){
+    const args = { v0: +$("v0").value, angle: +$("angle").value, h0: +$("h0").value };
+    render(await run("projectile_motion", args));
+  }
+  window.onToolResult = (params) => render(extractResult(params));
+  $("f").addEventListener("submit", (e) => { e.preventDefault(); simulate(); });
+  // Standalone preview: kick off a default run. Embedded under an mcp-apps
+  // host: wait for the host to deliver the tool result via tool-result.
+  if (!isEmbedded) simulate();
+</script>
+</body></html>
+""".replace("__BRIDGE__", _MCP_BRIDGE_JS)
+
+
+_OSCILLATOR_APP_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Harmonic Oscillator</title>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:#0b1020;color:#e6ecff}
+ h2{margin:0 0 12px 0;font-size:18px}
+ form{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;margin-bottom:12px}
+ input{background:#1a2244;color:#e6ecff;border:1px solid #2a3470;border-radius:4px;padding:6px}
+ button{background:#22c55e;color:#03110a;font-weight:600;border:0;border-radius:4px;padding:8px 14px;cursor:pointer;grid-column:1/-1}
+ canvas{background:#070b1a;border:1px solid #2a3470;border-radius:4px;display:block;width:100%;height:240px}
+ .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:10px;font-size:13px}
+ .stat{background:#141a35;padding:8px;border-radius:4px}
+ .stat b{display:block;color:#86efac;font-weight:500;font-size:11px;text-transform:uppercase}
+</style></head>
+<body>
+  <h2>Simple Harmonic Oscillator</h2>
+  <form id="f">
+    <label for="m">mass (kg)</label><input id="m" type="number" value="1" step="0.1" min="0.01">
+    <label for="k">k (N/m)</label><input id="k" type="number" value="10" step="1" min="0.01">
+    <label for="A">amplitude (m)</label><input id="A" type="number" value="0.2" step="0.05">
+    <button type="submit">Simulate one period</button>
+  </form>
+  <canvas id="plot" width="600" height="240"></canvas>
+  <div class="stats">
+    <div class="stat"><b>Period T</b><span id="T">—</span> s</div>
+    <div class="stat"><b>ω</b><span id="w">—</span> rad/s</div>
+    <div class="stat"><b>Total E</b><span id="E">—</span> J</div>
+  </div>
+__BRIDGE__
+<script>
+  const $ = (id) => document.getElementById(id);
+  function plotSeries(series){
+    const c = $("plot"), ctx = c.getContext("2d");
+    ctx.clearRect(0,0,c.width,c.height);
+    const pad = 24;
+    const ts = series.map(p=>p.t), xs = series.map(p=>p.x);
+    const tmax = Math.max(...ts, 0.001);
+    const amax = Math.max(...xs.map(Math.abs), 0.001);
+    const sx = (c.width - 2*pad)/tmax;
+    const sy = (c.height/2 - pad)/amax;
+    const midY = c.height/2;
+    ctx.strokeStyle = "#2a3470"; ctx.beginPath();
+    ctx.moveTo(pad, midY); ctx.lineTo(c.width-pad, midY); ctx.stroke();
+    ctx.strokeStyle = "#22c55e"; ctx.lineWidth = 2; ctx.beginPath();
+    series.forEach((p,i) => {
+      const x = pad + p.t*sx;
+      const y = midY - p.x*sy;
+      if (i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  }
+  function render(r){
+    if (!r || !r.period) return;
+    $("T").textContent = r.period.toFixed(4);
+    $("w").textContent = r.angular_frequency.toFixed(4);
+    $("E").textContent = r.total_energy.toFixed(6);
+    // Sample one period analytically using the same formula as the server tool
+    const w = r.angular_frequency, T = r.period, A = +$("A").value;
+    const steps = 60, series = [];
+    for (let i=0; i<=steps; i++){
+      const t = T * i / steps;
+      series.push({ t, x: A*Math.cos(w*t) });
+    }
+    plotSeries(series);
+  }
+  async function simulate(){
+    const m = +$("m").value, k = +$("k").value, A = +$("A").value;
+    render(await run("harmonic_oscillator", { mass:m, spring_constant:k, amplitude:A, time:0 }));
+  }
+  window.onToolResult = (params) => render(extractResult(params));
+  $("f").addEventListener("submit", (e) => { e.preventDefault(); simulate(); });
+  // Standalone preview: kick off a default run. Embedded under an mcp-apps
+  // host: wait for the host to deliver the tool result via tool-result.
+  if (!isEmbedded) simulate();
+</script>
+</body></html>
+""".replace("__BRIDGE__", _MCP_BRIDGE_JS)
+
+
+def _default_app_meta():
+    # Build a fresh meta dict per call so each registered resource owns its
+    # nested csp/permissions objects (no shared mutable state across apps).
+    return {
+        "ui": {
+            "csp": {
+                "connectDomains": [],
+                "resourceDomains": [],
+                "frameDomains": [],
+                "baseUriDomains": [],
+            },
+            "permissions": {},
+            "prefersBorder": True,
+        }
+    }
+
+
+@server.resource(
+    "ui://physics-simulator/projectile",
+    mime_type=_MCP_APP_MIME,
+    description="Interactive projectile-motion simulator UI",
+    meta=_default_app_meta(),
+)
+def projectile_app():
+    """MCP App: projectile motion simulator UI."""
+    return _PROJECTILE_APP_HTML
+
+
+@server.resource(
+    "ui://physics-simulator/oscillator",
+    mime_type=_MCP_APP_MIME,
+    description="Interactive harmonic-oscillator simulator UI",
+    meta=_default_app_meta(),
+)
+def oscillator_app():
+    """MCP App: simple-harmonic-oscillator simulator UI."""
+    return _OSCILLATOR_APP_HTML
 
 
 # =============================================================================

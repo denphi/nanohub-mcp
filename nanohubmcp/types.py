@@ -37,11 +37,14 @@ class Tool(object):
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
-        return {
+        result = {
             "name": self.name,
             "description": self.description,
             "inputSchema": self.inputSchema
         }
+        if self.meta:
+            result["_meta"] = self.meta
+        return result
 
 
 class TextContent(object):
@@ -144,6 +147,8 @@ class Resource(object):
             result["description"] = self.description
         if self.mimeType:
             result["mimeType"] = self.mimeType
+        if self.meta:
+            result["_meta"] = self.meta
         return result
 
 
@@ -339,12 +344,14 @@ GetPromptResult = PromptResult
 class ServerCapabilities(object):
     """Server capabilities advertised during initialization."""
 
-    def __init__(self, tools=False, resources=False, prompts=False, logging=False):
-        # type: (bool, bool, bool, bool) -> None
+    def __init__(self, tools=False, resources=False, prompts=False, logging=False,
+                 extensions=None):
+        # type: (bool, bool, bool, bool, Optional[Dict[str, Any]]) -> None
         self.tools = tools
         self.resources = resources
         self.prompts = prompts
         self.logging = logging
+        self.extensions = extensions or {}
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
@@ -357,6 +364,8 @@ class ServerCapabilities(object):
             caps["prompts"] = {"listChanged": False}
         if self.logging:
             caps["logging"] = {"listChanged": False}
+        if self.extensions:
+            caps["extensions"] = self.extensions
         return caps
 
 
