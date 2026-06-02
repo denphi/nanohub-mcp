@@ -209,13 +209,21 @@ Returns a standard MCP discovery document listing available transports:
        "resources": {},
        "prompts": {},
        "logging": {},
-       "extensions": {"io.modelcontextprotocol/tasks": {}}
+       "extensions": {
+         "io.modelcontextprotocol/ui": {"mimeTypes": ["text/html;profile=mcp-app"]},
+         "io.modelcontextprotocol/tasks": {}
+       }
      },
      "transports": [
        {"type": "sse", "endpoint": "/sse"},
        {"type": "streamable-http", "endpoint": "/mcp"}
      ]
    }
+
+The ``extensions`` block is advertised conditionally: ``io.modelcontextprotocol/ui``
+appears only when the server registers an MCP App resource (a ``ui://`` HTML
+template), and ``io.modelcontextprotocol/tasks`` appears only when the server
+registers at least one ``@server.async_tool()``.
 
 
 Error Handling
