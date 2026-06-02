@@ -71,7 +71,9 @@ The Streamable HTTP endpoint combines SSE and JSON-RPC in one path:
 JSON-RPC Methods
 ----------------
 
-All JSON-RPC requests use the standard format:
+JSON-RPC requests use the standard format below. ``POST /`` and ``POST /mcp`` also
+accept JSON-RPC batch arrays; the response is an array containing responses for
+requests with an ``id`` and omits notifications.
 
 .. code-block:: json
 
@@ -98,6 +100,12 @@ Supported methods:
      - List all registered tools with their input schemas
    * - ``tools/call``
      - Call a tool by name with arguments
+   * - ``tasks/get``
+     - Poll an MCP task created by an async tool call
+   * - ``tasks/update``
+     - Acknowledge task input responses when a task requires client input
+   * - ``tasks/cancel``
+     - Request cooperative cancellation of a task
    * - ``resources/list``
      - List all registered resources
    * - ``resources/read``
@@ -196,7 +204,13 @@ Returns a standard MCP discovery document listing available transports:
    {
      "mcpVersion": "2024-11-05",
      "serverInfo": {"name": "my-calculator", "version": "1.0.0"},
-     "capabilities": {"tools": {}, "resources": {}, "prompts": {}, "logging": {}},
+     "capabilities": {
+       "tools": {},
+       "resources": {},
+       "prompts": {},
+       "logging": {},
+       "extensions": {"io.modelcontextprotocol/tasks": {}}
+     },
      "transports": [
        {"type": "sse", "endpoint": "/sse"},
        {"type": "streamable-http", "endpoint": "/mcp"}

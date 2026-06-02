@@ -20,8 +20,10 @@ import json
 import os
 import sys
 import threading
+import time
 import traceback
 import uuid
+from datetime import datetime
 
 try:
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -56,6 +58,13 @@ SUPPORTED_PROTOCOL_VERSIONS = ["2026-01-26", "2025-11-25", "2025-06-18", "2024-1
 # `_meta.ui.resourceUri` and serve `text/html;profile=mcp-app` resources.
 MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
 MCP_APPS_MIME_TYPE = "text/html;profile=mcp-app"
+
+# MCP Tasks extension (https://github.com/modelcontextprotocol/experimental-ext-tasks).
+# Async tools can return a task handle to clients that opt into this extension,
+# while older clients continue to receive the existing get_job_result flow.
+MCP_TASKS_EXTENSION_ID = "io.modelcontextprotocol/tasks"
+MCP_TASK_TTL_MS = 60 * 60 * 1000
+MCP_TASK_POLL_INTERVAL_MS = 1000
 
 # Seconds between SSE heartbeats — keeps idle connections alive through proxies
 # (nginx, wrwroxy, etc.) that drop connections after ~30-60s of inactivity.
@@ -198,8 +207,18 @@ class MCPServer(object):
         arguments = dict(arguments) if arguments else {}
 
         job_id = str(uuid.uuid4())
+        now = self._utc_now()
         with self._jobs_lock:
-            self._jobs[job_id] = {"status": "running", "result": None}
+            self._jobs[job_id] = {
+                "status": "running",
+                "result": None,
+                "createdAt": now,
+                "lastUpdatedAt": now,
+                "ttlMs": MCP_TASK_TTL_MS,
+                "pollIntervalMs": MCP_TASK_POLL_INTERVAL_MS,
+                "session_id": session_id,
+                "expires_at": time.time() + (MCP_TASK_TTL_MS / 1000.0),
+            }
 
         server_instance = self
 
@@ -218,31 +237,132 @@ class MCPServer(object):
                     payload = call_result.to_dict()
                     if payload.get("isError"):
                         items = payload.get("content", [])
-                        message = items[0]["text"] if len(items) == 1 else payload
+                        message = (
+                            items[0]["text"]
+                            if len(items) == 1 and "text" in items[0]
+                            else payload
+                        )
                         with server_instance._jobs_lock:
+                            if server_instance._jobs[job_id].get("status") == "cancelled":
+                                return
                             server_instance._jobs[job_id]["status"] = "error"
                             server_instance._jobs[job_id]["result"] = message
+                            server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
                         return
-                    # Unwrap to a plain value so get_job_result can serialise it
-                    items = payload.get("content", [])
-                    result = items[0]["text"] if len(items) == 1 else payload
+                    result = payload
                 elif isinstance(call_result, dict):
                     result = call_result
                 else:
                     result = str(call_result)
                 with server_instance._jobs_lock:
+                    if server_instance._jobs[job_id].get("status") == "cancelled":
+                        return
                     server_instance._jobs[job_id]["status"] = "done"
                     server_instance._jobs[job_id]["result"] = result
+                    server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
             except Exception as e:
                 with server_instance._jobs_lock:
+                    if server_instance._jobs[job_id].get("status") == "cancelled":
+                        return
                     server_instance._jobs[job_id]["status"] = "error"
                     server_instance._jobs[job_id]["result"] = str(e)
+                    server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
                 traceback.print_exc()
 
         t = threading.Thread(target=_run)
         t.daemon = True
         t.start()
         return job_id
+
+    @staticmethod
+    def _utc_now():
+        # type: () -> str
+        """Return an MCP-friendly UTC timestamp."""
+        return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+    def _job_to_task(self, task_id, job, include_terminal_payload=True):
+        # type: (str, Dict[str, Any], bool) -> Dict[str, Any]
+        """Convert an internal async-job record into an MCP Task object."""
+        status_map = {
+            "running": "working",
+            "done": "completed",
+            "error": "failed",
+            "cancelled": "cancelled",
+        }
+        status = status_map.get(job.get("status"), "working")
+        now = self._utc_now()
+        task = {
+            "taskId": task_id,
+            "status": status,
+            "createdAt": job.get("createdAt", now),
+            "lastUpdatedAt": job.get("lastUpdatedAt", now),
+            "ttlMs": job.get("ttlMs", MCP_TASK_TTL_MS),
+            "pollIntervalMs": job.get("pollIntervalMs", MCP_TASK_POLL_INTERVAL_MS),
+        }
+        if status == "working":
+            task["statusMessage"] = "The operation is in progress."
+        elif status == "cancelled":
+            task["statusMessage"] = "Cancellation was requested."
+        elif include_terminal_payload and status == "completed":
+            task["result"] = self._tool_result_payload(job.get("result"))
+        elif include_terminal_payload and status == "failed":
+            task["error"] = {
+                "code": -32603,
+                "message": str(job.get("result", "Task failed")),
+            }
+        return task
+
+    def _tool_result_payload(self, value):
+        # type: (Any) -> Dict[str, Any]
+        """Wrap a stored async-tool value as a CallToolResult payload."""
+        if isinstance(value, ToolResult):
+            return value.to_dict()
+        if self._is_tool_result_payload(value):
+            return value
+        if isinstance(value, dict):
+            return {
+                "content": [{"type": "text", "text": json.dumps(value)}],
+                "isError": False,
+            }
+        return {
+            "content": [{"type": "text", "text": str(value)}],
+            "isError": False,
+        }
+
+    @staticmethod
+    def _is_tool_result_payload(value):
+        # type: (Any) -> bool
+        """Return True for dicts that already look like CallToolResult."""
+        return (
+            isinstance(value, dict)
+            and isinstance(value.get("content"), list)
+            and "isError" in value
+        )
+
+    def _task_access_error(self, task_id, job, session_id):
+        # type: (str, Optional[Dict[str, Any]], Optional[str]) -> Optional[Dict[str, Any]]
+        """Return a JSON-RPC error when the session cannot access a task."""
+        if job is None:
+            return {"code": -32602, "message": "Unknown taskId: {}".format(task_id)}
+        owner = job.get("session_id")
+        if not owner or owner != session_id:
+            return {
+                "code": -32003,
+                "message": "Task is not available in this session",
+            }
+        return None
+
+    def _prune_expired_jobs(self):
+        # type: () -> None
+        """Remove task/job records whose retention window has elapsed."""
+        now = time.time()
+        with self._jobs_lock:
+            expired = [
+                job_id for job_id, job in self._jobs.items()
+                if job.get("expires_at") is not None and job.get("expires_at") <= now
+            ]
+            for job_id in expired:
+                self._jobs.pop(job_id, None)
 
     def _strip_proxy_prefix(self, uri):
         # type: (str) -> str
@@ -488,6 +608,8 @@ class MCPServer(object):
             extensions[MCP_APPS_EXTENSION_ID] = {
                 "mimeTypes": [MCP_APPS_MIME_TYPE]
             }
+        if self._has_async_tools():
+            extensions[MCP_TASKS_EXTENSION_ID] = {}
         return ServerCapabilities(
             tools=len(self._tools) > 0,
             resources=len(self._resources) > 0,
@@ -507,6 +629,11 @@ class MCPServer(object):
             if getattr(definition, "uri", "").startswith("ui://"):
                 return True
         return False
+
+    def _has_async_tools(self):
+        # type: () -> bool
+        """True if the server has any long-running async tools."""
+        return any(t.get("is_async") for t in self._tools.values())
 
     def _context_param_name(self, func):
         # type: (Callable) -> Optional[str]
@@ -596,6 +723,29 @@ class MCPServer(object):
             return True
         if isinstance(value, dict):
             return mode in value
+        return False
+
+    def _client_supports_tasks(self, session_id=None, params=None):
+        # type: (Optional[str], Optional[Dict[str, Any]]) -> bool
+        """Return True when a client opted into the MCP Tasks extension."""
+        extension_sets = []
+
+        if isinstance(params, dict):
+            meta = params.get("_meta")
+            if isinstance(meta, dict):
+                request_caps = meta.get("io.modelcontextprotocol/clientCapabilities")
+                if isinstance(request_caps, dict):
+                    extension_sets.append(request_caps.get("extensions"))
+
+        capabilities = self._client_capabilities(session_id)
+        extension_sets.append(capabilities.get("extensions"))
+        experimental = capabilities.get("experimental")
+        if isinstance(experimental, dict):
+            extension_sets.append(experimental)
+
+        for extensions in extension_sets:
+            if isinstance(extensions, dict) and MCP_TASKS_EXTENSION_ID in extensions:
+                return True
         return False
 
     def _negotiate_protocol_version(self, requested):
@@ -738,9 +888,42 @@ class MCPServer(object):
             raise RuntimeError("Client does not support roots")
         return self._request_client(session_id, "roots/list", {}, timeout=timeout)
 
+    def _invalid_request(self, msg_id=None, message="Invalid Request"):
+        # type: (Optional[Any], str) -> Dict[str, Any]
+        """Build a JSON-RPC Invalid Request response."""
+        return {
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32600, "message": message},
+        }
+
+    def _handle_jsonrpc_message(self, message, session_id=None):
+        # type: (Any, Optional[str]) -> Optional[Dict[str, Any]]
+        """Handle one JSON-RPC message after top-level shape validation."""
+        if not isinstance(message, dict):
+            return self._invalid_request(None, "JSON-RPC message must be an object")
+        return self._handle_request(message, session_id=session_id)
+
+    def _handle_jsonrpc_payload(self, payload, session_id=None):
+        # type: (Any, Optional[str]) -> Optional[Any]
+        """Handle a JSON-RPC message or batch payload."""
+        if isinstance(payload, list):
+            if not payload:
+                return self._invalid_request(None, "JSON-RPC batch must not be empty")
+            responses = []
+            for message in payload:
+                response = self._handle_jsonrpc_message(message, session_id=session_id)
+                if response is not None:
+                    responses.append(response)
+            return responses or None
+        return self._handle_jsonrpc_message(payload, session_id=session_id)
+
     def _handle_request(self, request, session_id=None):
         # type: (Dict[str, Any], Optional[str]) -> Optional[Dict[str, Any]]
         """Handle a JSON-RPC request and return response."""
+        if not isinstance(request, dict):
+            return self._invalid_request(None, "JSON-RPC message must be an object")
+
         method = request.get("method", "")
         msg_id = request.get("id")
         is_notification = msg_id is None
@@ -776,6 +959,7 @@ class MCPServer(object):
 
         progress_token = self._extract_progress_token(params)
         meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else None
+        self._prune_expired_jobs()
 
         result = None
         error = None
@@ -798,6 +982,86 @@ class MCPServer(object):
             elif method == "ping":
                 result = {}
 
+            elif method == "tasks/get":
+                task_id = params.get("taskId")
+                if not isinstance(task_id, str) or not task_id:
+                    error = {"code": -32602, "message": "tasks/get requires taskId"}
+                elif not self._client_supports_tasks(session_id=session_id, params=params):
+                    error = {
+                        "code": -32003,
+                        "message": "Missing required client capability",
+                        "data": {
+                            "requiredCapabilities": {
+                                "extensions": {MCP_TASKS_EXTENSION_ID: {}}
+                            }
+                        },
+                    }
+                else:
+                    with self._jobs_lock:
+                        job = self._jobs.get(task_id)
+                        access_error = self._task_access_error(task_id, job, session_id)
+                        task = (
+                            self._job_to_task(task_id, job)
+                            if access_error is None
+                            else None
+                        )
+                    if access_error is not None:
+                        error = access_error
+                    else:
+                        task["resultType"] = "complete"
+                        result = task
+
+            elif method == "tasks/update":
+                task_id = params.get("taskId")
+                if not isinstance(task_id, str) or not task_id:
+                    error = {"code": -32602, "message": "tasks/update requires taskId"}
+                elif not self._client_supports_tasks(session_id=session_id, params=params):
+                    error = {
+                        "code": -32003,
+                        "message": "Missing required client capability",
+                        "data": {
+                            "requiredCapabilities": {
+                                "extensions": {MCP_TASKS_EXTENSION_ID: {}}
+                            }
+                        },
+                    }
+                else:
+                    with self._jobs_lock:
+                        job = self._jobs.get(task_id)
+                        access_error = self._task_access_error(task_id, job, session_id)
+                    if access_error is not None:
+                        error = access_error
+                    else:
+                        # This server's async tools do not currently pause for
+                        # MRTR input, so valid update requests are acknowledged.
+                        result = {"resultType": "complete"}
+
+            elif method == "tasks/cancel":
+                task_id = params.get("taskId")
+                if not isinstance(task_id, str) or not task_id:
+                    error = {"code": -32602, "message": "tasks/cancel requires taskId"}
+                elif not self._client_supports_tasks(session_id=session_id, params=params):
+                    error = {
+                        "code": -32003,
+                        "message": "Missing required client capability",
+                        "data": {
+                            "requiredCapabilities": {
+                                "extensions": {MCP_TASKS_EXTENSION_ID: {}}
+                            }
+                        },
+                    }
+                else:
+                    with self._jobs_lock:
+                        job = self._jobs.get(task_id)
+                        access_error = self._task_access_error(task_id, job, session_id)
+                        if access_error is None and job.get("status") == "running":
+                            job["status"] = "cancelled"
+                            job["lastUpdatedAt"] = self._utc_now()
+                    if access_error is not None:
+                        error = access_error
+                    else:
+                        result = {"resultType": "complete"}
+
             elif method == "tools/list":
                 result = {
                     "tools": [t["definition"].to_dict() for t in self._tools.values()]
@@ -817,21 +1081,40 @@ class MCPServer(object):
                     handler = tool_entry["handler"]
 
                     if tool_entry.get("is_async"):
-                        # Return a job_id immediately; client polls with get_job_result
-                        job_id = self._start_async_tool_job(
-                            handler, msg_id, arguments,
-                            session_id=session_id,
-                            progress_token=progress_token,
-                            meta=meta,
+                        # Return a task to clients that opted into the MCP
+                        # Tasks extension; older clients keep the existing
+                        # get_job_result polling-tool flow.
+                        supports_tasks = self._client_supports_tasks(
+                            session_id=session_id, params=params
                         )
-                        result = {
-                            "content": [{"type": "text", "text": json.dumps({
-                                "status": "running",
-                                "job_id": job_id,
-                                "message": "Job started. Poll with get_job_result(job_id=\"{}\")".format(job_id)
-                            })}],
-                            "isError": False
-                        }
+                        if supports_tasks and not session_id:
+                            error = {
+                                "code": -32003,
+                                "message": "Task-capable async tool calls require an MCP session",
+                            }
+                        else:
+                            job_id = self._start_async_tool_job(
+                                handler, msg_id, arguments,
+                                session_id=session_id,
+                                progress_token=progress_token,
+                                meta=meta,
+                            )
+                        if supports_tasks and not error:
+                            with self._jobs_lock:
+                                job = self._jobs[job_id]
+                                result = self._job_to_task(
+                                    job_id, job, include_terminal_payload=False
+                                )
+                            result["resultType"] = "task"
+                        elif not error:
+                            result = {
+                                "content": [{"type": "text", "text": json.dumps({
+                                    "status": "running",
+                                    "job_id": job_id,
+                                    "message": "Job started. Poll with get_job_result(job_id=\"{}\")".format(job_id)
+                                })}],
+                                "isError": False
+                            }
                     else:
                         try:
                             call_result = self._call_handler(
@@ -1135,10 +1418,6 @@ class MCPServer(object):
                     self.end_headers()
                 elif path_only in ("/", ""):
                     # Root: server info / health page.
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.end_headers()
                     info = {
                         "name": server_instance.name,
                         "version": server_instance.version,
@@ -1152,7 +1431,13 @@ class MCPServer(object):
                             "openapi": "/openapi.json"
                         }
                     }
-                    self.wfile.write(json.dumps(info).encode("utf-8"))
+                    body = json.dumps(info).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Access-Control-Allow-Origin", "*")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
                 else:
                     self.send_error(404, "No GET endpoint at {}".format(path_only))
 
@@ -1267,7 +1552,12 @@ class MCPServer(object):
                         self._handle_direct_tool_call(tool_name, request)
                         return
 
-                    print("Received: {}".format(request.get("method", "unknown")))
+                    if isinstance(request, list):
+                        print("Received: batch[{}]".format(len(request)))
+                    elif isinstance(request, dict):
+                        print("Received: {}".format(request.get("method", "unknown")))
+                    else:
+                        print("Received: invalid JSON-RPC payload")
 
                     if path_only in ("/mcp", "/mcp/"):
                         # Fast methods (initialize, tools/list, ping, etc.) are
@@ -1277,12 +1567,20 @@ class MCPServer(object):
                         # (HTTP 202 + the job_id broadcast on SSE); the actual
                         # result lands in the job table and the client polls
                         # via get_job_result.
-                        method = request.get("method", "")
-                        tool_name = request.get("params", {}).get("name", "")
+                        method = request.get("method", "") if isinstance(request, dict) else ""
+                        request_params = request.get("params", {}) if isinstance(request, dict) else {}
+                        tool_name = request_params.get("name", "") if isinstance(request_params, dict) else ""
                         tool_entry = server_instance._tools.get(tool_name, {})
                         is_slow = method == "tools/call" and tool_entry.get("is_async", False)
+                        returns_task = (
+                            is_slow and
+                            server_instance._client_supports_tasks(
+                                session_id=session_id,
+                                params=request_params if isinstance(request_params, dict) else {},
+                            )
+                        )
 
-                        if is_slow and session_id:
+                        if is_slow and session_id and not returns_task:
                             def async_handler():
                                 try:
                                     resp = server_instance._handle_request(
@@ -1306,7 +1604,7 @@ class MCPServer(object):
                             self.end_headers()
                             self.wfile.write(body)
                         else:
-                            response = server_instance._handle_request(
+                            response = server_instance._handle_jsonrpc_payload(
                                 request, session_id=session_id
                             )
                             # Streamable HTTP: deliver the response on the HTTP
@@ -1332,7 +1630,9 @@ class MCPServer(object):
                     # Per the legacy spec, responses are delivered via the SSE
                     # stream; we also echo on the HTTP reply for REST-style
                     # clients that don't open an SSE channel.
-                    response = server_instance._handle_request(request, session_id=session_id)
+                    response = server_instance._handle_jsonrpc_payload(
+                        request, session_id=session_id
+                    )
 
                     if response:
                         server_instance._broadcast(response, session_id=session_id)
@@ -1593,6 +1893,7 @@ class MCPServer(object):
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
 
         server = ThreadingHTTPServer((host, port), MCPRequestHandler)

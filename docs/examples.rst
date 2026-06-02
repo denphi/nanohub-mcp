@@ -5,7 +5,9 @@ Long-Running Async Tool
 -----------------------
 
 Use ``@server.async_tool()`` for tools that take longer than the reverse proxy timeout (typically 30 s).
-The server returns a ``job_id`` immediately and the client polls for the result.
+Clients that advertise the experimental MCP Tasks extension receive a task handle and poll with
+``tasks/get``. Older clients continue to receive a ``job_id`` and poll with the built-in
+``get_job_result`` tool.
 
 .. code-block:: python
 
@@ -30,6 +32,57 @@ The server returns a ``job_id`` immediately and the client polls for the result.
        server.run(port=8000)
 
 **Step 1 — start the job:**
+
+Task-capable clients first establish an MCP session (for example, with ``GET /mcp``)
+and then include ``io.modelcontextprotocol/tasks`` in request metadata. The task is
+bound to that session, so subsequent ``tasks/get``, ``tasks/update``, and
+``tasks/cancel`` requests must use the same session id.
+
+.. code-block:: bash
+
+   curl -X POST "http://localhost:8000/mcp?session_id=<session-id>" \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_heavy_job","arguments":{"input_data":"my_dataset","iterations":5},"_meta":{"io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}}}}}'
+
+.. code-block:: json
+
+   {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "result": {
+       "resultType": "task",
+       "taskId": "abc-123",
+       "status": "working",
+       "createdAt": "2026-06-02T12:00:00Z",
+       "lastUpdatedAt": "2026-06-02T12:00:00Z",
+       "ttlMs": 3600000,
+       "pollIntervalMs": 1000
+     }
+   }
+
+Poll until terminal:
+
+.. code-block:: bash
+
+   curl -X POST "http://localhost:8000/mcp?session_id=<session-id>" \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":2,"method":"tasks/get","params":{"taskId":"abc-123","_meta":{"io.modelcontextprotocol/clientCapabilities":{"extensions":{"io.modelcontextprotocol/tasks":{}}}}}}'
+
+When complete, the task includes the original ``tools/call`` result:
+
+.. code-block:: json
+
+   {
+     "resultType": "complete",
+     "taskId": "abc-123",
+     "status": "completed",
+     "result": {
+       "content": [{"type": "text", "text": "Processed: my_dataset after 5 iterations"}],
+       "isError": false
+     }
+   }
+
+Legacy clients can use the existing job polling tool:
 
 .. code-block:: bash
 
@@ -76,8 +129,8 @@ On error:
 
 .. note::
 
-   ``get_job_result`` is automatically available on every server — no registration needed.
-   An AI client (e.g. Claude) will call it automatically after receiving a ``job_id``.
+   ``get_job_result`` is automatically available on every server that registers at least one
+   ``@server.async_tool()``.
 
 
 Elicitation

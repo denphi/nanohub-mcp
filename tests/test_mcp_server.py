@@ -22,7 +22,7 @@ try:
 except ImportError:
     from httplib import HTTPConnection
 
-from nanohubmcp import MCPServer, Context
+from nanohubmcp import MCPServer, Context, ToolResult, ImageContent
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +97,19 @@ def ask_user(ctx):
     return result
 
 
+@server.async_tool()
+def slow_echo(value, delay=0.05):
+    """Return a value after a short delay."""
+    time.sleep(float(delay))
+    return {"value": value}
+
+
+@server.async_tool()
+def slow_image():
+    """Return rich content from an async tool."""
+    return ToolResult([ImageContent(data="abc", mimeType="image/png")])
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -142,6 +155,22 @@ def _read_sse(path="/sse", lines_to_read=4, timeout=3):
         pass
     conn.close()
     return resp.status, content_type, collected
+
+
+def _open_mcp_session():
+    """Open /mcp SSE and return (conn, resp, session_id) after draining headers."""
+    conn_sse = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn_sse.request("GET", "/mcp")
+    resp_sse = conn_sse.getresponse()
+    session_id = resp_sse.getheader("Mcp-Session-Id")
+    assert session_id
+    resp_sse.readline()  # event: open
+    resp_sse.readline()  # data: {}
+    resp_sse.readline()  # empty
+    resp_sse.readline()  # event: endpoint
+    resp_sse.readline()  # data: /mcp?session_id=...
+    resp_sse.readline()  # empty
+    return conn_sse, resp_sse, session_id
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +234,10 @@ def test_initialize():
     assert body["id"] == 1
     assert "protocolVersion" in body["result"]
     assert body["result"]["serverInfo"]["name"] == "test-calculator"
+    assert (
+        "io.modelcontextprotocol/tasks"
+        in body["result"]["capabilities"]["extensions"]
+    )
 
 
 def test_tools_list():
@@ -366,6 +399,268 @@ def test_mcp_post_tools_call():
     assert body["id"] == 101
     assert body["result"]["isError"] is False
     assert "30" in body["result"]["content"][0]["text"]
+
+
+def test_async_tool_returns_task_for_task_capable_client():
+    """Task-capable clients get CreateTaskResult for async tools."""
+    conn_sse, _resp_sse, session_id = _open_mcp_session()
+    task_capability = {
+        "_meta": {
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            }
+        }
+    }
+    try:
+        status, body = _post(
+            "/mcp?session_id={}".format(session_id),
+            {
+                "jsonrpc": "2.0",
+                "id": 110,
+                "method": "tools/call",
+                "params": dict(
+                    task_capability,
+                    name="slow_echo",
+                    arguments={"value": "hello", "delay": 0.01},
+                ),
+            },
+        )
+        assert status == 200
+        task = body["result"]
+        assert task["resultType"] == "task"
+        assert task["status"] in ("working", "completed")
+        assert task["taskId"]
+        assert task["ttlMs"] > 0
+        assert task["pollIntervalMs"] > 0
+
+        deadline = time.time() + 3
+        final = None
+        while time.time() < deadline:
+            status, poll_body = _post(
+                "/mcp?session_id={}".format(session_id),
+                {
+                    "jsonrpc": "2.0",
+                    "id": 111,
+                    "method": "tasks/get",
+                    "params": dict(task_capability, taskId=task["taskId"]),
+                },
+            )
+            assert status == 200
+            final = poll_body["result"]
+            if final["status"] == "completed":
+                break
+            time.sleep(0.02)
+
+        assert final["resultType"] == "complete"
+        assert final["status"] == "completed"
+        result_text = final["result"]["content"][0]["text"]
+        assert json.loads(result_text)["value"] == "hello"
+    finally:
+        conn_sse.close()
+
+
+def test_async_tool_keeps_legacy_job_result_without_task_capability():
+    """Older clients still receive the existing get_job_result flow."""
+    status, body = _post(
+        "/",
+        {
+            "jsonrpc": "2.0",
+            "id": 112,
+            "method": "tools/call",
+            "params": {"name": "slow_echo", "arguments": {"value": "legacy"}},
+        },
+    )
+    assert status == 200
+    payload = json.loads(body["result"]["content"][0]["text"])
+    assert payload["status"] == "running"
+    assert payload["job_id"]
+
+
+def test_tasks_get_requires_task_capability():
+    """tasks/get rejects callers that did not declare task support."""
+    status, body = _post(
+        "/mcp",
+        {
+            "jsonrpc": "2.0",
+            "id": 113,
+            "method": "tasks/get",
+            "params": {"taskId": "missing"},
+        },
+    )
+    assert status == 200
+    assert body["error"]["code"] == -32003
+    assert "io.modelcontextprotocol/tasks" in str(body["error"]["data"])
+
+
+def test_task_capable_async_tool_requires_session():
+    """Task-capable async calls without a session fail instead of returning unusable tasks."""
+    status, body = _post(
+        "/mcp",
+        {
+            "jsonrpc": "2.0",
+            "id": 114,
+            "method": "tools/call",
+            "params": {
+                "name": "slow_echo",
+                "arguments": {"value": "no-session"},
+                "_meta": {
+                    "io.modelcontextprotocol/clientCapabilities": {
+                        "extensions": {"io.modelcontextprotocol/tasks": {}}
+                    }
+                },
+            },
+        },
+    )
+    assert status == 200
+    assert body["error"]["code"] == -32003
+    assert "session" in body["error"]["message"].lower()
+
+
+def test_tasks_cancel_marks_running_task_cancelled():
+    """tasks/cancel acknowledges and marks a running task cancelled."""
+    conn_sse, _resp_sse, session_id = _open_mcp_session()
+    task_capability = {
+        "_meta": {
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            }
+        }
+    }
+    try:
+        status, body = _post(
+            "/mcp?session_id={}".format(session_id),
+            {
+                "jsonrpc": "2.0",
+                "id": 115,
+                "method": "tools/call",
+                "params": dict(
+                    task_capability,
+                    name="slow_echo",
+                    arguments={"value": "cancel-me", "delay": 0.5},
+                ),
+            },
+        )
+        assert status == 200
+        task_id = body["result"]["taskId"]
+
+        status, cancel_body = _post(
+            "/mcp?session_id={}".format(session_id),
+            {
+                "jsonrpc": "2.0",
+                "id": 116,
+                "method": "tasks/cancel",
+                "params": dict(task_capability, taskId=task_id),
+            },
+        )
+        assert status == 200
+        assert cancel_body["result"] == {"resultType": "complete"}
+
+        status, poll_body = _post(
+            "/mcp?session_id={}".format(session_id),
+            {
+                "jsonrpc": "2.0",
+                "id": 117,
+                "method": "tasks/get",
+                "params": dict(task_capability, taskId=task_id),
+            },
+        )
+        assert status == 200
+        assert poll_body["result"]["status"] == "cancelled"
+    finally:
+        conn_sse.close()
+
+
+def test_tasks_are_session_bound():
+    """A task created in one MCP session cannot be polled from another."""
+    owner_conn, _owner_resp, owner_session = _open_mcp_session()
+    other_conn, _other_resp, other_session = _open_mcp_session()
+    task_capability = {
+        "_meta": {
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            }
+        }
+    }
+    try:
+        status, body = _post(
+            "/mcp?session_id={}".format(owner_session),
+            {
+                "jsonrpc": "2.0",
+                "id": 118,
+                "method": "tools/call",
+                "params": dict(
+                    task_capability,
+                    name="slow_echo",
+                    arguments={"value": "private", "delay": 0.1},
+                ),
+            },
+        )
+        assert status == 200
+        task_id = body["result"]["taskId"]
+
+        status, poll_body = _post(
+            "/mcp?session_id={}".format(other_session),
+            {
+                "jsonrpc": "2.0",
+                "id": 119,
+                "method": "tasks/get",
+                "params": dict(task_capability, taskId=task_id),
+            },
+        )
+        assert status == 200
+        assert poll_body["error"]["code"] == -32003
+        assert "session" in poll_body["error"]["message"].lower()
+    finally:
+        owner_conn.close()
+        other_conn.close()
+
+
+def test_async_tool_task_preserves_rich_tool_result_content():
+    """Async task completion preserves non-text ToolResult content."""
+    conn_sse, _resp_sse, session_id = _open_mcp_session()
+    task_capability = {
+        "_meta": {
+            "io.modelcontextprotocol/clientCapabilities": {
+                "extensions": {"io.modelcontextprotocol/tasks": {}}
+            }
+        }
+    }
+    try:
+        status, body = _post(
+            "/mcp?session_id={}".format(session_id),
+            {
+                "jsonrpc": "2.0",
+                "id": 120,
+                "method": "tools/call",
+                "params": dict(task_capability, name="slow_image", arguments={}),
+            },
+        )
+        assert status == 200
+        task_id = body["result"]["taskId"]
+
+        deadline = time.time() + 3
+        final = None
+        while time.time() < deadline:
+            status, poll_body = _post(
+                "/mcp?session_id={}".format(session_id),
+                {
+                    "jsonrpc": "2.0",
+                    "id": 121,
+                    "method": "tasks/get",
+                    "params": dict(task_capability, taskId=task_id),
+                },
+            )
+            assert status == 200
+            final = poll_body["result"]
+            if final["status"] == "completed":
+                break
+            time.sleep(0.02)
+
+        assert final["status"] == "completed"
+        content = final["result"]["content"]
+        assert content == [{"type": "image", "data": "abc", "mimeType": "image/png"}]
+    finally:
+        conn_sse.close()
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +972,49 @@ def test_notification_invalid_params_gets_no_reply():
     assert b"error" not in raw
 
 
+def test_jsonrpc_batch_returns_responses_for_requests_only():
+    """JSON-RPC batches return an array, omitting notification responses."""
+    status, body = _post("/", [
+        {"jsonrpc": "2.0", "id": 901, "method": "ping", "params": {}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        {
+            "jsonrpc": "2.0",
+            "id": 902,
+            "method": "tools/call",
+            "params": {"name": "add", "arguments": {"a": 1, "b": 2}},
+        },
+    ])
+    assert status == 200
+    assert isinstance(body, list)
+    assert [item["id"] for item in body] == [901, 902]
+    assert body[0]["result"] == {}
+    assert body[1]["result"]["isError"] is False
+
+
+def test_jsonrpc_batch_all_notifications_returns_accepted():
+    """A batch with only notifications gets no JSON-RPC response."""
+    status, body = _post("/", [
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+    ])
+    assert status == 202
+    assert body == {"status": "accepted"}
+
+
+def test_jsonrpc_invalid_top_level_payload_returns_minus_32600():
+    """Valid JSON with the wrong top-level shape must not become a 500."""
+    status, body = _post("/", "not-an-object")
+    assert status == 200
+    assert body["error"]["code"] == -32600
+
+
+def test_jsonrpc_empty_batch_returns_minus_32600():
+    """Empty JSON-RPC batches are invalid."""
+    status, body = _post("/", [])
+    assert status == 200
+    assert body["error"]["code"] == -32600
+
+
 def test_request_client_fails_fast_without_stream():
     """Server-to-client requests must error immediately if no SSE is connected."""
     import pytest
@@ -863,6 +1201,23 @@ def test_async_job_consumed_after_first_successful_poll():
     # Second poll sees a not_found
     second = handler(job_id="jid-1")
     assert second["status"] == "not_found"
+
+
+def test_expired_task_records_are_pruned():
+    """Expired task records are removed during request handling."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("prune")
+    s._jobs["old"] = {
+        "status": "done",
+        "result": "ok",
+        "session_id": "sess-old",
+        "expires_at": 0,
+    }
+
+    s._handle_request({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+
+    assert "old" not in s._jobs
 
 
 def test_get_job_result_not_registered_without_async_tools():
