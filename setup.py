@@ -2,7 +2,7 @@
 
 import os
 import re
-from setuptools import setup, find_packages
+from setuptools import setup
 
 
 def get_version():
@@ -71,7 +71,9 @@ setup(
         "Topic :: Scientific/Engineering",
         "Topic :: Software Development :: Libraries :: Python Modules",
     ],
-    packages=find_packages(where=".", include=["nanohubmcp*"]),
+    # Listed explicitly rather than via find_packages(), which walks the tree
+    # following symlinks and hangs on the com_mcp -> ../com_mcp loop.
+    packages=["nanohubmcp"],
     python_requires=">=3.7",
     install_requires=[],
     extras_require={

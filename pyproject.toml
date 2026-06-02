@@ -64,9 +64,12 @@ start_mcp = "nanohubmcp.cli:start_mcp_main"
 [tool.setuptools.dynamic]
 version = {attr = "nanohubmcp._version.__version__"}
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["nanohubmcp*"]
+[tool.setuptools]
+# List the package explicitly instead of using find-based auto-discovery.
+# Auto-discovery walks the project tree with followlinks=True, which hangs on
+# the untracked com_mcp -> ../com_mcp symlink (whose App symlink points back
+# into this repo, forming a loop).
+packages = ["nanohubmcp"]
 
 [tool.black]
 line-length = 100
