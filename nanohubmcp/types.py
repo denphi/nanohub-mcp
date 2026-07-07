@@ -22,7 +22,8 @@ class Tool(object):
         description="",  # type: str
         inputSchema=None,  # type: Optional[Dict[str, Any]]
         tags=None,  # type: Optional[set]
-        meta=None  # type: Optional[Dict[str, Any]]
+        meta=None,  # type: Optional[Dict[str, Any]]
+        outputSchema=None  # type: Optional[Dict[str, Any]]
     ):
         # type: (...) -> None
         self.name = name
@@ -34,6 +35,7 @@ class Tool(object):
         }
         self.tags = tags or set()
         self.meta = meta or {}
+        self.outputSchema = outputSchema
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
@@ -42,6 +44,8 @@ class Tool(object):
             "description": self.description,
             "inputSchema": self.inputSchema
         }
+        if self.outputSchema:
+            result["outputSchema"] = self.outputSchema
         if self.meta:
             result["_meta"] = self.meta
         return result

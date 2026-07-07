@@ -105,6 +105,17 @@ With explicit options:
      - dict
      - auto-generated
      - JSON Schema for inputs
+   * - ``output_schema``
+     - dict
+     - ``None``
+     - JSON Schema describing the dict the tool returns. When set, it is emitted as ``outputSchema`` in ``tools/list``.
+
+.. note::
+
+   When a tool returns a ``dict``, the server also includes it as
+   ``structuredContent`` in the call result (per the MCP spec), in addition to
+   the JSON-encoded ``text`` content. This lets clients and ``mcp-apps``
+   widgets consume the data without re-parsing the text block.
 
 
 @server.async_tool()
@@ -179,6 +190,10 @@ The decorator accepts the same parameters as ``@server.tool()``:
      - dict
      - auto-generated
      - JSON Schema for inputs
+   * - ``output_schema``
+     - dict
+     - ``None``
+     - JSON Schema describing the dict the tool returns. Emitted as ``outputSchema`` in ``tools/list``.
 
 .. note::
 

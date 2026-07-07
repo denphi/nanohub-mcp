@@ -268,7 +268,8 @@ def tool(
     description=None,  # type: Optional[str]
     tags=None,  # type: Optional[Set[str]]
     meta=None,  # type: Optional[Dict[str, Any]]
-    input_schema=None  # type: Optional[Dict[str, Any]]
+    input_schema=None,  # type: Optional[Dict[str, Any]]
+    output_schema=None  # type: Optional[Dict[str, Any]]
 ):
     # type: (...) -> Callable
     """
@@ -300,6 +301,7 @@ def tool(
         func._mcp_tool_name = name or func.__name__
         func._mcp_tool_description = description or (func.__doc__ or "").strip()
         func._mcp_tool_input_schema = input_schema or _generate_input_schema(func)
+        func._mcp_tool_output_schema = output_schema
         func._mcp_tool_tags = tags or set()
         func._mcp_tool_meta = meta or {}
 
@@ -312,6 +314,7 @@ def tool(
         wrapper._mcp_tool_name = func._mcp_tool_name
         wrapper._mcp_tool_description = func._mcp_tool_description
         wrapper._mcp_tool_input_schema = func._mcp_tool_input_schema
+        wrapper._mcp_tool_output_schema = func._mcp_tool_output_schema
         wrapper._mcp_tool_tags = func._mcp_tool_tags
         wrapper._mcp_tool_meta = func._mcp_tool_meta
 

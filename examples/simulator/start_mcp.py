@@ -31,11 +31,56 @@ BOLTZMANN_CONSTANT = 1.380649e-23  # J/K
 
 
 # =============================================================================
+# TOOL OUTPUT SCHEMAS
+# =============================================================================
+# Declared as `outputSchema` in tools/list (clients like ChatGPT lint for it)
+# and matched by the `structuredContent` the framework attaches to dict
+# results. Error paths return ToolResult(is_error=True) and are exempt.
+
+def _number_schema(*keys):
+    # type: (*str) -> dict
+    """JSON Schema for an object of numeric fields."""
+    return {
+        "type": "object",
+        "properties": dict((k, {"type": "number"}) for k in keys),
+        "required": list(keys),
+    }
+
+
+_PROJECTILE_OUTPUT_SCHEMA = _number_schema(
+    "range", "max_height", "time_of_flight",
+    "initial_velocity_x", "initial_velocity_y")
+_PROJECTILE_OUTPUT_SCHEMA["properties"]["trajectory"] = {
+    "type": "array",
+    "description": "Sampled (t, x, y) points along the flight path",
+    "items": _number_schema("t", "x", "y"),
+}
+_PROJECTILE_OUTPUT_SCHEMA["required"].append("trajectory")
+
+_OSCILLATOR_OUTPUT_SCHEMA = _number_schema(
+    "position", "velocity", "acceleration", "angular_frequency", "period",
+    "frequency", "kinetic_energy", "potential_energy", "total_energy")
+
+_WAVE_OUTPUT_SCHEMA = _number_schema(
+    "frequency", "wavelength", "speed", "period", "wave_number",
+    "angular_frequency", "photon_energy_joules", "photon_energy_eV")
+
+_IDEAL_GAS_OUTPUT_SCHEMA = _number_schema(
+    "pressure_Pa", "pressure_atm", "volume_m3", "volume_L",
+    "n_moles", "temperature_K", "temperature_C")
+
+_RELATIVISTIC_OUTPUT_SCHEMA = _number_schema(
+    "lorentz_factor", "beta", "relativistic_mass_kg", "rest_energy_J",
+    "kinetic_energy_J", "total_energy_J", "momentum_kg_m_s")
+
+
+# =============================================================================
 # TOOLS
 # =============================================================================
 
 @server.tool(meta={"ui": {"resourceUri": "ui://physics-simulator/projectile",
-                          "visibility": ["model", "app"]}})
+                          "visibility": ["model", "app"]}},
+             output_schema=_PROJECTILE_OUTPUT_SCHEMA)
 def projectile_motion(v0, angle, h0=0):
     # type: (float, float, float) -> dict
     """
@@ -91,7 +136,8 @@ def projectile_motion(v0, angle, h0=0):
 
 
 @server.tool(meta={"ui": {"resourceUri": "ui://physics-simulator/oscillator",
-                          "visibility": ["model", "app"]}})
+                          "visibility": ["model", "app"]}},
+             output_schema=_OSCILLATOR_OUTPUT_SCHEMA)
 def harmonic_oscillator(mass, spring_constant, amplitude, time):
     # type: (float, float, float, float) -> dict
     """
@@ -138,7 +184,7 @@ def harmonic_oscillator(mass, spring_constant, amplitude, time):
     }
 
 
-@server.tool()
+@server.tool(output_schema=_WAVE_OUTPUT_SCHEMA)
 def wave_properties(frequency, wavelength=None, medium_speed=None):
     # type: (float, float, float) -> dict
     """
@@ -185,7 +231,7 @@ def wave_properties(frequency, wavelength=None, medium_speed=None):
     }
 
 
-@server.tool()
+@server.tool(output_schema=_IDEAL_GAS_OUTPUT_SCHEMA)
 def ideal_gas(pressure=None, volume=None, n_moles=None, temperature=None):
     # type: (float, float, float, float) -> dict
     """
@@ -243,7 +289,7 @@ def ideal_gas(pressure=None, volume=None, n_moles=None, temperature=None):
     }
 
 
-@server.tool(tags={"advanced"})
+@server.tool(tags={"advanced"}, output_schema=_RELATIVISTIC_OUTPUT_SCHEMA)
 def relativistic_energy(ctx, rest_mass, velocity):
     # type: (Context, float, float) -> dict
     """
@@ -360,12 +406,15 @@ _MCP_BRIDGE_JS = r"""
       height: document.documentElement.scrollHeight,
     });
   }
+  // Shape per McpUiInitializeRequest (ext-apps spec 2026-01-26): appInfo +
+  // appCapabilities are required; hosts reject the request otherwise and
+  // then ignore the view entirely (no tool-result, no sizing — blank iframe).
   rpc("ui/initialize", {
-    capabilities: {},
-    clientInfo: { name: "physics-simulator-app", version: "1.0.0" },
+    appInfo: { name: "physics-simulator-app", version: "1.0.0" },
+    appCapabilities: { availableDisplayModes: ["inline"] },
     protocolVersion: "2026-01-26",
   }).then(() => notify("ui/notifications/initialized", {}))
-    .catch(() => {});
+    .catch((e) => console.error("ui/initialize failed:", e));
   new ResizeObserver(reportSize).observe(document.documentElement);
 </script>
 """.strip()
@@ -431,6 +480,13 @@ __BRIDGE__
     const args = { v0: +$("v0").value, angle: +$("angle").value, h0: +$("h0").value };
     render(await run("projectile_motion", args));
   }
+  function applyToolInput(params){
+    const args = (params && params.arguments) || {};
+    if (args.v0 !== undefined) $("v0").value = args.v0;
+    if (args.angle !== undefined) $("angle").value = args.angle;
+    if (args.h0 !== undefined) $("h0").value = args.h0;
+  }
+  window.onToolInput = applyToolInput;
   window.onToolResult = (params) => render(extractResult(params));
   $("f").addEventListener("submit", (e) => { e.preventDefault(); simulate(); });
   // Standalone preview: kick off a default run. Embedded under an mcp-apps
@@ -509,6 +565,13 @@ __BRIDGE__
     const m = +$("m").value, k = +$("k").value, A = +$("A").value;
     render(await run("harmonic_oscillator", { mass:m, spring_constant:k, amplitude:A, time:0 }));
   }
+  function applyToolInput(params){
+    const args = (params && params.arguments) || {};
+    if (args.mass !== undefined) $("m").value = args.mass;
+    if (args.spring_constant !== undefined) $("k").value = args.spring_constant;
+    if (args.amplitude !== undefined) $("A").value = args.amplitude;
+  }
+  window.onToolInput = applyToolInput;
   window.onToolResult = (params) => render(extractResult(params));
   $("f").addEventListener("submit", (e) => { e.preventDefault(); simulate(); });
   // Standalone preview: kick off a default run. Embedded under an mcp-apps

@@ -322,6 +322,7 @@ class MCPServer(object):
         if isinstance(value, dict):
             return {
                 "content": [{"type": "text", "text": json.dumps(value)}],
+                "structuredContent": value,
                 "isError": False,
             }
         return {
@@ -427,6 +428,7 @@ class MCPServer(object):
                 description=func._mcp_tool_description,
                 inputSchema=func._mcp_tool_input_schema,
                 meta=getattr(func, "_mcp_tool_meta", None) or {},
+                outputSchema=getattr(func, "_mcp_tool_output_schema", None),
             ),
             "handler": func,
             "is_async": is_async,
@@ -475,7 +477,8 @@ class MCPServer(object):
         description=None,  # type: Optional[str]
         tags=None,  # type: Optional[Set[str]]
         meta=None,  # type: Optional[Dict[str, Any]]
-        input_schema=None  # type: Optional[Dict[str, Any]]
+        input_schema=None,  # type: Optional[Dict[str, Any]]
+        output_schema=None  # type: Optional[Dict[str, Any]]
     ):
         # type: (...) -> Callable
         """
@@ -488,10 +491,13 @@ class MCPServer(object):
             tags: Optional set of tags for categorization
             meta: Optional metadata dictionary
             input_schema: JSON Schema for inputs (auto-generated if not provided)
+            output_schema: JSON Schema describing the dict the tool returns.
+                Emitted as `outputSchema` in tools/list; dict results always
+                carry `structuredContent` per the MCP spec.
         """
         def decorator(func):
             # type: (Callable) -> Callable
-            decorated = tool(name, description, tags, meta, input_schema)(func)
+            decorated = tool(name, description, tags, meta, input_schema, output_schema)(func)
             self._register_tool_function(decorated)
             return decorated
 
@@ -1128,8 +1134,12 @@ class MCPServer(object):
                             if isinstance(call_result, ToolResult):
                                 result = call_result.to_dict()
                             elif isinstance(call_result, dict):
+                                # structuredContent (MCP spec): required when the
+                                # tool declares outputSchema, and lets mcp-apps
+                                # widgets consume data without re-parsing text.
                                 result = {
                                     "content": [{"type": "text", "text": json.dumps(call_result)}],
+                                    "structuredContent": call_result,
                                     "isError": False
                                 }
                             else:
