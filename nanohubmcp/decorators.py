@@ -232,7 +232,9 @@ def async_tool(
     description=None,  # type: Optional[str]
     tags=None,  # type: Optional[Set[str]]
     meta=None,  # type: Optional[Dict[str, Any]]
-    input_schema=None  # type: Optional[Dict[str, Any]]
+    input_schema=None,  # type: Optional[Dict[str, Any]]
+    output_schema=None,  # type: Optional[Dict[str, Any]]
+    annotations=None  # type: Optional[Dict[str, Any]]
 ):
     # type: (...) -> Callable
     """
@@ -251,7 +253,8 @@ def async_tool(
     """
     def decorator(func):
         # type: (Callable) -> Callable
-        decorated = tool(name, description, tags, meta, input_schema)(func)
+        decorated = tool(name, description, tags, meta, input_schema, output_schema,
+                         annotations=annotations)(func)
         decorated._mcp_async_tool = True
         return decorated
 
@@ -263,13 +266,47 @@ def async_tool(
     return decorator
 
 
+# MCP standard tool annotations (`ToolAnnotations` in the 2025-03-26+ spec).
+# Values are hints for clients (caching, retry, UI gating) — never guarantees.
+_ANNOTATION_KEYS = {
+    "title": str,
+    "readOnlyHint": bool,
+    "destructiveHint": bool,
+    "idempotentHint": bool,
+    "openWorldHint": bool,
+}
+
+
+def _validate_annotations(annotations):
+    # type: (Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
+    """Reject typos/wrong types at decoration time — a misspelled hint would
+    otherwise be emitted in tools/list and silently ignored by clients."""
+    if annotations is None:
+        return None
+    if not isinstance(annotations, dict):
+        raise ValueError("annotations must be a dict of MCP ToolAnnotations")
+    for key, value in annotations.items():
+        expected = _ANNOTATION_KEYS.get(key)
+        if expected is None:
+            raise ValueError(
+                "Unknown tool annotation %r; valid keys: %s"
+                % (key, ", ".join(sorted(_ANNOTATION_KEYS)))
+            )
+        if expected is bool and not isinstance(value, bool):
+            raise ValueError("Tool annotation %r must be a bool" % key)
+        if expected is str and not isinstance(value, str):
+            raise ValueError("Tool annotation %r must be a string" % key)
+    return dict(annotations)
+
+
 def tool(
     name=None,  # type: Optional[str]
     description=None,  # type: Optional[str]
     tags=None,  # type: Optional[Set[str]]
     meta=None,  # type: Optional[Dict[str, Any]]
     input_schema=None,  # type: Optional[Dict[str, Any]]
-    output_schema=None  # type: Optional[Dict[str, Any]]
+    output_schema=None,  # type: Optional[Dict[str, Any]]
+    annotations=None  # type: Optional[Dict[str, Any]]
 ):
     # type: (...) -> Callable
     """
@@ -282,6 +319,10 @@ def tool(
         tags: Optional set of tags for categorization
         meta: Optional metadata dictionary
         input_schema: JSON Schema for inputs (auto-generated if not provided)
+        annotations: MCP ToolAnnotations hints emitted in tools/list —
+            readOnlyHint / destructiveHint / idempotentHint / openWorldHint
+            (bool) and title (str). Clients use these for result caching,
+            retry policy, and app-widget tool gating.
 
     Example:
         @tool
@@ -289,7 +330,8 @@ def tool(
             '''Add two numbers'''
             return a + b
 
-        @tool(name="multiply", tags={"math"})
+        @tool(name="multiply", tags={"math"},
+              annotations={"readOnlyHint": True, "destructiveHint": False})
         def mult(a: int, b: int) -> int:
             '''Multiply two numbers'''
             return a * b
@@ -302,6 +344,7 @@ def tool(
         func._mcp_tool_description = description or (func.__doc__ or "").strip()
         func._mcp_tool_input_schema = input_schema or _generate_input_schema(func)
         func._mcp_tool_output_schema = output_schema
+        func._mcp_tool_annotations = _validate_annotations(annotations)
         func._mcp_tool_tags = tags or set()
         func._mcp_tool_meta = meta or {}
 
@@ -315,6 +358,7 @@ def tool(
         wrapper._mcp_tool_description = func._mcp_tool_description
         wrapper._mcp_tool_input_schema = func._mcp_tool_input_schema
         wrapper._mcp_tool_output_schema = func._mcp_tool_output_schema
+        wrapper._mcp_tool_annotations = func._mcp_tool_annotations
         wrapper._mcp_tool_tags = func._mcp_tool_tags
         wrapper._mcp_tool_meta = func._mcp_tool_meta
 

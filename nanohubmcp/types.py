@@ -23,7 +23,8 @@ class Tool(object):
         inputSchema=None,  # type: Optional[Dict[str, Any]]
         tags=None,  # type: Optional[set]
         meta=None,  # type: Optional[Dict[str, Any]]
-        outputSchema=None  # type: Optional[Dict[str, Any]]
+        outputSchema=None,  # type: Optional[Dict[str, Any]]
+        annotations=None  # type: Optional[Dict[str, Any]]
     ):
         # type: (...) -> None
         self.name = name
@@ -36,6 +37,9 @@ class Tool(object):
         self.tags = tags or set()
         self.meta = meta or {}
         self.outputSchema = outputSchema
+        # MCP ToolAnnotations (readOnlyHint, destructiveHint, idempotentHint,
+        # openWorldHint, title) — behavioral hints for clients, not guarantees.
+        self.annotations = annotations
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
@@ -46,6 +50,8 @@ class Tool(object):
         }
         if self.outputSchema:
             result["outputSchema"] = self.outputSchema
+        if self.annotations:
+            result["annotations"] = self.annotations
         if self.meta:
             result["_meta"] = self.meta
         return result

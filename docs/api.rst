@@ -109,6 +109,10 @@ With explicit options:
      - dict
      - ``None``
      - JSON Schema describing the dict the tool returns. When set, it is emitted as ``outputSchema`` in ``tools/list``.
+   * - ``annotations``
+     - dict
+     - ``None``
+     - MCP ``ToolAnnotations`` hints emitted in ``tools/list``: ``readOnlyHint``, ``destructiveHint``, ``idempotentHint``, ``openWorldHint`` (bool) and ``title`` (str). Unknown keys or wrong value types raise ``ValueError`` at decoration time. Per the MCP spec these are hints, not guarantees — clients use them for result caching, retry policy, and app-widget tool gating.
 
 .. note::
 
@@ -194,6 +198,10 @@ The decorator accepts the same parameters as ``@server.tool()``:
      - dict
      - ``None``
      - JSON Schema describing the dict the tool returns. Emitted as ``outputSchema`` in ``tools/list``.
+   * - ``annotations``
+     - dict
+     - ``None``
+     - MCP ``ToolAnnotations`` hints emitted in ``tools/list``: ``readOnlyHint``, ``destructiveHint``, ``idempotentHint``, ``openWorldHint`` (bool) and ``title`` (str). Unknown keys or wrong value types raise ``ValueError`` at decoration time. Per the MCP spec these are hints, not guarantees — clients use them for result caching, retry policy, and app-widget tool gating.
 
 .. note::
 

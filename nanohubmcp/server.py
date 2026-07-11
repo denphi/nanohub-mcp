@@ -429,6 +429,7 @@ class MCPServer(object):
                 inputSchema=func._mcp_tool_input_schema,
                 meta=getattr(func, "_mcp_tool_meta", None) or {},
                 outputSchema=getattr(func, "_mcp_tool_output_schema", None),
+                annotations=getattr(func, "_mcp_tool_annotations", None),
             ),
             "handler": func,
             "is_async": is_async,
@@ -478,7 +479,8 @@ class MCPServer(object):
         tags=None,  # type: Optional[Set[str]]
         meta=None,  # type: Optional[Dict[str, Any]]
         input_schema=None,  # type: Optional[Dict[str, Any]]
-        output_schema=None  # type: Optional[Dict[str, Any]]
+        output_schema=None,  # type: Optional[Dict[str, Any]]
+        annotations=None  # type: Optional[Dict[str, Any]]
     ):
         # type: (...) -> Callable
         """
@@ -494,10 +496,17 @@ class MCPServer(object):
             output_schema: JSON Schema describing the dict the tool returns.
                 Emitted as `outputSchema` in tools/list; dict results always
                 carry `structuredContent` per the MCP spec.
+            annotations: MCP ToolAnnotations hints emitted in tools/list —
+                readOnlyHint / destructiveHint / idempotentHint /
+                openWorldHint (bool) and title (str). Unknown keys or wrong
+                types raise ValueError at decoration time. Hints only: mark
+                pure reads readOnlyHint=True so clients may cache results and
+                allow the tool from embedded app widgets in strict mode.
         """
         def decorator(func):
             # type: (Callable) -> Callable
-            decorated = tool(name, description, tags, meta, input_schema, output_schema)(func)
+            decorated = tool(name, description, tags, meta, input_schema, output_schema,
+                             annotations=annotations)(func)
             self._register_tool_function(decorated)
             return decorated
 
@@ -514,7 +523,9 @@ class MCPServer(object):
         description=None,  # type: Optional[str]
         tags=None,  # type: Optional[Set[str]]
         meta=None,  # type: Optional[Dict[str, Any]]
-        input_schema=None  # type: Optional[Dict[str, Any]]
+        input_schema=None,  # type: Optional[Dict[str, Any]]
+        output_schema=None,  # type: Optional[Dict[str, Any]]
+        annotations=None  # type: Optional[Dict[str, Any]]
     ):
         # type: (...) -> Callable
         """
@@ -533,7 +544,8 @@ class MCPServer(object):
         """
         def decorator(func):
             # type: (Callable) -> Callable
-            decorated = async_tool(name, description, tags, meta, input_schema)(func)
+            decorated = async_tool(name, description, tags, meta, input_schema,
+                                   output_schema=output_schema, annotations=annotations)(func)
             self._register_tool_function(decorated)
             return decorated
 
