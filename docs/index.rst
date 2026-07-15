@@ -32,3 +32,4 @@ Installation
    testing
    endpoints
    nanohub
+   building-mcp

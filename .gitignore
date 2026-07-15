@@ -54,3 +54,7 @@ Thumbs.db
 # Secrets / config
 .env
 .env.*
+
+# Sphinx: generated copy of the build-nanohub-mcp skill (see docs/conf.py)
+docs/skill/
+docs/_build/
