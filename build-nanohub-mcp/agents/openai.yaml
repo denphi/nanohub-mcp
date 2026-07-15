@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build nanoHUB MCP"
+  short_description: "Turn scientific code into a secure nanoHUB MCP"
+  default_prompt: "Use $build-nanohub-mcp to wrap my scientific Python code as a secure, tested MCP server for publication on nanoHUB."

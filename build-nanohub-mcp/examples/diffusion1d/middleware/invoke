@@ -1,0 +1,14 @@
+#!/bin/sh
+
+#
+# diffusion1d — nanoHUB MCP tool entrypoint (headless).
+# Pure-stdlib example: the base anaconda start_mcp suffices. If your real
+# tool has dependencies in a specific conda env, pin start_mcp's full path
+# (see references/project-layout.md).
+#
+/usr/bin/invoke_app "$@" -t diffusion1d \
+                         -e "PYTHONNOUSERSITE=1" \
+                         -C "start_mcp --app @tool/bin/diffusion1d.py" \
+                         -u anaconda-6 \
+                         -r none \
+                         -w headless
