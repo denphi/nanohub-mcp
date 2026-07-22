@@ -23,7 +23,18 @@ import os
 import re
 import sys
 
-MCP_APP_MIME = "text/html;profile=mcp-app"
+# Shared invariants (same module the live check_conformance.py uses, so a rule
+# can't drift between pre-deploy and post-deploy). It sits next to this script.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mcp_conformance import (  # noqa: E402
+    MCP_APP_MIME,
+    APPS_EXTENSION_ID,
+    TASKS_EXTENSION_ID,
+    ELICITATION_METHOD,
+    check_app_handshake,
+    expected_extensions,
+)
+
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 # Registered automatically by the nanohubmcp framework, not by the author.
 FRAMEWORK_BUILTIN_TOOLS = {"get_job_result"}
@@ -130,6 +141,58 @@ def check_security_hints(report, label, handler, schema):
             report.warn("{}: input '{}' has no description/units".format(label, name))
 
 
+def check_extensions(report, server, has_apps, has_async):
+    """Confirm the server advertises the extensions its features require.
+
+    Offline surrogate for the live "does initialize advertise ui/tasks?" check:
+    call the framework's own `_get_capabilities()` and compare its `extensions`
+    to what a server with these features must declare. Catches, e.g., an app
+    resource that won't be renderable because the capability was suppressed.
+    """
+    expected = expected_extensions(has_apps, has_async)
+    try:
+        caps = server._get_capabilities().to_dict()
+    except Exception as exc:  # pragma: no cover - framework shape drift
+        report.warn("could not read server capabilities ({}); "
+                    "skipping extension-advertisement check".format(exc))
+        return
+    advertised = caps.get("extensions") or {}
+
+    for ext_id, shape in expected.items():
+        if ext_id not in advertised:
+            report.error("extension {} must be advertised at initialize (server "
+                         "has {}) but is absent from capabilities".format(
+                             ext_id, "apps" if ext_id == APPS_EXTENSION_ID else "async tools"))
+        elif ext_id == APPS_EXTENSION_ID:
+            mimes = (advertised.get(ext_id) or {}).get("mimeTypes") or []
+            if MCP_APP_MIME not in mimes:
+                report.error("extension {} advertises mimeTypes {} — must include "
+                             "{!r}".format(ext_id, mimes, MCP_APP_MIME))
+    if expected:
+        report.info("extensions advertised: {}".format(", ".join(sorted(advertised)) or "none"))
+
+
+def check_elicitation_usage(report, tools):
+    """Elicitation is a client capability the server *requests*; the framework
+    raises if the client lacks it. Flag handlers that elicit without guarding."""
+    for name, entry in sorted(tools.items()):
+        handler = entry.get("handler")
+        try:
+            source = inspect.getsource(handler)
+        except (OSError, TypeError):
+            continue
+        if ".elicit(" not in source and ".elicit_url(" not in source \
+                and ELICITATION_METHOD not in source:
+            continue
+        report.info("tool {}: uses elicitation".format(name))
+        guarded = any(tok in source for tok in (
+            "try:", "_client_supports", "supports_elicitation", "except"))
+        if not guarded:
+            report.warn("tool {}: calls ctx.elicit without a try/except or "
+                        "capability guard — clients without elicitation get a "
+                        "RuntimeError; degrade to a chat fallback".format(name))
+
+
 def validate(server, render_apps=False, limit_mb=8.0):
     report = Report()
     tools = getattr(server, "_tools", {}) or {}
@@ -204,29 +267,50 @@ def validate(server, render_apps=False, limit_mb=8.0):
             report.warn("no async tools, but {} look long-running — consider "
                         "@server.async_tool".format(", ".join(slow_looking)))
 
-    # ui:// resources
+    # ── MCP Apps (io.modelcontextprotocol/ui): ui:// resources ──────────────
+    # The app HTML is always rendered so the ext-apps handshake can be checked
+    # (a malformed ui/initialize renders blank on strict hosts — the exact
+    # failure this guards). --render-apps additionally size-checks the payload.
     limit_bytes = int(limit_mb * 1024 * 1024)
+    n_apps = 0
     for uri, entry in sorted(resources.items()):
         definition = entry["definition"]
         if not uri.startswith("ui://"):
             continue
+        n_apps += 1
         label = "resource {}".format(uri)
         if getattr(definition, "mimeType", None) != MCP_APP_MIME:
             report.error("{}: mimeType must be {!r} for MCP Apps".format(label, MCP_APP_MIME))
         meta = getattr(definition, "meta", None) or {}
         if "ui" not in meta:
             report.warn("{}: no _meta.ui (csp/permissions) block".format(label))
+
+        try:
+            page = entry["handler"]()
+            if hasattr(page, "to_dict"):
+                page = json.dumps(page.to_dict())
+        except Exception as exc:
+            report.error("{}: render failed: {}".format(label, exc))
+            continue
+
+        errs, warns = check_app_handshake(page if isinstance(page, str) else str(page))
+        for msg in errs:
+            report.error("{}: {}".format(label, msg))
+        for msg in warns:
+            report.warn("{}: {}".format(label, msg))
+
         if render_apps:
-            try:
-                page = entry["handler"]()
-                if hasattr(page, "to_dict"):
-                    page = json.dumps(page.to_dict())
-                size = len(page.encode("utf-8")) if isinstance(page, str) else len(str(page))
-                status = "over limit" if size > limit_bytes else "ok"
-                (report.error if size > limit_bytes else report.info)(
-                    "{}: {:.2f} MB ({})".format(label, size / 1048576.0, status))
-            except Exception as exc:
-                report.error("{}: render failed: {}".format(label, exc))
+            size = len(page.encode("utf-8")) if isinstance(page, str) else len(str(page))
+            status = "over limit" if size > limit_bytes else "ok"
+            (report.error if size > limit_bytes else report.info)(
+                "{}: {:.2f} MB ({})".format(label, size / 1048576.0, status))
+
+    # ── Extension advertisement (offline: call the server's own capability
+    # logic and confirm it declares what its features require) ───────────────
+    check_extensions(report, server, has_apps=n_apps > 0, has_async=n_async > 0)
+
+    # ── Elicitation usage hygiene ───────────────────────────────────────────
+    check_elicitation_usage(report, tools)
 
     if not HAVE_JSONSCHEMA:
         report.warn("jsonschema not installed — schema validity NOT checked "

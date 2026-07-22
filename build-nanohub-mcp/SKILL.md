@@ -73,8 +73,9 @@ Install the same dependencies used by the published environment, then run:
 
 ```sh
 python3 -m pytest tests/ -q
-python scripts/validate_server.py bin/yourtool.py
+python scripts/validate_server.py bin/yourtool.py         # offline: contracts + extension conformance
 start_mcp --app bin/yourtool.py --port 8000
+python scripts/check_conformance.py http://localhost:8000  # live: core + extensions over the wire
 ```
 
 Exercise `initialize`, the initialized notification, `tools/list`, a complete
@@ -82,6 +83,15 @@ create→run→get workflow, invalid schemas, traversal handles, workload limits
 and cleanup. Require at least one passing test and make skipped offline tests a
 CI failure. The scaffold includes `.github/workflows/ci.yml` and copies the
 validator into the generated repository.
+
+`validate_server.py` (offline) and `check_conformance.py` (live) share one rule
+set (`scripts/mcp_conformance.py`) and together verify conformance to the core
+protocol plus every extension nanohub-mcp implements — **MCP Apps**
+(`io.modelcontextprotocol/ui`, including the `ui/initialize` handshake shape
+that renders blank on strict hosts when wrong), **MCP Tasks**
+(`io.modelcontextprotocol/tasks`), and **elicitation**. See
+[references/mcp-apps.md](references/mcp-apps.md) and
+[references/verification.md](references/verification.md).
 
 ## 4. Package and publish
 
@@ -91,7 +101,7 @@ Use this repository layout:
 yourtool/
 ├── bin/yourtool.py
 ├── middleware/invoke
-├── scripts/validate_server.py
+├── scripts/validate_server.py   # + check_conformance.py, mcp_conformance.py
 ├── tests/
 ├── .github/workflows/ci.yml
 ├── doc/description.html
@@ -141,7 +151,9 @@ for the manual equivalents.
 | Resource | Use |
 |---|---|
 | `scripts/new_tool.py NAME` | Scaffold a secure server, tests, invoke file, validator, docs, and CI |
-| `scripts/validate_server.py APP` | Validate contracts and flag common security hazards before deployment |
+| `scripts/validate_server.py APP` | Offline: validate contracts, security hazards, and extension conformance (renders ui:// apps, checks the ext-apps handshake shape) before deployment |
+| `scripts/check_conformance.py URL` | Live: drive a running server and assert core + extension conformance (Apps ⇔ capability advertised + handshake, Tasks, elicitation) over the wire |
+| `scripts/mcp_conformance.py` | Shared invariant rules imported by both validators so a check can't drift between offline and live |
 | `scripts/smoke_live.sh` | Verify discovery, CORS, OAuth metadata, sessions, resources, and optional Tasks/DCR |
 | [references/security.md](references/security.md) | Apply input, path, process, result, secret, and resource controls |
 | [references/state-model.md](references/state-model.md) | Separate global, run, session, and authenticated-user state |

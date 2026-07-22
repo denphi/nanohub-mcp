@@ -120,10 +120,41 @@ timers, don't re-call the same tool with the same args in a render loop, and
 prefer one `["app"]`-visibility polling tool with a `seq` cursor over many
 chatty reads.
 
-**Testable invariant:** your generated app HTML must contain the lifecycle
-strings (`ui/initialize`, `ui/notifications/initialized`,
-`ui/notifications/tool-input`, `ui/resource-teardown` handling). Assert this
-in a validation tool/test so a refactor can't silently drop the handshake.
+**Get the `ui/initialize` argument shape right — this is the #1 blank-app
+cause.** The request params are `McpUiInitializeRequest`: `appInfo` +
+`appCapabilities` + `protocolVersion` (`"2026-01-26"`) — **not** the core-MCP
+`clientInfo` + `capabilities` shape. A spec-strict host (Claude) *rejects* a
+malformed `ui/initialize`, so the promise rejects, `ui/notifications/initialized`
+is never sent, and the host keeps the iframe `visibility:hidden` → the app
+renders blank with no error in the chat. Lenient hosts (ChatGPT) render anyway,
+which masks the bug. Send it as:
+
+```js
+rpc("ui/initialize", {
+  appInfo: { name: "yourapp", version: "1.0.0" },
+  appCapabilities: { availableDisplayModes: ["inline"] },
+  protocolVersion: "2026-01-26",
+}).then(() => notify("ui/notifications/initialized", {}))
+  .catch((e) => console.error("ui/initialize failed:", e));
+```
+
+**Testable invariant (automated in this skill).** A presence check
+(`"ui/initialize" in html`) is not enough — the broken shape above still
+contains the string. The skill's validators assert the *argument shape* and the
+full lifecycle, offline and live, sharing one rule set
+(`scripts/mcp_conformance.py`):
+
+```sh
+python scripts/validate_server.py bin/yourtool.py     # offline: renders ui:// apps,
+                                                      #   asserts appInfo+appCapabilities,
+                                                      #   initialized, size-changed, and that
+                                                      #   the server advertises the ui extension
+python scripts/check_conformance.py http://localhost:8000   # live: ui:// ⇔ extension advertised,
+                                                            #   resources/read handshake conformance
+```
+
+Also assert this in your tool's own test suite so a refactor fails fast in CI
+(see mcp4mp `tests/test_mcp_app_handshake.py` for a self-contained example).
 
 ## Size and self-diagnosis
 

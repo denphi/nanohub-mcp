@@ -493,12 +493,16 @@ def main():
         os.makedirs(os.path.join(root, extra), exist_ok=True)
         open(os.path.join(root, extra, ".keep"), "w").close()
 
-    validator = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "validate_server.py")
-    if os.path.isfile(validator):
-        target = os.path.join(root, "scripts", "validate_server.py")
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        shutil.copyfile(validator, target)
+    # Copy the pre-deploy validator, the live conformance driver, and the
+    # shared invariant module (validate_server.py imports mcp_conformance, so
+    # all three must travel together or the copy ImportErrors).
+    skill_scripts = os.path.dirname(os.path.abspath(__file__))
+    scripts_dir = os.path.join(root, "scripts")
+    os.makedirs(scripts_dir, exist_ok=True)
+    for fname in ("validate_server.py", "check_conformance.py", "mcp_conformance.py"):
+        src = os.path.join(skill_scripts, fname)
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(scripts_dir, fname))
     check_ci = os.path.join(root, "scripts", "check_ci.py")
     with open(check_ci, "w") as stream:
         stream.write(CHECK_CI_TEMPLATE)

@@ -17,8 +17,18 @@ Automated versions of the checks below ship with this skill:
 
 ```sh
 python scripts/validate_server.py bin/yourtool.py --render-apps   # pre-deploy, offline
-HUB=https://nanohub.org TOOL=yourtool scripts/smoke_live.sh        # post-deploy, live
+HUB=https://nanohub.org TOOL=yourtool scripts/smoke_live.sh        # post-deploy, live (OAuth/CORS/session)
+python scripts/check_conformance.py http://localhost:8000          # core + extension conformance, live
 ```
+
+`validate_server.py` (offline) and `check_conformance.py` (live) share one rule
+set (`scripts/mcp_conformance.py`) so a check can't drift between them. Together
+they cover the core protocol and every extension nanohub-mcp implements —
+**MCP Apps** (`io.modelcontextprotocol/ui`: ui:// apps present ⇔ capability
+advertised, and each app's `ui/initialize` handshake is shape-conformant),
+**MCP Tasks** (`io.modelcontextprotocol/tasks`), and **elicitation**. Run
+`check_conformance.py` against a local `start_mcp` first, then the hub URL with
+`--token` (a hub deployment is not your working tree).
 
 For manual runs, set `HUB=https://nanohub.org` (or your hub) and
 `TOOL=yourtoolname`.
