@@ -15,12 +15,15 @@ A nanoHUB MCP tool is a regular nanoHUB tool. Real examples: `padremcp`
 ```
 yourtool/
 ├── bin/
-│   ├── yourtool.py          # THE server — defines module-level `server`
+│   └── yourtool.py          # THE server — defines module-level `server`
+├── tests/
 │   └── test_offline.py      # tests that need no solver/session (run anywhere)
 ├── middleware/
 │   └── invoke               # how the hub launches the tool (see below)
-├── scripts/
-│   ├── validate_server.py   # copied by the scaffold
+├── scripts/                 # copied by the scaffold
+│   ├── validate_server.py   # offline: contracts + extension conformance
+│   ├── check_conformance.py # live: core + extensions over the wire
+│   ├── mcp_conformance.py   # shared rule set the two validators import
 │   └── check_ci.py          # fail CI on skipped/empty suites
 ├── .github/workflows/ci.yml # offline tests + validator on push/PR
 ├── doc/

@@ -101,8 +101,8 @@ Use this repository layout:
 yourtool/
 ├── bin/yourtool.py
 ├── middleware/invoke
-├── scripts/validate_server.py   # + check_conformance.py, mcp_conformance.py
-├── tests/
+├── scripts/   validate_server.py, check_conformance.py, mcp_conformance.py, check_ci.py
+├── tests/test_offline.py
 ├── .github/workflows/ci.yml
 ├── doc/description.html
 └── src/  data/  examples/
