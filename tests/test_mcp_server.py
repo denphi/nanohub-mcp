@@ -240,6 +240,33 @@ def test_initialize():
     )
 
 
+def test_optional_dict_schema_generation():
+    """Optional[Dict[str, str]] must serialize as an object, not a bare string.
+
+    Regression for the bug where strict MCP clients (e.g. ChatGPT) refused to
+    send a map argument because the generated wire schema said 'string'.
+    """
+    from typing import Optional, Dict, List, Any
+    from nanohubmcp import decorators as D
+
+    assert D._python_type_to_json_schema(Optional[Dict[str, str]]) == {
+        "type": "object", "additionalProperties": {"type": "string"}}
+    assert D._python_type_to_json_schema(Dict[str, str]) == {
+        "type": "object", "additionalProperties": {"type": "string"}}
+    assert D._python_type_to_json_schema(Optional[str]) == {"type": "string"}
+    assert D._python_type_to_json_schema(List[str]) == {
+        "type": "array", "items": {"type": "string"}}
+    assert D._python_type_to_json_schema(Any) == {}
+
+    def sample(sources: Optional[Dict[str, str]] = None, name: str = ""):
+        return None
+
+    props = D._generate_input_schema(sample)["properties"]
+    assert props["sources"]["type"] == "object"
+    assert props["sources"]["additionalProperties"] == {"type": "string"}
+    assert props["name"]["type"] == "string"
+
+
 def test_tools_list():
     """POST tools/list returns registered tools."""
     status, body = _post("/", {"jsonrpc": "2.0", "id": 10, "method": "tools/list", "params": {}})

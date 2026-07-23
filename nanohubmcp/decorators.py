@@ -18,9 +18,32 @@ except ImportError:
 
 def _python_type_to_json_schema(py_type):
     # type: (Any) -> Dict[str, Any]
-    """Convert Python type hints to JSON Schema types."""
+    """Convert Python type hints to JSON Schema types.
+
+    Handles Optional[X]/Union[X, None] by unwrapping to X (so, for example,
+    ``Optional[Dict[str, str]]`` becomes an object schema rather than falling
+    back to ``string`` — which previously made strict MCP clients refuse to send
+    a map argument). Also emits ``items``/``additionalProperties`` for typed
+    containers and treats ``typing.Any`` as "accept any JSON value".
+    """
     if py_type is None or py_type is type(None):
         return {"type": "null"}
+
+    origin = getattr(py_type, "__origin__", None)
+
+    # Unwrap Optional[X] / Union[X, None] (and general Unions).
+    try:
+        import typing as _typing
+        is_union = origin is _typing.Union
+    except Exception:
+        is_union = False
+    if is_union:
+        non_none = [a for a in getattr(py_type, "__args__", ()) if a is not type(None)]
+        if len(non_none) == 1:
+            return _python_type_to_json_schema(non_none[0])
+        # Union of several concrete types (or a bare Union) -> accept anything.
+        return {}
+
     if py_type is str:
         return {"type": "string"}
     if py_type is int:
@@ -29,11 +52,25 @@ def _python_type_to_json_schema(py_type):
         return {"type": "number"}
     if py_type is bool:
         return {"type": "boolean"}
-    if py_type is list or (hasattr(py_type, "__origin__") and py_type.__origin__ is list):
+    if py_type is list or origin is list:
+        args = getattr(py_type, "__args__", ())
+        if args:
+            return {"type": "array", "items": _python_type_to_json_schema(args[0])}
         return {"type": "array"}
-    if py_type is dict or (hasattr(py_type, "__origin__") and py_type.__origin__ is dict):
+    if py_type is dict or origin is dict:
+        args = getattr(py_type, "__args__", ())
+        if len(args) == 2:
+            return {"type": "object",
+                    "additionalProperties": _python_type_to_json_schema(args[1])}
         return {"type": "object"}
-    # Default to string for unknown types
+
+    # typing.Any -> permissive (accept any JSON value); truly unknown -> string.
+    try:
+        import typing as _typing2
+        if py_type is _typing2.Any:
+            return {}
+    except Exception:
+        pass
     return {"type": "string"}
 
 
