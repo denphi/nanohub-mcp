@@ -16,6 +16,8 @@ anaconda-7 / py3.8 environment the server runs in.
 
 from __future__ import print_function
 
+import re
+
 # ── Protocol / extension identifiers ────────────────────────────────────────
 # Keep these byte-identical to nanohubmcp/server.py; the whole point of the
 # checks is to catch a server that has drifted from the spec these name.
@@ -36,6 +38,19 @@ LATEST_UI_PROTOCOL = "2026-01-26"
 ELICITATION_METHOD = "elicitation/create"
 
 
+def _strip_js_comments(text):
+    """Drop `//` and `/* */` comments so windows see code, not prose.
+
+    Without this a comment that documents the rule ("params are appInfo, not
+    clientInfo") lands inside a window and is read as the code doing it — a
+    false positive — while also pushing the real params past the window edge,
+    which hides a real defect. Line comments are only stripped when `//` is not
+    preceded by `:` so URLs (`https://`, `ui://`) survive intact.
+    """
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.DOTALL)
+    return re.sub(r"(?<!:)//[^\n]*", " ", text)
+
+
 def _initialize_windows(html, span=600):
     """Yield the text right after each literal `ui/initialize` occurrence.
 
@@ -43,6 +58,7 @@ def _initialize_windows(html, span=600):
     about the *arguments of the initialize call* specifically, while tolerating
     an earlier mention of the string in a comment.
     """
+    html = _strip_js_comments(html)
     windows = []
     start = 0
     while True:

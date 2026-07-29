@@ -79,13 +79,20 @@ initiates; implement every phase or hosts will consider the app broken.
 **1. Handshake — app goes first:**
 
 ```
-app  → host   ui/initialize            (request: appCapabilities, clientInfo)
+app  → host   ui/initialize            (request: appInfo, appCapabilities,
+                                        protocolVersion — never clientInfo)
 host → app    ← result                 (hostCapabilities, hostInfo, hostContext)
 app  → host   ui/notifications/initialized
 ```
 
 Hosts hold back all data until they see `ui/notifications/initialized` —
-an app that skips it renders but never receives tool input.
+an app that skips it renders but never receives tool input. The rule is
+symmetric and hosts enforce it: **send nothing before `initialized`** — no
+`tools/call`, no `ui/notifications/size-changed`. Page startup code that calls
+tools on `DOMContentLoaded` must await the handshake, or the host logs
+`AppBridge received 'tools/call' before ui/notifications/initialized` and drops
+the calls. Queue outbound notifications until the handshake resolves, and gate
+`callTool` on it.
 
 **2. Host pushes data (after initialized):**
 
@@ -138,6 +145,21 @@ rpc("ui/initialize", {
   .catch((e) => console.error("ui/initialize failed:", e));
 ```
 
+**Never fail the handshake silently, and retry it.** A bare `.catch(() => {})`
+around `ui/initialize` turns every one of the failures above into a blank app
+with an empty console — the single hardest MCP Apps bug to diagnose, because
+the server side looks perfect end to end. Two rules:
+
+- **Retry with backoff** (e.g. 400 ms → 5 s, ~30 s total) instead of one short
+  timeout. Hosts answer at wildly different speeds: a host that renders the view
+  in the same page replies synchronously, while one that routes it through a
+  separate sandbox frame can drop the first attempts. Leave timed-out attempts
+  registered in your pending-request map so a *late* reply to any of them still
+  completes the handshake.
+- **Surface the failure in the app's own DOM** when the retries are exhausted,
+  and reject `callTool` with the reason. A visible banner in the iframe is the
+  only channel you have — the host will not show one for you.
+
 **Testable invariant (automated in this skill).** A presence check
 (`"ui/initialize" in html`) is not enough — the broken shape above still
 contains the string. The skill's validators assert the *argument shape* and the
@@ -166,6 +188,40 @@ render the app, report bytes vs limit, and assert invariants (bridge script
 present, lifecycle handlers wired). Hosts have their own caps; when a tile
 doesn't mount on a host that *did* declare the capability, size is the first
 suspect.
+
+## Your own host is not a conformance test
+
+The most common reason an app works locally and dies on a third-party host is
+that the local host is more permissive. Check these before blaming the host:
+
+- **CSP.** A conformant host *builds* a CSP from your resource `_meta.ui.csp`
+  and applies it to the iframe; a host that just sets `iframe.srcdoc` (com_mcp
+  does) enforces nothing. With the secure default of empty domain lists you get
+  roughly `default-src 'none'; script-src 'self' 'unsafe-inline'; connect-src
+  'self'; img-src 'self' data:; font-src 'self'; media-src 'self' data:`. Note
+  what is absent: **no `blob:` anywhere** (so no blob workers, blob scripts, or
+  blob object URLs) and **no `data:` in `font-src`** (so inlined `@font-face`
+  data URIs fail). `csp` accepts *domains only* — there is no way to re-add a
+  scheme, so don't depend on those. Inline `<script>` and `<style>` are fine;
+  `<script src="data:...">` is not.
+- **Sandbox.** Assume `allow-scripts` only. No top-level navigation, no popups,
+  no form posts to anything real.
+- **Handshake latency.** A same-page host replies to `ui/initialize` in
+  microseconds; a sandbox-frame host does not. See the retry rule above.
+- **Viewport-height CSS silently pins the frame.** If your page came from a
+  standalone web app it probably has `body { height: 100vh/100dvh;
+  overflow: hidden }`. Inside an iframe that closes a feedback loop:
+  `scrollHeight` equals whatever height the host granted, you report that back
+  via `ui/notifications/size-changed`, and the host keeps the frame at its
+  initial size forever. The app renders *correctly* but as an unusable sliver,
+  and it only looks right in fullscreen — the one mode where it finally gets a
+  real viewport. Measured on a Rappture app in a 200 px frame: the document laid
+  out at 232 px; with `html, body { height: auto; overflow: visible }` plus a
+  `min-height` floor it laid out at 800 px. Override the height in app mode and
+  report `max(documentElement.scrollHeight, body.scrollHeight, floor)`.
+- **Transport.** claude.ai's client also opens the optional `GET` SSE stream and
+  can treat a failure as fatal for the whole connector; make sure the gateway
+  answers `GET /mcp` with `text/event-stream`, not 405.
 
 ## Host-side notes (if you also build the host)
 
