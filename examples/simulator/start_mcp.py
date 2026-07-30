@@ -409,12 +409,34 @@ _MCP_BRIDGE_JS = r"""
   // Shape per McpUiInitializeRequest (ext-apps spec 2026-01-26): appInfo +
   // appCapabilities are required; hosts reject the request otherwise and
   // then ignore the view entirely (no tool-result, no sizing — blank iframe).
-  rpc("ui/initialize", {
-    appInfo: { name: "physics-simulator-app", version: "1.0.0" },
-    appCapabilities: { availableDisplayModes: ["inline"] },
-    protocolVersion: "2026-01-26",
-  }).then(() => notify("ui/notifications/initialized", {}))
-    .catch((e) => console.error("ui/initialize failed:", e));
+  // Retry the handshake with backoff instead of firing once. Hosts answer
+  // this handshake at very different speeds — one that renders the view in the
+  // same page replies synchronously, while one that routes it through a separate
+  // sandbox frame (claude.ai) can drop the earliest attempts. Attempts are never
+  // cancelled, so a late reply to any of them still completes the handshake; if
+  // they all go unanswered the host never shows the app, so say so loudly.
+  const _initDelays = [400, 800, 1600, 3200, 5000, 5000, 5000, 5000];
+  let _initAttempt = 0;
+  let _initDone = false;
+  function _sendInitialize() {
+    if (_initDone) return;
+    if (_initAttempt >= _initDelays.length) {
+      console.error("[physics-simulator-app] MCP Apps handshake was never answered; this host will not display the app.");
+      return;
+    }
+    const wait = _initDelays[_initAttempt++];
+    rpc("ui/initialize", {
+      appInfo: { name: "physics-simulator-app", version: "1.0.0" },
+      appCapabilities: { availableDisplayModes: ["inline"] },
+      protocolVersion: "2026-01-26",
+    }).then(() => {
+      if (_initDone) return;
+      _initDone = true;
+      notify("ui/notifications/initialized", {});
+    }).catch((e) => console.error("[physics-simulator-app] MCP Apps handshake rejected:", e && e.message));
+    setTimeout(_sendInitialize, wait);
+  }
+  _sendInitialize();
   new ResizeObserver(reportSize).observe(document.documentElement);
 </script>
 """.strip()

@@ -51,6 +51,21 @@ def _strip_js_comments(text):
     return re.sub(r"(?<!:)//[^\n]*", " ", text)
 
 
+def _script_sources(text):
+    """Return just the `<script>` bodies, or the whole text if there are none.
+
+    Servers embed their bridge JS inside a Python (or PHP) source file, so the
+    surrounding host-language comments are part of the file. Those comments
+    routinely *document* the rule being checked ("appInfo, never clientInfo"),
+    which lands in a window and reads as the code doing the wrong thing — a
+    false positive on a correct app. Restricting to script bodies drops them,
+    and drops `<style>` blocks too, where a leading `#` is a selector rather
+    than a comment.
+    """
+    blocks = re.findall(r"<script\b[^>]*>(.*?)</script>", text, re.DOTALL | re.IGNORECASE)
+    return "\n".join(blocks) if blocks else text
+
+
 def _initialize_windows(html, span=600):
     """Yield the text right after each literal `ui/initialize` occurrence.
 
@@ -58,7 +73,7 @@ def _initialize_windows(html, span=600):
     about the *arguments of the initialize call* specifically, while tolerating
     an earlier mention of the string in a comment.
     """
-    html = _strip_js_comments(html)
+    html = _strip_js_comments(_script_sources(html))
     windows = []
     start = 0
     while True:

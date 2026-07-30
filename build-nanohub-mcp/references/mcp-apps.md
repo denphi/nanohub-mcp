@@ -178,6 +178,25 @@ python scripts/check_conformance.py http://localhost:8000   # live: ui:// ⇔ ex
 Also assert this in your tool's own test suite so a refactor fails fast in CI
 (see mcp4mp `tests/test_mcp_app_handshake.py` for a self-contained example).
 
+**Run these checks on rendered app HTML, not on the server source.** Both the
+shared rule set and the project-local guards window on the text following the
+literal `ui/initialize`, which makes them sensitive to prose:
+
+- A host-language comment that *documents* the rule ("appInfo, never
+  clientInfo") lands inside the window and reads as the code doing the wrong
+  thing — a false positive on a correct app. `mcp_conformance.py` now scans only
+  `<script>` bodies and strips JS comments, but a Python `#` comment sitting
+  inside a `<script>` template string can still fool it.
+- A string literal containing `<script` (for instance a check asserting a
+  fragment ships no script) pairs with a later `</script>` and swallows whatever
+  lies between.
+- The project-local guards use the **first** occurrence with a fixed window, so
+  keep the literal method name out of comments and log messages above the call —
+  otherwise the real params fall outside the window and a correct app fails.
+
+Rendering first avoids all three: the host language is gone and only the app's
+own markup remains.
+
 ## Size and self-diagnosis
 
 Apps are typically one self-contained HTML page with inlined JS/CSS — sizes
