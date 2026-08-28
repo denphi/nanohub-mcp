@@ -122,6 +122,47 @@ With explicit options:
    widgets consume the data without re-parsing the text block.
 
 
+Dynamic registration
+--------------------
+
+Tools, resources, and prompts may be registered *after* the server starts. The
+decorators are the same ones used at import time — calling one later also
+notifies connected clients:
+
+.. code-block:: python
+
+   @server.tool(input_schema=...)          # at import: just registers
+   def alpha():
+       ...
+
+   # ... later, while serving:
+   @server.tool(input_schema=...)          # also emits list_changed
+   def beta():
+       ...
+
+   server.remove_tool("beta")              # likewise
+   server.remove_resource("config://x")
+   server.remove_prompt("summarize")
+
+Each ``remove_*`` returns ``True`` when something was removed and ``False``
+when the name was already absent. Removal affects only later lookups: a call
+already in flight holds its handler and completes normally.
+
+**Both client generations are served.** A client on ``2026-07-28`` must opt in
+through ``subscriptions/listen`` (``toolsListChanged``, ``resourcesListChanged``,
+``promptsListChanged``) and receives notifications tagged with its subscription
+id; a session on an earlier revision has no way to opt in, so it receives them
+because the server advertised ``listChanged``. A ``2026-07-28`` session that did
+not subscribe receives nothing, as that revision requires.
+
+``listChanged`` is advertised as ``false`` until the first registration or
+removal happens while serving — a static server must not claim it will send a
+notification it never sends.
+
+Registration and listing are guarded by a re-entrant lock, so a background
+thread may register while requests are being served. Single-key lookups on the
+hot path stay lock-free.
+
 @server.async_tool()
 ---------------------
 
@@ -141,6 +182,90 @@ Use this for any tool that may exceed the reverse proxy timeout (typically 30–
        """Run a long RTL-to-GDSII flow. Can take up to 10 minutes."""
        # ... long-running work ...
        return result
+
+**Cancellation.** ``tasks/cancel`` sets a per-job cancel event and fires any
+callbacks the handler registered, so cancelling a task stops the work instead of
+just relabelling the record. Cancellation is cooperative — the MCP Tasks
+extension lets a cancelled task still reach a non-``cancelled`` terminal state —
+so the handler decides how promptly to stop:
+
+.. code-block:: python
+
+   @server.async_tool()
+   def run_simulation(deck, ctx=None):
+       proc = subprocess.Popen(argv, start_new_session=True)
+       ctx.on_cancel(lambda: os.killpg(proc.pid, signal.SIGTERM))
+       while proc.poll() is None:
+           if ctx.cancel_event.wait(0.5):   # returns True the moment cancel lands
+               break
+       return {"status": "cancelled" if ctx.is_cancelled() else "finished"}
+
+``ctx.on_cancel`` callbacks run on the thread handling ``tasks/cancel``, so keep
+them short. A callback registered after cancellation already happened fires
+immediately rather than being dropped. ``server.cancel_job(job_id)`` exposes the
+same path, so you can offer cancellation to legacy clients by registering your
+own tool that calls it under whatever authorization you require.
+
+**Task metadata at dispatch.** To hand the caller a durable identifier — a
+scheduler job id, a run handle — before the work finishes, use a ``prepare``
+hook. It runs synchronously *before* the worker thread starts, so what it
+publishes is already on the task handle the call returns:
+
+.. code-block:: python
+
+   def _submit(deck, ctx=None):
+       ctx.set_task_metadata(jobHandle=cluster.submit(deck))
+
+   @server.async_tool(prepare=_submit)
+   def run_simulation(deck, ctx=None):
+       return cluster.wait(ctx.task_metadata["org.nanohub/jobHandle"])
+
+The values appear as ``_meta`` on the initial task handle and on every
+``tasks/get`` response. (The Tasks ``Task`` object has no ``_meta`` of its own,
+but ``CreateTaskResult`` is ``Result & Task``, so the response envelope carries
+it.) Unqualified keys are namespaced with ``org.nanohub/``; MCP-reserved
+prefixes raise ``ValueError``. Legacy clients, which never read ``_meta``, get
+the same values under ``meta`` in the JSON body and in ``get_job_result``.
+
+A ``prepare`` hook that raises aborts the call and starts no job.
+
+**Status notifications (opt-in).** Clients that would rather not poll can
+subscribe with ``subscriptions/listen``, naming the task ids they care about:
+
+.. code-block:: json
+
+   {"jsonrpc": "2.0", "id": "sub-1", "method": "subscriptions/listen",
+    "params": {"notifications": {"taskIds": ["<taskId>"]}}}
+
+The server acknowledges with ``notifications/subscriptions/acknowledged`` —
+listing only the tasks it agreed to, which are those that exist and belong to
+the calling session — and then pushes ``notifications/tasks`` on every status
+change, carrying the complete task (terminal result included) plus the
+subscription id. Because the listen stream is long-lived, the request itself
+gets no immediate response; the transport replies ``202`` and the stream stays
+open.
+
+Notifications **supplement** polling, they do not replace it: the extension says
+servers MAY push updates *in addition to* servicing ``tasks/get``, and clients
+MAY keep polling. Sending is strictly opt-in — a session that never subscribes
+receives nothing, per the rule that a server MUST NOT send a notification type
+the client did not request.
+
+.. note::
+
+   ``subscriptions/listen`` is implemented in the shape defined by the current
+   MCP draft while the server negotiates ``2026-07-28`` and earlier. Clients
+   that do not know the method simply never call it and keep polling.
+
+.. note::
+
+   **Routing headers.** ``Mcp-Method`` and ``Mcp-Name`` are required by default
+   of requests that declare ``2026-07-28`` — the revision that requires them —
+   and never of earlier revisions, which never defined them. A contradicting
+   header is rejected at any revision. Enforcement applies only to transports
+   that carry headers; a direct call, SSE, or stdio is unaffected. Override with
+   ``start_mcp --require-route-headers`` (all revisions) or
+   ``--allow-missing-route-headers`` (never), or ``run(require_route_headers=…)``.
 
 Calling ``run_simulation`` returns immediately:
 
@@ -369,6 +494,16 @@ Add a ``ctx`` (or ``context``) parameter as the first argument:
      - Request LLM sampling from a client that declared the ``sampling`` capability
    * - ``ctx.list_roots(timeout=60)``
      - Request roots from a client that declared the ``roots`` capability
+   * - ``ctx.is_cancelled()``
+     - True once the client has cancelled this async task; poll it between iterations
+   * - ``ctx.cancel_event``
+     - ``threading.Event`` set on cancellation — pass it to blocking waits
+   * - ``ctx.on_cancel(callback)``
+     - Register a callback fired on cancellation (terminate a process group, delete a remote job)
+   * - ``ctx.task_metadata``
+     - Metadata published for this task, as a dict
+   * - ``ctx.set_task_metadata(metadata=None, **kwargs)``
+     - Publish durable identifiers that surface as ``_meta`` on the task handle
 
 .. note::
 

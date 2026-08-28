@@ -149,6 +149,12 @@ Rules:
   meaningful without the surrounding conversation.
 - **Do not confirm-spam.** Reads and cheap idempotent calls must never elicit;
   a prompt on every call trains the user to accept without reading.
+- **Put the work after the ask.** Under protocol `2026-07-28` a *sync* handler
+  re-runs from the top when the client answers, so anything done before the
+  confirmation happens on every round trip. Compute what you need to describe
+  the consequence, ask, then act — or make the tool `@async_tool`, where the
+  worker parks and resumes instead of re-running
+  ([elicitation.md](elicitation.md)).
 - Set `destructiveHint` / `idempotentHint` so hosts add their own confirmation
   too. Host dialogs and annotations are defense in depth, never the gate.
 

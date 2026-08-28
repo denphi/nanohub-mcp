@@ -98,8 +98,53 @@ remove or shadow `get_job_result`.
   `get_*` readers for arrays. Giant task results bloat every poll response.
 - **Progress**: for long phases, a `ctx` parameter gives you
   progress/logging helpers tied to the request's progress token.
-- **Cancellation** maps to `tasks/cancel`; if your solver can be interrupted,
-  poll a cancellation flag between iterations rather than ignoring it.
+- **Cancellation** maps to `tasks/cancel`, which sets a per-job cancel event
+  and fires the callbacks your handler registered — so a cancel stops the
+  solver instead of just relabelling the record. Poll `ctx.is_cancelled()`
+  between iterations, wait on `ctx.cancel_event` instead of `sleep`, and
+  register `ctx.on_cancel(...)` to kill a process group you cannot poll out
+  of:
+
+  ```python
+  proc = subprocess.Popen(argv, start_new_session=True)
+  ctx.on_cancel(lambda: os.killpg(proc.pid, signal.SIGTERM))
+  while proc.poll() is None:
+      if ctx.cancel_event.wait(0.5):
+          break
+  ```
+
+  Cancellation is cooperative by spec — a cancelled task may still reach a
+  non-`cancelled` terminal state — so decide what a half-finished run leaves
+  behind. `server.cancel_job(job_id)` is the same path, for offering
+  cancellation to legacy clients through a tool of your own.
+- **Push instead of poll, if the client asks.** A client may subscribe with
+  `subscriptions/listen` (`params.notifications.taskIds`); the server
+  acknowledges with `notifications/subscriptions/acknowledged` and then pushes
+  `notifications/tasks` on every status change, carrying the full task and its
+  terminal result. This *supplements* polling — the spec says servers MAY push
+  in addition to servicing `tasks/get`, and clients MAY keep polling — and it
+  is strictly opt-in: a session that never subscribes receives nothing. You
+  get it for free; there is nothing to add to a tool. Do not design a tool
+  that only works with notifications, since most hosts still just poll.
+- **Durable handles at dispatch.** If the caller needs an identifier to find
+  the work again — a scheduler job id, a run handle — mint it in a `prepare`
+  hook. It runs synchronously before the worker starts, so it lands on the
+  task handle the call returns; the tool body has not run yet and cannot:
+
+  ```python
+  def _submit(deck, ctx=None):
+      ctx.set_task_metadata(jobHandle=cluster.submit(deck))
+
+  @server.async_tool(prepare=_submit)
+  def run_simulation(deck, ctx=None):
+      return cluster.wait(ctx.task_metadata["org.nanohub/jobHandle"])
+  ```
+
+  Values surface as `_meta` on the initial handle and on every `tasks/get`
+  (the `Task` object has no `_meta`, but `CreateTaskResult` is `Result &
+  Task`, so the envelope carries it). Bare keys get an `org.nanohub/` prefix;
+  MCP-reserved prefixes raise. Hosts may ignore `_meta` entirely, so keep a
+  tool that lists live handles as the reliable path.
 - **Docstring**: say explicitly "long-running; returns a task/job — poll for
   the result, then call get_… tools". Models handle the flow well when told.
 
@@ -109,3 +154,7 @@ remove or shadow `get_job_result`.
   then poll `get_job_result` (or `tasks/get` with a session) until terminal.
 - A fake solver (`sleep 2; write output`) exercises the whole lifecycle
   without scientific dependencies — good offline-test material.
+- Cancel mid-run and assert the *work* stopped, not just the status: check the
+  `on_cancel` callback fired and the handler returned early. A test that only
+  asserts `status == "cancelled"` passes even when the solver runs to
+  completion.

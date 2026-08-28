@@ -176,7 +176,22 @@ def shutdown(signum, frame):
             proc.terminate()
 
 
-def write_mcp_runner(app_path, host, port, path_prefix=""):
+def _route_header_mode(args):
+    # type: (argparse.Namespace) -> object
+    """Resolve the two CLI flags into run()'s tri-state.
+
+    Default "auto" enforces the routing headers only for the revision that
+    requires them; the flags force enforcement on or off for all of them.
+    """
+    if getattr(args, "allow_missing_route_headers", False):
+        return False
+    if getattr(args, "require_route_headers", False):
+        return True
+    return "auto"
+
+
+def write_mcp_runner(app_path, host, port, path_prefix="",
+                     require_session_header=False, require_route_headers="auto"):
     # type: (str, str, int, str) -> str
     """
     Create a temporary Python runner script for the MCP server.
@@ -201,6 +216,8 @@ app_path = {app_path!r}
 host = {host!r}
 port = {port!r}
 path_prefix = {path_prefix!r}
+require_session_header = {require_session_header!r}
+require_route_headers = {require_route_headers!r}
 
 # Add app directory to path
 if app_dir not in sys.path:
@@ -217,11 +234,16 @@ spec.loader.exec_module(module)
 if hasattr(module, "server"):
     server = module.server
     print("MCP Server ready!", flush=True)
-    server.run(host=host, port=port, path_prefix=path_prefix)
+    server.run(host=host, port=port, path_prefix=path_prefix,
+               require_session_header=require_session_header,
+               require_route_headers=require_route_headers)
 else:
     print("Error: No 'server' variable found in app file", flush=True)
     sys.exit(1)
-""".format(app_dir=app_dir, app_path=app_path, host=host, port=port, path_prefix=path_prefix, mod=mod)
+""".format(app_dir=app_dir, app_path=app_path, host=host, port=port,
+           path_prefix=path_prefix, mod=mod,
+           require_session_header=require_session_header,
+           require_route_headers=require_route_headers)
 
     fd, path = tempfile.mkstemp(prefix="mcp_runner_", suffix=".py")
     with os.fdopen(fd, "w") as f:
@@ -324,6 +346,29 @@ Examples:
         action="store_true",
         help="Enable debug mode with verbose logging"
     )
+    parser.add_argument(
+        "--require-session-header",
+        action="store_true",
+        help="Only accept session ids from the Mcp-Session-Id header, never "
+             "from the query string. Harden deployments whose URLs are logged "
+             "by proxies. Requires every hop to forward the header."
+    )
+    parser.add_argument(
+        "--require-route-headers",
+        action="store_true",
+        help="Require the routing headers (Mcp-Method, and Mcp-Name where the "
+             "body names a tool or prompt) on POSTs from EVERY protocol "
+             "revision, not just 2026-07-28. By default they are required only "
+             "of requests that declare 2026-07-28, which is where the spec "
+             "requires them."
+    )
+    parser.add_argument(
+        "--allow-missing-route-headers",
+        action="store_true",
+        help="Never require the routing headers, even from a 2026-07-28 "
+             "client. Use when a hop in front of this server strips unknown "
+             "headers. A contradicting header is still rejected."
+    )
 
     args = parser.parse_args()
 
@@ -351,7 +396,10 @@ def _start_directly(app_path, args):
         python_executable = resolve_python_env(args.python_env)
         print("Using Python environment: {}".format(python_executable), flush=True)
         # For python-env, we need to use subprocess
-        runner = write_mcp_runner(app_path, args.host, args.port)
+        runner = write_mcp_runner(
+            app_path, args.host, args.port,
+            require_session_header=args.require_session_header,
+            require_route_headers=_route_header_mode(args))
         env = os.environ.copy()
         app_dir = os.path.dirname(app_path)
         env["PYTHONPATH"] = app_dir + os.pathsep + env.get("PYTHONPATH", "")
@@ -363,7 +411,9 @@ def _start_directly(app_path, args):
     else:
         # Run directly in current process
         server = load_server_from_app(app_path)
-        server.run(host=args.host, port=args.port)
+        server.run(host=args.host, port=args.port,
+                   require_session_header=args.require_session_header,
+                   require_route_headers=_route_header_mode(args))
 
 
 def _find_wrwroxy():
@@ -450,7 +500,10 @@ def _start_with_proxy(app_path, args):
     env["PYTHONPATH"] = app_dir + os.pathsep + env.get("PYTHONPATH", "")
 
     # Create runner script
-    runner = write_mcp_runner(app_path, args.host, mcp_port, path_prefix=path_prefix)
+    runner = write_mcp_runner(
+        app_path, args.host, mcp_port, path_prefix=path_prefix,
+        require_session_header=args.require_session_header,
+        require_route_headers=_route_header_mode(args))
 
     # Launch MCP server
     print("Starting MCP server", flush=True)

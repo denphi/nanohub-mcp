@@ -6,12 +6,28 @@ Four version axes exist; know which one you're changing.
 
 nanohub-mcp negotiates from `SUPPORTED_PROTOCOL_VERSIONS` in the installed
 `nanohubmcp/server.py`. The repository inspected for this skill listed
-`2026-01-26, 2025-11-25, 2025-06-18, 2024-11-05`; verify the installed
-environment instead of treating that list as permanent. If the client
+`2026-07-28, 2025-11-25, 2025-06-18, 2024-11-05`; verify the installed
+environment instead of treating that list as permanent. Only **core** MCP
+revisions belong there — an extension's spec date (the MCP Apps
+`ui/initialize` `protocolVersion`, for one) is a different namespace, and
+advertising one as a core version names a revision that does not exist. If the client
 requests one of those, it wins; otherwise the server answers with the newest.
 You write no code for this — but don't assume a newer-protocol feature is
 available just because the framework supports it: check the **negotiated
 capabilities** (Tasks, Apps, elicitation), not the version string.
+
+`2026-07-28` is negotiated **per request**, not once at `initialize`: a client
+declares its version in `params._meta`. That revision removes sessions and the
+handshake, so a request that declares nothing is served as `2025-11-25` and
+keeps working unchanged.
+
+One consequence reaches your tool code. Under `2026-07-28` the server may no
+longer push a request to the client and block, so `ctx.elicit()` asks by
+**returning**: the call comes back as an `InputRequiredResult`, the client
+retries it with the answer, and **your handler runs again from the top**. Write
+elicitation-using handlers to be idempotent up to each ask — compute the
+preview, then ask, then do the work. Against older clients the same code takes
+the blocking path and behaves exactly as before, so one tool body serves both.
 
 ## 2. What nanohub-mcp does NOT support: live list changes
 

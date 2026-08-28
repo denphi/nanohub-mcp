@@ -210,4 +210,4 @@ for the manual equivalents.
 | [references/quota-and-etiquette.md](references/quota-and-etiquette.md) | Control context, calls, storage, and session costs |
 | [references/oauth-dcr.md](references/oauth-dcr.md) | Understand hub-provided OAuth and DCR |
 | [references/gateway-cors.md](references/gateway-cors.md) | Diagnose gateway, CORS, SSE, and header forwarding |
-| [references/versioning.md](references/versioning.md) | Evolve protocol, framework, tools, and hub revisions safely |
+| [references/versioning.md](references/versioning.md) | Evolve protocol, framework, tools, and hub revisions safely; what `2026-07-28` changes |

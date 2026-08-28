@@ -72,6 +72,45 @@ correlates the flow). Use for third-party authorization or anything requiring
 a real browser context. Never use elicitation of either mode to collect
 passwords or secrets into tool results — results enter the model context.
 
+## Under protocol 2026-07-28: the server asks by *returning*
+
+That revision removed server-initiated requests. A server can no longer push
+`elicitation/create` down the wire and block, so the same `ctx.elicit()` call
+takes a different route — **the framework picks; your tool body does not
+change**. What changes is what happens around it.
+
+**In a sync tool, the call is re-driven.** `ctx.elicit()` raises
+`InputRequired`, the server answers with an `InputRequiredResult` naming what
+it needs, and the client retries the *same* `tools/call` with `inputResponses`
+plus a `requestState`. **Your handler then runs again from the top.** So:
+
+- **Be idempotent up to each ask.** Everything before the ask happens once per
+  round trip. Compute the preview, then ask, then do the work — never write
+  files, submit jobs, or mutate state before a confirmation.
+- **Ask in a stable order.** Answers are keyed by ask order (`input-1`,
+  `input-2`, …), so the handler must reach the same asks in the same sequence
+  on a retry. Don't branch on a random value or a clock before an ask.
+
+**In an async tool, nothing re-runs.** The worker thread is alive and holding
+its state, so the task moves to `input_required`, publishes its
+`inputRequests`, and parks until the client sends `tasks/update`. It then
+resumes in place. An async handler needs no idempotency at all — expensive prep
+before an ask happens exactly once. This is the better shape for anything
+costly: put the work in an `@async_tool` and the retry problem disappears.
+
+What does not change:
+
+- **The capability gate still raises `RuntimeError`** when the client never
+  declared `elicitation`, on both stacks. The fail-closed pattern in
+  [security.md](security.md) works unmodified.
+- **Never wrap the ask in a bare `except Exception`.** `InputRequired` derives
+  from `BaseException` precisely so a careless catch cannot swallow it and
+  return a fabricated answer — but catching `BaseException` would still break
+  the flow. Catch `RuntimeError`, which is what the gate raises.
+- URL mode loses `elicitationId`: with no completion notification, the client
+  reports the outcome by retrying. Encode your own correlation id in
+  `requestState` if you need one.
+
 ## Transport constraints (nanoHUB-specific)
 
 - Server→client requests ride the MCP session channel. They work through
@@ -93,3 +132,4 @@ passwords or secrets into tool results — results enter the model context.
 | external browser flow (OAuth to a data source) | `ctx.elicit_url` |
 | clients without the capability, cheap/reversible action | ToolResult telling the model what to ask |
 | clients without the capability, irreversible/expensive action | refuse and say so — the model must not relay consent |
+| a confirmation in a tool that already did expensive work | move the work after the ask, or make the tool `@async_tool` — a sync handler re-runs from the top on 2026-07-28 |

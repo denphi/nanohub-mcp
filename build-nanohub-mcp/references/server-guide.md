@@ -13,6 +13,37 @@ Framework: `nanohubmcp` (repo `nanohub-mcp`). Reference servers:
 `padremcp/bin/padremcp.py` (clean create→run→get simulation wrapper),
 `rappturemcp/bin/rappturemcp.py` (large: apps, tasks, projects).
 
+## Registering tools after start-up
+
+Tools, resources, and prompts do not have to exist at import. The same
+decorators work while the server is running, and `remove_tool(name)` /
+`remove_resource(uri)` / `remove_prompt(name)` take them away again. Use this
+when the available tools depend on something only known at runtime — a licence
+check, a solver that may or may not be installed, a dataset that appears later.
+
+```python
+if solver_available():
+    @server.tool(input_schema=_RUN_INPUT_SCHEMA, output_schema=_RUN_OUTPUT_SCHEMA)
+    def run_solver(deck, ctx=None):
+        """Run the licensed solver. Long-running; poll for the result."""
+        ...
+```
+
+Clients are told: a `2026-07-28` client that subscribed via
+`subscriptions/listen` gets a tagged `notifications/tools/list_changed`, and an
+older client gets one because the server advertises `listChanged`. Nothing is
+sent to a modern client that did not ask.
+
+Two rules:
+
+- **Keep the tool set stable per session where you can.** A model that has
+  already been told a tool exists will call it; removing it mid-conversation
+  produces a confusing failure. Prefer registering everything up front and
+  returning a clear error from a tool that cannot run right now.
+- **Registration is not authorization.** Hiding a tool from `tools/list` is not
+  an access control — enforce permissions inside the handler
+  ([security.md](security.md)).
+
 ## Anatomy of a tool
 
 ```python

@@ -271,7 +271,8 @@ def async_tool(
     meta=None,  # type: Optional[Dict[str, Any]]
     input_schema=None,  # type: Optional[Dict[str, Any]]
     output_schema=None,  # type: Optional[Dict[str, Any]]
-    annotations=None  # type: Optional[Dict[str, Any]]
+    annotations=None,  # type: Optional[Dict[str, Any]]
+    prepare=None  # type: Optional[Callable]
 ):
     # type: (...) -> Callable
     """
@@ -287,12 +288,29 @@ def async_tool(
             # may take minutes — will not block the HTTP response
             ...
             return result_string
+
+    ``prepare`` is an optional callable run **synchronously before** the worker
+    thread starts, receiving the same arguments (plus ``ctx`` if it declares
+    one). Whatever it publishes becomes task metadata on the handle the caller
+    gets back, which is the only way a durable identifier can be present at
+    dispatch — the tool body has not run yet::
+
+        def _submit(deck, ctx=None):
+            ctx.set_task_metadata(jobHandle=cluster.submit(deck))
+
+        @server.async_tool(prepare=_submit)
+        def run_simulation(deck, ctx=None):
+            return cluster.wait(ctx.task_metadata["org.nanohub/jobHandle"])
+
+    Keep it fast — it runs inside the request. If it raises, the call fails and
+    no job is started.
     """
     def decorator(func):
         # type: (Callable) -> Callable
         decorated = tool(name, description, tags, meta, input_schema, output_schema,
                          annotations=annotations)(func)
         decorated._mcp_async_tool = True
+        decorated._mcp_async_prepare = prepare
         return decorated
 
     if callable(name):

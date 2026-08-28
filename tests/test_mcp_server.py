@@ -1302,3 +1302,639 @@ def setup_module():
             pass
         time.sleep(0.1)
     raise RuntimeError("Test server did not start within 5 seconds")
+
+
+# ---------------------------------------------------------------------------
+# Task metadata at dispatch + real cancellation
+# ---------------------------------------------------------------------------
+
+def _tasks_server(prepare=None, body=None):
+    """Build a server with one async tool and a Tasks-capable session."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("tasksrv")
+    s.async_tool(prepare=prepare)(body)
+    s._set_session_capabilities(
+        "sess-1", {"extensions": {"io.modelcontextprotocol/tasks": {}}}
+    )
+    return s
+
+
+def _rpc(server, method, params, session_id="sess-1"):
+    return server._handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        session_id=session_id,
+    )["result"]
+
+
+def test_prepare_hook_puts_metadata_on_the_initial_task_handle():
+    """A durable handle minted in prepare must ride the CreateTaskResult _meta.
+
+    Task itself has no _meta, but CreateTaskResult is `Result & Task`, so the
+    envelope carries it. This is the only point a handle can reach the caller
+    at dispatch — the tool body has not run yet.
+    """
+    def prepare(ctx=None):
+        ctx.set_task_metadata(jobHandle="cluster-4711")
+
+    def body(ctx=None):
+        return "done"
+
+    s = _tasks_server(prepare=prepare, body=body)
+    result = _rpc(s, "tools/call", {"name": "body", "arguments": {}})
+
+    assert result["resultType"] == "task"
+    assert result["_meta"] == {"org.nanohub/jobHandle": "cluster-4711"}
+
+    # tasks/get carries it too, for clients that only see the poll.
+    got = _rpc(s, "tasks/get", {"taskId": result["taskId"]})
+    assert got["_meta"] == {"org.nanohub/jobHandle": "cluster-4711"}
+
+
+def test_prepare_failure_starts_no_job():
+    """A raising prepare must not leave a phantom 'running' task behind."""
+    def prepare(ctx=None):
+        raise ValueError("submit refused")
+
+    def body(ctx=None):
+        return "never"
+
+    s = _tasks_server(prepare=prepare, body=body)
+    response = s._handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+         "params": {"name": "body", "arguments": {}}},
+        session_id="sess-1",
+    )
+
+    assert "error" in response
+    assert s._jobs == {}
+
+
+def test_tasks_cancel_signals_the_worker_and_fires_callbacks():
+    """tasks/cancel must stop the work, not just relabel the record."""
+    fired = threading.Event()
+    running = threading.Event()
+
+    def body(ctx=None):
+        ctx.on_cancel(fired.set)
+        running.set()
+        # Would be a solver wait; returns early only if cancellation lands.
+        if ctx.cancel_event.wait(10):
+            return {"status": "cancelled"}
+        return {"status": "finished"}
+
+    s = _tasks_server(body=body)
+    task_id = _rpc(s, "tools/call", {"name": "body", "arguments": {}})["taskId"]
+    assert running.wait(2), "worker never started"
+
+    started = time.time()
+    assert _rpc(s, "tasks/cancel", {"taskId": task_id}) == {"resultType": "complete"}
+    assert fired.wait(2), "on_cancel callback never ran"
+
+    deadline = time.time() + 3
+    status = None
+    while time.time() < deadline:
+        status = _rpc(s, "tasks/get", {"taskId": task_id})["status"]
+        if status == "cancelled":
+            break
+        time.sleep(0.02)
+
+    assert status == "cancelled"
+    # The tool asked to wait 10s; cancellation must cut that short.
+    assert time.time() - started < 3
+
+
+def test_on_cancel_after_cancellation_fires_immediately():
+    """Registering a callback post-cancel must not silently drop it."""
+    from nanohubmcp.server import MCPServer
+
+    fired = []
+    s = MCPServer("late")
+
+    @s.async_tool()
+    def worker(ctx=None):
+        while not ctx.is_cancelled():
+            time.sleep(0.01)
+        ctx.on_cancel(lambda: fired.append(1))
+        return "stopped"
+
+    job_id = s._start_async_tool_job(s._tools["worker"]["handler"], 1, {})
+    time.sleep(0.05)
+    assert s.cancel_job(job_id) is True
+
+    deadline = time.time() + 2
+    while time.time() < deadline and not fired:
+        time.sleep(0.01)
+    assert fired == [1]
+
+
+def test_cancelled_job_polls_as_cancelled_not_done():
+    """A cancelled job must not report 'done' with a null result."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("cancelpoll")
+
+    @s.async_tool()
+    def worker():
+        return "x"
+
+    with s._jobs_lock:
+        s._jobs["jid"] = {"status": "cancelled", "result": None, "task_meta": {}}
+
+    polled = s._tools["get_job_result"]["handler"](job_id="jid")
+    assert polled["status"] == "cancelled"
+
+
+def test_legacy_clients_get_task_metadata_in_the_body():
+    """Non-Tasks clients never read _meta — give them the handles they can see."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("legacy")
+
+    def prepare(ctx=None):
+        ctx.set_task_metadata(jobHandle="h-1")
+
+    @s.async_tool(prepare=prepare)
+    def worker(ctx=None):
+        time.sleep(0.2)
+        return "done"
+
+    response = s._handle_request({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "worker", "arguments": {}},
+    })
+    body = json.loads(response["result"]["content"][0]["text"])
+    assert body["meta"] == {"org.nanohub/jobHandle": "h-1"}
+
+    polled = s._tools["get_job_result"]["handler"](job_id=body["job_id"])
+    assert polled["meta"] == {"org.nanohub/jobHandle": "h-1"}
+
+
+def test_task_metadata_keys_are_namespaced_and_reserved_prefixes_rejected():
+    """_meta keys must follow the MCP naming rules."""
+    from nanohubmcp.server import MCPServer
+
+    assert MCPServer._normalize_task_meta({"jobHandle": "h"}) == {
+        "org.nanohub/jobHandle": "h"
+    }
+    # Second label 'example' is not reserved — passes through untouched.
+    assert MCPServer._normalize_task_meta({"com.example.mcp/x": 1}) == {
+        "com.example.mcp/x": 1
+    }
+    for reserved in ("io.modelcontextprotocol/x", "dev.mcp/x",
+                     "org.modelcontextprotocol.api/x"):
+        try:
+            MCPServer._normalize_task_meta({reserved: 1})
+            assert False, "expected {} to be rejected".format(reserved)
+        except ValueError:
+            pass
+
+
+def test_is_cancelled_is_safe_in_sync_tools():
+    """The same guard code must work outside a task without blowing up."""
+    from nanohubmcp.server import MCPServer
+
+    ctx = Context(server=MCPServer("sync"))
+    assert ctx.is_cancelled() is False
+    assert ctx.cancel_event.wait(0) is False
+    assert ctx.task_metadata == {}
+    ctx.on_cancel(lambda: None)   # no-op, must not raise
+
+
+# ---------------------------------------------------------------------------
+# subscriptions/listen + notifications/tasks
+# ---------------------------------------------------------------------------
+
+def _sse_probe(server, session_id):
+    """Attach a queue standing in for a connected SSE client."""
+    from nanohubmcp.server import _SSEQueue
+
+    queue = _SSEQueue()
+    with server._clients_lock:
+        server._clients.setdefault(session_id, []).append(queue)
+    return queue
+
+
+def _messages(queue, method=None):
+    out = [json.loads(m) for m in queue]
+    if method is not None:
+        out = [m for m in out if m.get("method") == method]
+    return out
+
+
+def test_listen_acknowledges_and_keeps_the_stream_open():
+    """The listen response is deferred; the ack names the tasks agreed to."""
+    def body(ctx=None):
+        time.sleep(0.3)
+        return "done"
+
+    s = _tasks_server(body=body)
+    probe = _sse_probe(s, "sess-1")
+    task_id = _rpc(s, "tools/call", {"name": "body", "arguments": {}})["taskId"]
+
+    response = s._handle_request(
+        {"jsonrpc": "2.0", "id": "sub-7", "method": "subscriptions/listen",
+         "params": {"notifications": {"taskIds": [task_id]}}},
+        session_id="sess-1",
+    )
+    # A listen stream's result is only sent on graceful teardown.
+    assert response is None
+
+    acks = _messages(probe, "notifications/subscriptions/acknowledged")
+    assert len(acks) == 1
+    assert acks[0]["params"]["notifications"]["taskIds"] == [task_id]
+    assert acks[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"] == "sub-7"
+
+
+def test_task_notifications_are_pushed_and_polling_still_works():
+    """Notifications supplement tasks/get; they do not replace it."""
+    gate = threading.Event()
+
+    def prepare(ctx=None):
+        ctx.set_task_metadata(jobHandle="cluster-99")
+
+    def body(ctx=None):
+        gate.wait(5)
+        return {"status": "finished"}
+
+    s = _tasks_server(prepare=prepare, body=body)
+    probe = _sse_probe(s, "sess-1")
+    task_id = _rpc(s, "tools/call", {"name": "body", "arguments": {}})["taskId"]
+    s._handle_request(
+        {"jsonrpc": "2.0", "id": "sub-1", "method": "subscriptions/listen",
+         "params": {"notifications": {"taskIds": [task_id]}}},
+        session_id="sess-1",
+    )
+
+    gate.set()
+    deadline = time.time() + 3
+    pushed = []
+    while time.time() < deadline:
+        pushed = _messages(probe, "notifications/tasks")
+        if pushed:
+            break
+        time.sleep(0.02)
+
+    assert pushed, "no notifications/tasks delivered"
+    params = pushed[-1]["params"]
+    assert params["taskId"] == task_id
+    assert params["status"] == "completed"
+    # Carries the full DetailedTask, including the terminal payload...
+    assert params["result"]["structuredContent"] == {"status": "finished"}
+    # ...the subscription id, and the tool's own task metadata.
+    assert params["_meta"]["io.modelcontextprotocol/subscriptionId"] == "sub-1"
+    assert params["_meta"]["org.nanohub/jobHandle"] == "cluster-99"
+
+    # Polling remains valid and returns the same terminal state.
+    assert _rpc(s, "tasks/get", {"taskId": task_id})["status"] == "completed"
+
+
+def test_no_task_notifications_without_a_subscription():
+    """The spec forbids sending notification types the client didn't request."""
+    def body(ctx=None):
+        return "done"
+
+    s = _tasks_server(body=body)
+    probe = _sse_probe(s, "sess-1")
+    _rpc(s, "tools/call", {"name": "body", "arguments": {}})
+
+    time.sleep(0.3)
+    assert _messages(probe, "notifications/tasks") == []
+
+
+def test_listen_only_acknowledges_tasks_the_session_owns():
+    """Unknown or foreign task ids are omitted from the acknowledgement."""
+    def body(ctx=None):
+        time.sleep(0.3)
+        return "done"
+
+    s = _tasks_server(body=body)
+    probe = _sse_probe(s, "sess-1")
+    mine = _rpc(s, "tools/call", {"name": "body", "arguments": {}})["taskId"]
+
+    s._handle_request(
+        {"jsonrpc": "2.0", "id": "sub-2", "method": "subscriptions/listen",
+         "params": {"notifications": {"taskIds": [mine, "not-a-real-task"]}}},
+        session_id="sess-1",
+    )
+    ack = _messages(probe, "notifications/subscriptions/acknowledged")[0]
+    assert ack["params"]["notifications"]["taskIds"] == [mine]
+
+
+def test_cancellation_is_pushed_to_subscribers():
+    """A cancelled task notifies, so a subscriber need not poll to learn it."""
+    running = threading.Event()
+
+    def body(ctx=None):
+        running.set()
+        ctx.cancel_event.wait(10)
+        return {"status": "cancelled"}
+
+    s = _tasks_server(body=body)
+    probe = _sse_probe(s, "sess-1")
+    task_id = _rpc(s, "tools/call", {"name": "body", "arguments": {}})["taskId"]
+    s._handle_request(
+        {"jsonrpc": "2.0", "id": "sub-3", "method": "subscriptions/listen",
+         "params": {"notifications": {"taskIds": [task_id]}}},
+        session_id="sess-1",
+    )
+    assert running.wait(2)
+
+    _rpc(s, "tasks/cancel", {"taskId": task_id})
+
+    deadline = time.time() + 3
+    statuses = []
+    while time.time() < deadline:
+        statuses = [m["params"]["status"] for m in _messages(probe, "notifications/tasks")]
+        if "cancelled" in statuses:
+            break
+        time.sleep(0.02)
+    assert "cancelled" in statuses
+
+
+def test_listen_requires_a_notifications_filter():
+    """A malformed listen is a -32602, not a silent subscription."""
+    def body(ctx=None):
+        return "done"
+
+    s = _tasks_server(body=body)
+    response = s._handle_request(
+        {"jsonrpc": "2.0", "id": 9, "method": "subscriptions/listen", "params": {}},
+        session_id="sess-1",
+    )
+    assert response["error"]["code"] == -32602
+
+
+def test_subscriptions_dropped_when_the_session_disconnects():
+    """Subscription state must not outlive the session that opened it."""
+    def body(ctx=None):
+        time.sleep(0.3)
+        return "done"
+
+    s = _tasks_server(body=body)
+    probe = _sse_probe(s, "sess-1")
+    task_id = _rpc(s, "tools/call", {"name": "body", "arguments": {}})["taskId"]
+    s._handle_request(
+        {"jsonrpc": "2.0", "id": "sub-4", "method": "subscriptions/listen",
+         "params": {"notifications": {"taskIds": [task_id]}}},
+        session_id="sess-1",
+    )
+    assert s._subscriptions.get("sess-1")
+
+    s._unregister_client("sess-1", probe)
+    assert "sess-1" not in s._subscriptions
+
+
+# ---------------------------------------------------------------------------
+# Tests - Streamable HTTP sessions are established by initialize, not by SSE
+# ---------------------------------------------------------------------------
+
+
+def _post_raw(path, data, headers=None):
+    """POST arbitrary bytes and return (status, headers, parsed-or-raw body)."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.request("POST", path, body=data,
+                 headers=dict({"Content-Type": "application/json"}, **(headers or {})))
+    resp = conn.getresponse()
+    raw = resp.read().decode("utf-8")
+    conn.close()
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = raw
+    return resp.status, dict(resp.getheaders()), body
+
+
+def test_initialize_post_mints_a_session_id():
+    """A POST-only Streamable HTTP client never opens an SSE stream first.
+
+    The session -- and with it every capability the client negotiated -- must
+    be created on the initialize POST and returned in Mcp-Session-Id.
+    """
+    status, headers, body = _post_raw("/mcp", json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18",
+                   "capabilities": {"elicitation": {},
+                                    "extensions": {"io.modelcontextprotocol/tasks": {}}},
+                   "clientInfo": {"name": "post-only", "version": "1"}}}).encode())
+    assert status == 200, body
+    assert "serverInfo" in body["result"]
+    session_id = headers.get("Mcp-Session-Id")
+    assert session_id, "initialize did not return Mcp-Session-Id"
+    assert "Mcp-Session-Id" in headers.get("Access-Control-Expose-Headers", "")
+
+    # The negotiated capabilities live under that session on the NEXT request.
+    assert server._client_capabilities(session_id).get("elicitation") == {}
+    status, _h, body = _post_raw("/mcp", json.dumps({
+        "jsonrpc": "2.0", "id": 2, "method": "tasks/get",
+        "params": {"taskId": "no-such-task"}}).encode(),
+        headers={"Mcp-Session-Id": session_id})
+    error = body.get("error") or {}
+    assert "required client capability" not in str(error.get("message", "")).lower(), body
+    assert error.get("code") != -32003, body
+
+
+def test_initialize_with_a_supplied_session_keeps_it():
+    """A client that already has a session (from SSE) must not get a new one."""
+    conn_sse, resp_sse, session_id = _open_mcp_session()
+    try:
+        status, headers, body = _post_raw("/mcp", json.dumps({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "sse-first", "version": "1"}}}).encode(),
+            headers={"Mcp-Session-Id": session_id})
+        assert status == 200
+        assert headers.get("Mcp-Session-Id") in (None, session_id)
+    finally:
+        conn_sse.close()
+
+
+def test_non_initialize_post_without_session_mints_nothing():
+    status, headers, body = _post_raw("/mcp", json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}}).encode())
+    assert status == 200
+    assert headers.get("Mcp-Session-Id") is None
+
+
+def test_malformed_json_is_a_jsonrpc_parse_error():
+    """-32700 with a JSON body, never an HTML 400 a proxy will mangle."""
+    status, headers, body = _post_raw("/mcp", b"{")
+    assert isinstance(body, dict), body
+    assert body["error"]["code"] == -32700
+    assert body["id"] is None
+    assert "application/json" in headers.get("Content-Type", "")
+
+
+def test_preflight_allows_and_exposes_the_session_header():
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.request("OPTIONS", "/mcp")
+    resp = conn.getresponse()
+    headers = dict(resp.getheaders())
+    conn.close()
+    assert "Mcp-Session-Id" in headers.get("Access-Control-Allow-Headers", "")
+    assert "Mcp-Session-Id" in headers.get("Access-Control-Expose-Headers", "")
+
+
+# ---------------------------------------------------------------------------
+# Dynamic registration
+# ---------------------------------------------------------------------------
+
+def _dyn_server():
+    """A serving server with one import-time tool and two attached sessions."""
+    from nanohubmcp.server import MCPServer, _SSEQueue
+
+    s = MCPServer("dyn")
+
+    @s.tool(input_schema={"type": "object", "properties": {}, "required": []})
+    def alpha():
+        """First tool, registered at import time."""
+        return 1
+
+    s._serving = True   # what run() sets
+
+    modern, legacy = _SSEQueue(), _SSEQueue()
+    with s._clients_lock:
+        s._clients["M"] = [modern]
+        s._clients["L"] = [legacy]
+    # The legacy session negotiates a handshake-era revision.
+    s._handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2025-11-25",
+                                  "capabilities": {}}}, session_id="L")
+    return s, modern, legacy
+
+
+def _methods(queue):
+    return [json.loads(m).get("method") for m in queue]
+
+
+def test_registering_a_tool_while_serving_notifies_both_client_generations():
+    s, modern, legacy = _dyn_server()
+
+    # A 2026-07-28 client must opt in; an older one cannot and does not.
+    s._handle_request({
+        "jsonrpc": "2.0", "id": "sub-1", "method": "subscriptions/listen",
+        "params": {"notifications": {"toolsListChanged": True}, "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}}},
+    }, session_id="M")
+    ack = [json.loads(m) for m in modern if "acknowledged" in m][-1]
+    assert ack["params"]["notifications"]["toolsListChanged"] is True
+
+    del modern[:]
+    del legacy[:]
+
+    @s.tool(input_schema={"type": "object", "properties": {}, "required": []})
+    def beta():
+        """Second tool, registered while serving."""
+        return 2
+
+    assert "notifications/tools/list_changed" in _methods(modern)
+    assert "notifications/tools/list_changed" in _methods(legacy)
+    # The subscriber's copy is tagged with the subscription it belongs to.
+    tagged = json.loads(modern[0])["params"]["_meta"]
+    assert tagged["io.modelcontextprotocol/subscriptionId"] == "sub-1"
+
+    listed = s._handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                                "params": {}}, session_id="L")["result"]
+    assert [t["name"] for t in listed["tools"]] == ["alpha", "beta"]
+
+    called = s._handle_request({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "beta", "arguments": {}}}, session_id="L")
+    assert "error" not in called
+
+
+def test_remove_tool_notifies_and_makes_it_uncallable():
+    s, modern, legacy = _dyn_server()
+    del legacy[:]
+
+    assert s.remove_tool("alpha") is True
+    assert "notifications/tools/list_changed" in _methods(legacy)
+
+    gone = s._handle_request({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "alpha", "arguments": {}}}, session_id="L")
+    assert "error" in gone
+
+    # Removing something absent is a no-op, not an error.
+    assert s.remove_tool("alpha") is False
+
+
+def test_list_changed_is_advertised_only_once_the_registry_is_dynamic():
+    """A static server must not claim it will send notifications it never sends."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("static")
+
+    @s.tool()
+    def only():
+        """The one tool this server has."""
+        return 1
+
+    assert s._get_capabilities().to_dict()["tools"]["listChanged"] is False
+
+    s._serving = True
+
+    @s.tool()
+    def later():
+        """Registered after start-up, which makes the claim true."""
+        return 2
+
+    assert s._get_capabilities().to_dict()["tools"]["listChanged"] is True
+
+
+def test_unsubscribed_modern_session_gets_no_list_changed():
+    """2026-07-28 forbids sending a notification type the client didn't request."""
+    from nanohubmcp.server import MCPServer, _SSEQueue
+
+    s = MCPServer("quiet")
+    s._serving = True
+    probe = _SSEQueue()
+    with s._clients_lock:
+        s._clients["N"] = [probe]
+    s._handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                       "params": {"protocolVersion": "2026-07-28",
+                                  "capabilities": {}}}, session_id="N")
+    del probe[:]
+
+    @s.tool()
+    def added():
+        """Registered with nobody subscribed."""
+        return 1
+
+    assert _methods(probe) == []
+
+
+def test_registry_survives_concurrent_registration_and_listing():
+    """tools/list must not trip over a registration on another thread."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("race")
+    errors = []
+
+    def register():
+        try:
+            for i in range(60):
+                fn = (lambda n: lambda: n)(i)
+                fn.__name__ = "tool_{}".format(i)
+                fn.__doc__ = "Dynamically registered tool number {}.".format(i)
+                s.tool()(fn)
+                s.remove_tool("tool_{}".format(i // 2))
+        except Exception as exc:
+            errors.append(exc)
+
+    def lister():
+        try:
+            for _ in range(120):
+                s._handle_request({"jsonrpc": "2.0", "id": 1,
+                                   "method": "tools/list", "params": {}})
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=register), threading.Thread(target=lister),
+               threading.Thread(target=lister)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not errors, errors

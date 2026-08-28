@@ -37,6 +37,11 @@ LATEST_UI_PROTOCOL = "2026-01-26"
 # Method an elicitation-using handler triggers (server -> client request).
 ELICITATION_METHOD = "elicitation/create"
 
+# Base protocol revision that made MCP stateless: per-request `_meta` version
+# and capabilities, `server/discover`, `resultType` on every result, cacheable
+# list results, and the renumbered error codes.
+PROTOCOL_2026_07_28 = "2026-07-28"
+
 
 def _strip_js_comments(text):
     """Drop `//` and `/* */` comments so windows see code, not prose.

@@ -46,6 +46,7 @@ from mcp_conformance import (  # noqa: E402
     MCP_APP_MIME,
     APPS_EXTENSION_ID,
     TASKS_EXTENSION_ID,
+    PROTOCOL_2026_07_28,
     check_app_handshake,
 )
 
@@ -71,18 +72,21 @@ class Driver(object):
         self.session_id = None
         self._id = 0
 
-    def _headers(self):
+    def _headers(self, extra=None):
         h = {"Content-Type": "application/json",
              "Accept": "application/json, text/event-stream"}
         if self.token:
             h["Authorization"] = "Bearer " + self.token
         if self.session_id:
             h["Mcp-Session-Id"] = self.session_id
+        if extra:
+            h.update(extra)
         return h
 
-    def _post(self, payload):
+    def _post(self, payload, headers=None):
         data = json.dumps(payload).encode("utf-8")
-        req = _request.Request(self.url, data=data, headers=self._headers(), method="POST")
+        req = _request.Request(self.url, data=data,
+                               headers=self._headers(headers), method="POST")
         try:
             resp = _request.urlopen(req, timeout=self.timeout)
         except _error.HTTPError as exc:
@@ -113,10 +117,11 @@ class Driver(object):
                     continue
         return {}
 
-    def request(self, method, params=None):
+    def request(self, method, params=None, headers=None):
         self._id += 1
         code, _headers, body = self._post({
-            "jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}})
+            "jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}},
+            headers=headers)
         return code, self._parse(body)
 
     def notify(self, method, params=None):
@@ -251,6 +256,54 @@ def run(url, token=None, call_tool=None, tool_args=None, task_tool=None,
             "name": call_tool, "arguments": json.loads(tool_args or "{}")})
         rep.check("error" not in cr, "tools/call {} succeeded".format(call_tool),
                   json.dumps(cr)[:200])
+
+    # ── protocol 2026-07-28 ─────────────────────────────────────────────────
+    # Probed with per-request _meta, which is how that revision declares
+    # itself. A server that only speaks earlier revisions is not failed for
+    # this — it is reported as absent.
+    print("== core: protocol 2026-07-28 ==")
+    modern_meta = {
+        "io.modelcontextprotocol/protocolVersion": PROTOCOL_2026_07_28,
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+    _c, discover = d.request("server/discover", {"_meta": modern_meta})
+    if "error" in discover and discover["error"].get("code") == -32601:
+        rep.info("server/discover absent — server predates 2026-07-28 (skipped)")
+    else:
+        result = discover.get("result", {})
+        rep.check("supportedVersions" in result and "capabilities" in result,
+                  "server/discover returns versions + capabilities",
+                  json.dumps(discover)[:200])
+        rep.check(result.get("resultType") == "complete",
+                  "server/discover carries resultType")
+        rep.check(result.get("ttlMs") is not None and result.get("cacheScope"),
+                  "server/discover is a CacheableResult (ttlMs + cacheScope)")
+        rep.check(PROTOCOL_2026_07_28 in (result.get("supportedVersions") or []),
+                  "2026-07-28 advertised in supportedVersions")
+
+        _c, listed = d.request("tools/list", {"_meta": modern_meta})
+        lr = listed.get("result", {})
+        rep.check(lr.get("resultType") == "complete",
+                  "tools/list carries resultType for a 2026-07-28 client")
+        rep.check(lr.get("ttlMs") is not None and lr.get("cacheScope"),
+                  "tools/list is cacheable for a 2026-07-28 client")
+        names = [t.get("name") for t in lr.get("tools", [])]
+        rep.check(names == sorted(names), "tools/list order is deterministic")
+
+        _c, bad = d.request("tools/list", {"_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+            "io.modelcontextprotocol/clientCapabilities": {}}})
+        err = bad.get("error") or {}
+        rep.check(err.get("code") == -32022 and "supported" in (err.get("data") or {}),
+                  "unknown protocol version -> -32022 with supported list",
+                  json.dumps(bad)[:200])
+
+        _c, mismatch = d.request("tools/list", {"_meta": modern_meta},
+                                 headers={"Mcp-Method": "tools/call"})
+        merr = mismatch.get("error") or {}
+        rep.check(merr.get("code") == -32020,
+                  "contradicting Mcp-Method header -> -32020",
+                  json.dumps(mismatch)[:200])
 
     print("\n{} failed check(s)".format(rep.failures))
     return rep.failures

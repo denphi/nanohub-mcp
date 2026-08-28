@@ -355,25 +355,32 @@ class ServerCapabilities(object):
     """Server capabilities advertised during initialization."""
 
     def __init__(self, tools=False, resources=False, prompts=False, logging=False,
-                 extensions=None):
-        # type: (bool, bool, bool, bool, Optional[Dict[str, Any]]) -> None
+                 extensions=None, list_changed=False):
+        # type: (bool, bool, bool, bool, Optional[Dict[str, Any]], bool) -> None
         self.tools = tools
         self.resources = resources
         self.prompts = prompts
         self.logging = logging
         self.extensions = extensions or {}
+        # True once the server can gain or lose tools/resources/prompts after
+        # start-up, which is what makes a listChanged notification meaningful.
+        self.list_changed = list_changed
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
         caps = {}
+        # Only claim listChanged when the server will actually send one.
+        changed = bool(self.list_changed)
         if self.tools:
-            caps["tools"] = {"listChanged": False}  # Not empty to ensure {} in JSON
+            caps["tools"] = {"listChanged": changed}  # Not empty to ensure {} in JSON
         if self.resources:
-            caps["resources"] = {"listChanged": False, "subscribe": False}
+            caps["resources"] = {"listChanged": changed, "subscribe": False}
         if self.prompts:
-            caps["prompts"] = {"listChanged": False}
+            caps["prompts"] = {"listChanged": changed}
         if self.logging:
-            caps["logging"] = {"listChanged": False}
+            # The logging capability carries no sub-fields: its presence is the
+            # declaration. `listChanged` belongs to tools/resources/prompts.
+            caps["logging"] = {}
         if self.extensions:
             caps["extensions"] = self.extensions
         return caps
@@ -423,3 +430,29 @@ class Image(object):
             data = ""
 
         return ImageContent(data=data, mimeType=self.mime_type)
+
+
+class InputRequired(BaseException):
+    """Raised inside a handler when it needs input from the client.
+
+    Under Multi Round-Trip Requests (2026-07-28), a server no longer pushes
+    `elicitation/create`, `sampling/createMessage`, or `roots/list` down to the
+    client and blocks. It returns an ``InputRequiredResult`` naming what it
+    needs; the client answers by retrying the original request with
+    ``inputResponses``. Handlers never raise this directly — ``ctx.elicit()``
+    and friends raise it when the current request is speaking a revision that
+    uses MRTR.
+
+    Deliberately derived from ``BaseException``, not ``Exception``: it is a
+    control-flow signal, and a handler with a broad ``except Exception`` around
+    its body would otherwise swallow the ask and return a wrong answer instead
+    of asking. ``finally`` blocks still run.
+
+    Args:
+        requests: map of server-assigned key -> JSON-RPC request object.
+    """
+
+    def __init__(self, requests):
+        # type: (Dict[str, Any]) -> None
+        super().__init__("client input required")
+        self.requests = requests or {}

@@ -33,6 +33,7 @@ from .types import (
     Tool,
     Resource,
     Prompt,
+    InputRequired,
     # Primary type names (FastMCP aligned)
     ToolResult,
     ResourceResult,
@@ -61,6 +62,7 @@ __all__ = [
     "Tool",
     "Resource",
     "Prompt",
+    "InputRequired",
     # Primary type names (FastMCP aligned)
     "ToolResult",
     "ResourceResult",
