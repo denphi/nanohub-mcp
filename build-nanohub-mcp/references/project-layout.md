@@ -15,9 +15,11 @@ A nanoHUB MCP tool is a regular nanoHUB tool. Real examples: `padremcp`
 ```
 yourtool/
 ├── bin/
-│   └── yourtool.py          # THE server — defines module-level `server`
+│   ├── yourtool.py          # entrypoint — defines module-level `server`
+│   └── yourtool_mcp/        # the server package once one file stops scaling
 ├── tests/
 │   └── test_offline.py      # tests that need no solver/session (run anywhere)
+│                            # split into unit/ integration/ protocol/ scenarios/ as it grows
 ├── middleware/
 │   └── invoke               # how the hub launches the tool (see below)
 ├── scripts/                 # copied by the scaffold
@@ -40,8 +42,12 @@ Rules of thumb:
   tool session** — either in `bin/` next to the server file (`start_mcp` adds
   that directory to `sys.path`), installed in the conda env named by the
   invoke file, or an installed hub app.
-- Keep the server in ONE file if you can. Deployment, debugging, and the
-  `@tool/bin/...` invoke reference all get simpler.
+- One file is the right shape for a first server, not a target to defend. Split
+  into a `bin/yourtool_mcp/` package as soon as configuration, confinement,
+  state, execution, schemas, handlers, and UI start sharing a file — see
+  [module-layout.md](module-layout.md) for the seams, the `build_server()`
+  pattern, and the package-naming trap. The entrypoint stays `bin/yourtool.py`
+  either way, so the `@tool/bin/...` invoke reference never changes.
 - Offline tests belong in the repo and must not require the solver binary or
   a hub session (test deck generation, schemas, tool registration — see
   `scripts/` in this skill).

@@ -47,6 +47,12 @@ Facts that matter:
   didn't declare the `elicitation` capability (form mode also accepts the
   bare `{}` declaration). Always wrap and provide a conversational fallback —
   many MCP clients still don't implement it.
+- **Fail closed when the prompt is a safety gate.** The fallback above is a
+  degradation for *parameter* questions. When the elicitation is confirming an
+  irreversible or expensive action, `RuntimeError`, `decline`, `cancel`, and
+  timeout all mean do not proceed — see
+  [security.md](security.md) for which actions require a prompt and why the
+  model must not relay consent on them.
 - **Keep the schema flat and small.** Hosts render it as a form; nested
   objects and long enums make bad forms. Provide `default`s — they prefill.
 - **Default timeout is 60 s** (`ctx.elicit(..., timeout=…)`); a user who
@@ -81,8 +87,9 @@ passwords or secrets into tool results — results enter the model context.
 
 | Situation | Use |
 |---|---|
-| destructive/expensive confirmation with options | `ctx.elicit` (form with enum + defaults) |
+| destructive/expensive confirmation | `ctx.elicit` — required, and fail closed ([security.md](security.md)) |
 | a required parameter with a small closed choice set | elicit — beats a wrong guess |
 | open-ended scientific intent ("what sweep range?") | let the model ask in chat — it has context |
 | external browser flow (OAuth to a data source) | `ctx.elicit_url` |
-| clients without the capability | ToolResult telling the model what to ask |
+| clients without the capability, cheap/reversible action | ToolResult telling the model what to ask |
+| clients without the capability, irreversible/expensive action | refuse and say so — the model must not relay consent |

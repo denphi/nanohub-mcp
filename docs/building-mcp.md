@@ -45,6 +45,7 @@ skill/references/state-model
 skill/references/server-guide
 skill/references/tasks
 skill/references/project-layout
+skill/references/module-layout
 skill/references/connecting-clients
 skill/references/troubleshooting
 skill/references/verification

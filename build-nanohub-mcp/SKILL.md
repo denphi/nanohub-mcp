@@ -42,6 +42,13 @@ accept a caller-selected filesystem path. Bound derived work, not just each
 parameter. Invoke solvers with argument arrays, `shell=False`, and a timeout.
 Never return credentials or present external text as model instructions.
 
+Ask the user before any action that is irreversible, expensive, externally
+visible, or broad in scope: `ctx.elicit` reaches a human through a channel the
+model cannot fabricate, which matters precisely because a model can be argued
+into a delete by text in a file it just read. Fail closed — a declined,
+cancelled, timed-out, or unsupported prompt all mean do not proceed
+([references/elicitation.md](references/elicitation.md)).
+
 Read [references/state-model.md](references/state-model.md) before caching.
 Keep globals limited to immutable configuration and synchronized caches. Store
 run state behind handles; key optional conversation state by `ctx.session_id`
@@ -57,7 +64,7 @@ Split simulation workflows into:
 3. `get_*` readers: return bounded, plot-ready arrays, units, warnings, and
    pagination/decimation controls.
 4. `delete_run(run_handle)`: resolve the handle through the same confinement
-   helper and mark the tool destructive.
+   helper, mark the tool destructive, and confirm with the user before acting.
 
 Declare `input_schema` and `output_schema` on every tool. Put types, units,
 descriptions, defaults, enums, and numeric bounds in the input schema; repeat
@@ -67,7 +74,40 @@ Keep zero-argument defaults physically meaningful.
 Use [references/server-guide.md](references/server-guide.md) for tool contracts
 and [references/tasks.md](references/tasks.md) for async execution.
 
-## 3. Test and validate locally
+## 3. Structure the server as a package
+
+One file is the correct shape for a first server and a liability for a mature
+one. Do not let `bin/yourtool.py` accumulate configuration, path confinement,
+run state, process supervision, every schema and handler, HTML/JavaScript, and
+shutdown hooks — at that size security invariants get duplicated and drift,
+import time starts mutating the filesystem, and unfinished paths hide.
+
+Split into a package under `bin/`, keeping the entrypoint trivial:
+
+```text
+bin/
+├── yourtool.py            # `server = build_server()` — under 20 lines
+└── yourtool_mcp/          # MUST NOT be named `yourtool` — the loader collides
+    ├── app.py             # build_server(): registration only, under 200 lines
+    ├── config.py  errors.py  security.py  state.py
+    ├── storage/  execution/
+    ├── tools/             # one module per tool group, schemas colocated
+    └── ui/  resources.py  prompts.py
+```
+
+Each tool module exposes `register(server)`; `app.py` calls them and returns the
+server. Keep `build_server()` free of side effects — no directory creation, job
+recovery, or `atexit` hooks at import — so offline tests and the validator can
+import the app file without a session. Split `tests/` the same way
+(`unit/ integration/ protocol/ scenarios/`) instead of growing one
+`test_offline.py`.
+
+Read [references/module-layout.md](references/module-layout.md) for the seams,
+the ownership rules, the split triggers, and the package-naming trap that makes
+`start_mcp` fail with `'yourtool' is not a package`. The invoke file, the
+`server` contract, and both validators are unaffected by the split.
+
+## 4. Test and validate locally
 
 Install the same dependencies used by the published environment, then run:
 
@@ -93,16 +133,16 @@ that renders blank on strict hosts when wrong), **MCP Tasks**
 [references/mcp-apps.md](references/mcp-apps.md) and
 [references/verification.md](references/verification.md).
 
-## 4. Package and publish
+## 5. Package and publish
 
 Use this repository layout:
 
 ```text
 yourtool/
-├── bin/yourtool.py
+├── bin/yourtool.py          # entrypoint; bin/yourtool_mcp/ once it outgrows one file
 ├── middleware/invoke
 ├── scripts/   validate_server.py, check_conformance.py, mcp_conformance.py, check_ci.py
-├── tests/test_offline.py
+├── tests/test_offline.py    # split into unit/ integration/ protocol/ scenarios/ as it grows
 ├── .github/workflows/ci.yml
 ├── doc/description.html
 └── src/  data/  examples/
@@ -113,7 +153,7 @@ environment-pinned `invoke` command and nanoHUB workflow. Drive the tool through
 Uploaded → Installed → Approved → Published, then ask the hub team to register
 it with `com_mcp`. Terminate stale sessions before validating a new revision.
 
-## 5. Connect real clients
+## 6. Connect real clients
 
 Do not stop at curl. Follow [references/connecting-clients.md](references/connecting-clients.md)
 for Claude Code, Claude, ChatGPT, MCP Inspector, hub chat, and token-authenticated
@@ -135,12 +175,13 @@ Use [references/troubleshooting.md](references/troubleshooting.md) to map common
 symptoms to the failing layer. Use [references/verification.md](references/verification.md)
 for the manual equivalents.
 
-## 6. Add optional protocol features
+## 7. Add optional protocol features
 
 - Use [references/mcp-apps.md](references/mcp-apps.md) for an interactive
   `ui://` application after plain tools work.
 - Use [references/elicitation.md](references/elicitation.md) for capability-
-  gated forms, confirmations, and URL flows.
+  gated forms and URL flows. Confirmations of risky actions are not optional —
+  design them in at step 1.
 - Use [references/quota-and-etiquette.md](references/quota-and-etiquette.md)
   before shipping to constrain context, API calls, disk, and sessions.
 - Use [references/versioning.md](references/versioning.md) before changing a
@@ -160,6 +201,7 @@ for the manual equivalents.
 | [references/server-guide.md](references/server-guide.md) | Design tools, schemas, annotations, resources, prompts, and context use |
 | [references/tasks.md](references/tasks.md) | Choose sync/async behavior and test Tasks |
 | [references/project-layout.md](references/project-layout.md) | Package, invoke, install, and publish the nanoHUB tool |
+| [references/module-layout.md](references/module-layout.md) | Split the server into modules; seams, registration, and test layout |
 | [references/connecting-clients.md](references/connecting-clients.md) | Configure real MCP hosts and compare capabilities |
 | [references/troubleshooting.md](references/troubleshooting.md) | Diagnose symptom → cause → fix |
 | [references/verification.md](references/verification.md) | Run local and deployed checks manually |

@@ -9,6 +9,7 @@ and values previously returned by another tool are untrusted too.
 - Trust boundaries
 - Confine run handles
 - Validate scientific inputs and derived cost
+- Confirm risky actions with the user
 - Invoke processes safely
 - Generate solver inputs safely
 - Return untrusted data safely
@@ -85,6 +86,75 @@ bypass protocol validation.
 Treat a parameter combination that exceeds a ceiling as a normal tool error.
 Do not rely on `async_tool` to make unbounded work safe.
 
+## Confirm risky actions with the user
+
+Validation bounds *what* a call may do. It does not establish that the user
+wanted it done. Ask the user directly, through elicitation, before an action
+that is:
+
+| Risk | Examples |
+|---|---|
+| Irreversible | `delete_run`, overwriting an input deck, clearing a workspace |
+| Expensive | cluster submission, a sweep that consumes hours of quota |
+| Externally visible | publishing a result, sending data off-hub, third-party API calls |
+| Broad in scope | anything operating on many runs at once, or on "all" of something |
+
+The tool asks, not the model. This is the point: a model can be argued into a
+deletion by text inside a file it just read, and it will report that deletion as
+routine. `ctx.elicit` opens a second channel to a human that injected text
+cannot forge or observe.
+
+```python
+@server.tool(name="delete_run", annotations={"destructiveHint": True, ...},
+             input_schema=..., output_schema=...)
+def delete_run(run_handle, ctx=None):
+    path = resolve_run_handle(run_handle)      # authorize first, always
+    try:
+        answer = ctx.elicit(
+            "Permanently delete run {} and its outputs?".format(run_handle),
+            requested_schema={"type": "object",
+                              "properties": {"confirm": {"type": "boolean",
+                                                         "default": False}},
+                              "required": ["confirm"]})
+    except RuntimeError:
+        # No capability, timeout, or dropped stream — refuse.
+        # Do NOT fall through to the delete.
+        return ToolResult(content="The run was NOT deleted: this client could "
+                                  "not show a confirmation prompt.",
+                          is_error=True)
+    if answer.get("action") != "accept" \
+            or not (answer.get("content") or {}).get("confirm"):
+        return {"status": "cancelled_by_user"}
+    shutil.rmtree(path)
+    ...
+```
+
+Rules:
+
+- **Fail closed.** A missing elicitation capability, a decline, a cancel, or a
+  timeout all mean *do not proceed*. Never treat "the client could not ask" as
+  consent. One `except RuntimeError` covers every ask-failed case — missing
+  capability, timeout, dropped stream, and client-reported error all raise it —
+  so there is no excuse for a fall-through delete.
+- **Confirmation is not authorization.** Resolve the handle and check the
+  caller's right to the resource before eliciting, and again before acting. A
+  user clicking accept does not grant access they never had (see *Trust
+  boundaries* above).
+- **Do not relay consent through the model** for irreversible actions. A
+  `*_confirmed` second tool that the model calls after asking in chat is fine
+  for cheap, reversible steps, but the model can be induced to call it without
+  ever asking — so it is not a substitute for a real prompt on a delete.
+- **Confirm the consequence, not the call.** Name what is destroyed or spent
+  ("delete 4 runs, 2.1 GB", "submit a 4-hour job to `long`"), so the dialog is
+  meaningful without the surrounding conversation.
+- **Do not confirm-spam.** Reads and cheap idempotent calls must never elicit;
+  a prompt on every call trains the user to accept without reading.
+- Set `destructiveHint` / `idempotentHint` so hosts add their own confirmation
+  too. Host dialogs and annotations are defense in depth, never the gate.
+
+See [elicitation.md](elicitation.md) for the API, the capability gate, and the
+degrade-gracefully patterns.
+
 ## Invoke processes safely
 
 Pass an argument array and keep the shell disabled:
@@ -153,6 +223,9 @@ Add offline tests for:
 - shell metacharacters, newlines, and deck-control characters in strings;
 - fixed error text that does not reflect the malicious input;
 - timeout, cancellation, concurrent-run, disk-full, and oversized-log paths;
+- every risky tool with elicitation declined, cancelled, timed out, and
+  unsupported — assert in each case that nothing was deleted, submitted, or
+  spent;
 - output schemas that contain no secret-like fields.
 
 Use `scripts/validate_server.py` as a warning system, not proof of safety. A
