@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.1
+
+### Fixed
+
+- `resources/read` now returns the `ttlMs` and `cacheScope` freshness hints
+  that `2026-07-28` requires of every `CacheableResult`. The list methods had
+  carried them since 0.4.0, but reads did not, so a host that validates the
+  response against the published schema rejected every read outright. For an
+  MCP Apps server that rejection is total: the app resource never loads, and
+  the host reports a display failure with no request ever reaching the server.
+- `start_mcp --python-env NAME` now places the launcher's own package root
+  ahead of the selected environment on `PYTHONPATH`. This prevents a generated
+  0.4.x runner from importing an older framework from the scientific
+  environment and exiting before the MCP port opens. Environment-specific
+  packages remain available, while the launcher and child server are
+  guaranteed to use the same `nanohubmcp` version.
+
 ## 0.4.0
 
 Adds protocol revision **`2026-07-28`**, negotiated per request alongside every

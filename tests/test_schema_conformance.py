@@ -109,6 +109,11 @@ def _server():
             "required": ["q"]})
         return {"picked": answer["content"]["q"]}
 
+    @server.resource("ui://schemasrv/app", mime_type="text/html;profile=mcp-app")
+    def app():
+        """An MCP App resource, the shape most sensitive to read conformance."""
+        return "<!DOCTYPE html><html><body>ok</body></html>"
+
     return server
 
 
@@ -121,6 +126,20 @@ def test_list_results_are_cacheable():
     validate(BASE, "ListToolsResult", modern_rpc(server, "tools/list")["result"])
     validate(BASE, "ListResourcesResult", modern_rpc(server, "resources/list")["result"])
     validate(BASE, "ListPromptsResult", modern_rpc(server, "prompts/list")["result"])
+
+
+def test_read_result_is_cacheable():
+    """resources/read is a CacheableResult too — reads were missing the hints.
+
+    ReadResourceResult requires ttlMs and cacheScope just as the list results
+    do. A host that validates the response drops the whole read when they are
+    absent, which silently breaks every MCP App the server serves.
+    """
+    result = modern_rpc(_server(), "resources/read",
+                        {"uri": "ui://schemasrv/app"})["result"]
+    validate(BASE, "ReadResourceResult", result)
+    assert result["ttlMs"] > 0
+    assert result["cacheScope"] in ("public", "private")
 
 
 def test_unsupported_version_error_matches_schema():

@@ -2176,6 +2176,13 @@ class MCPServer(object):
                                 item["mimeType"] = res_mime
                             if res_meta and "_meta" not in item:
                                 item["_meta"] = res_meta
+
+                        # A read is a CacheableResult too, exactly like the
+                        # list methods above. Hosts that validate the result
+                        # schema reject a resources/read with no ttlMs and no
+                        # cacheScope, and for an MCP Apps server that rejection
+                        # means the app resource never loads at all.
+                        result = self._cacheable(result, version)
                     except Exception as e:
                         traceback.print_exc()
                         error = {"code": -32603, "message": str(e)}
