@@ -191,8 +191,9 @@ def _route_header_mode(args):
 
 
 def write_mcp_runner(app_path, host, port, path_prefix="",
-                     require_session_header=False, require_route_headers="auto"):
-    # type: (str, str, int, str) -> str
+                     require_session_header=False, require_route_headers="auto",
+                     prefer_interpreter_packages=False):
+    # type: (str, str, int, str, bool, object, bool) -> str
     """
     Create a temporary Python runner script for the MCP server.
 
@@ -201,27 +202,89 @@ def write_mcp_runner(app_path, host, port, path_prefix="",
         host: Host to bind to
         port: Port to listen on
         path_prefix: URL path prefix for proxy environments
+        prefer_interpreter_packages: Put the selected interpreter's packages
+            ahead of entries inherited through PYTHONPATH.
 
     Returns:
         str: Path to the generated temporary runner script.
     """
     app_dir = os.path.dirname(os.path.abspath(app_path))
+    framework_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     mod = os.path.splitext(os.path.basename(app_path))[0]
 
     runner_code = """\
 import os, sys, importlib.util
 
 app_dir = {app_dir!r}
+framework_root = {framework_root!r}
 app_path = {app_path!r}
 host = {host!r}
 port = {port!r}
 path_prefix = {path_prefix!r}
 require_session_header = {require_session_header!r}
 require_route_headers = {require_route_headers!r}
+prefer_interpreter_packages = {prefer_interpreter_packages!r}
 
-# Add app directory to path
-if app_dir not in sys.path:
-    sys.path.insert(0, app_dir)
+
+def _same_path(left, right):
+    if not left or not right:
+        return left == right
+    return (os.path.normcase(os.path.realpath(left))
+            == os.path.normcase(os.path.realpath(right)))
+
+
+def _remove_path(path):
+    for entry in list(sys.path):
+        if _same_path(entry, path):
+            sys.path.remove(entry)
+
+
+# Import the launcher's own nanohubmcp without exposing anything else that
+# sits beside it.  A pip-installed launcher lives in a shared site-packages,
+# so putting that directory on sys.path would also hand the app the
+# launcher's numpy instead of the one in --python-env.
+def _pin_framework(root):
+    package_dir = os.path.join(root, "nanohubmcp")
+    init_py = os.path.join(package_dir, "__init__.py")
+    if not os.path.isfile(init_py):
+        return False
+    spec = importlib.util.spec_from_file_location(
+        "nanohubmcp", init_py, submodule_search_locations=[package_dir])
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["nanohubmcp"] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        del sys.modules["nanohubmcp"]
+        print("Warning: could not load nanohubmcp from {{}}: {{}}".format(
+            root, exc), flush=True)
+        return False
+    return True
+
+
+# PYTHONPATH entries precede the selected interpreter's site-packages, so an
+# app started with --python-env would otherwise import the launcher's copy of
+# every shared package.  Demote the inherited entries behind site-packages,
+# keeping the app directory first.
+if prefer_interpreter_packages:
+    demoted = []
+    for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if not entry or _same_path(entry, app_dir):
+            continue
+        entry = os.path.abspath(entry)
+        _remove_path(entry)
+        if not any(_same_path(entry, seen) for seen in demoted):
+            demoted.append(entry)
+    sys.path.extend(demoted)
+
+if not _pin_framework(framework_root):
+    # Fall back to the directory: a runner must never import a framework
+    # version other than the launcher's, whatever else that costs.
+    _remove_path(framework_root)
+    sys.path.insert(0, framework_root)
+
+_remove_path(app_dir)
+sys.path.insert(0, app_dir)
 
 # Load the module
 module_name = {mod!r}
@@ -240,10 +303,12 @@ if hasattr(module, "server"):
 else:
     print("Error: No 'server' variable found in app file", flush=True)
     sys.exit(1)
-""".format(app_dir=app_dir, app_path=app_path, host=host, port=port,
+""".format(app_dir=app_dir, framework_root=framework_root,
+           app_path=app_path, host=host, port=port,
            path_prefix=path_prefix, mod=mod,
            require_session_header=require_session_header,
-           require_route_headers=require_route_headers)
+           require_route_headers=require_route_headers,
+           prefer_interpreter_packages=prefer_interpreter_packages)
 
     fd, path = tempfile.mkstemp(prefix="mcp_runner_", suffix=".py")
     with os.fdopen(fd, "w") as f:
@@ -271,8 +336,10 @@ def _runner_environment(app_path):
     framework version must not import another version: their ``server.run``
     contracts and transport behaviour can differ.
 
-    Put this launcher's package root ahead of inherited site paths while
-    retaining the app directory first for its sibling modules.
+    The runner itself pins the framework by file, so this only has to make
+    the launcher reachable: it is the fallback for a layout the runner cannot
+    pin.  ``--python-env`` then demotes these inherited entries behind the
+    selected interpreter's own packages.
     """
     env = os.environ.copy()
     app_dir = os.path.dirname(os.path.abspath(app_path))
@@ -423,7 +490,8 @@ def _start_directly(app_path, args):
         runner = write_mcp_runner(
             app_path, args.host, args.port,
             require_session_header=args.require_session_header,
-            require_route_headers=_route_header_mode(args))
+            require_route_headers=_route_header_mode(args),
+            prefer_interpreter_packages=True)
         env = _runner_environment(app_path)
         proc = Popen([python_executable, runner], env=env)
         try:
@@ -523,7 +591,8 @@ def _start_with_proxy(app_path, args):
     runner = write_mcp_runner(
         app_path, args.host, mcp_port, path_prefix=path_prefix,
         require_session_header=args.require_session_header,
-        require_route_headers=_route_header_mode(args))
+        require_route_headers=_route_header_mode(args),
+        prefer_interpreter_packages=bool(args.python_env))
 
     # Launch MCP server
     print("Starting MCP server", flush=True)

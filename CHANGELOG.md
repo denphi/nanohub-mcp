@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.2
+
+### Fixed
+
+- `start_mcp --python-env NAME` now runs the app against the packages of the
+  environment it names. Two things had to change. Inherited `PYTHONPATH`
+  entries, which the interpreter places ahead of its own site-packages, are
+  demoted behind them, so a NumPy in the launcher's environment no longer
+  shadows the one the app was started for. And the launcher's `nanohubmcp` is
+  pinned by importing that package from its own file rather than by putting
+  its parent directory on `sys.path`: for the documented `pip install
+  nanohub-mcp` that parent is a shared site-packages, and pinning the whole
+  directory — as 0.4.1 did through `PYTHONPATH` — reintroduced the launcher's
+  NumPy at the head of the search path. The app directory stays first, and the
+  framework version the child imports still matches the launcher's.
+
 ## 0.4.1
 
 ### Fixed
