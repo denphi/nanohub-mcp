@@ -12,34 +12,30 @@ import nanohubmcp
 from nanohubmcp import cli
 
 
-def test_runner_environment_pins_launchers_framework(monkeypatch, tmp_path):
+def test_runner_environment_excludes_launcher_package_root(monkeypatch, tmp_path):
+    """The child's PYTHONPATH carries the app and the session, nothing more.
+
+    0.4.1 added the launcher's own package root here to pin the framework
+    version.  For a pip-installed launcher that root is a shared
+    site-packages, so it handed the child every library sitting beside the
+    framework — a NumPy built for the launcher's Python among them.  The
+    runner pins the framework by file instead, so this must stay narrow.
+    """
     app_dir = tmp_path / "app"
     app_dir.mkdir()
     app_path = app_dir / "server.py"
     app_path.write_text("server = None\n")
 
-    old_site = tmp_path / "old-site"
-    old_package = old_site / "nanohubmcp"
-    old_package.mkdir(parents=True)
-    (old_package / "__init__.py").write_text("__version__ = '0.3.3'\n")
-    monkeypatch.setenv("PYTHONPATH", str(old_site))
+    session_site = tmp_path / "session-site"
+    session_site.mkdir()
+    monkeypatch.setenv("PYTHONPATH", str(session_site))
 
     env = cli._runner_environment(str(app_path))
     paths = env["PYTHONPATH"].split(os.pathsep)
     framework_root = os.path.dirname(os.path.dirname(os.path.abspath(cli.__file__)))
 
-    assert paths == [str(app_dir), framework_root, str(old_site)]
-
-    # Model the real failure: the selected scientific Python environment has
-    # an old nanohubmcp installation.  The child must still import the exact
-    # framework that generated its runner.
-    imported = subprocess.check_output(
-        [sys.executable, "-c",
-         "import nanohubmcp; print(nanohubmcp.__version__)"],
-        env=env,
-    ).decode("utf-8").strip()
-    assert imported != "0.3.3"
-    assert imported == nanohubmcp.__version__
+    assert paths == [str(app_dir), str(session_site)]
+    assert framework_root not in paths
 
 
 def test_runner_environment_has_no_empty_path_entry(monkeypatch, tmp_path):
@@ -68,11 +64,17 @@ class RecordingServer(object):
                 "framework_file": nanohubmcp.__file__,
                 "numpy_version": numpy.__version__,
                 "numpy_file": numpy.__file__,
+                "sys_path": sys.path,
             }, result)
 
 
 server = RecordingServer()
 """
+
+
+def _real_paths(paths):
+    """sys.path as the child saw it, comparable across symlinks."""
+    return [os.path.realpath(entry) for entry in paths if entry]
 
 
 def _venv_python(venv_dir):
@@ -166,6 +168,14 @@ def test_python_env_uses_selected_interpreter_and_its_numpy(monkeypatch, tmp_pat
     assert loaded["numpy_version"] == "1.26.4-selected-env"
     assert os.path.commonpath([loaded["numpy_file"], selected_site]) == selected_site
 
+    # The framework arrives by file, so its directory never joins the search
+    # path; the session's own entries still do, behind the chosen environment.
+    child = _real_paths(loaded["sys_path"])
+    assert os.path.realpath(framework_root) not in child
+    assert os.path.realpath(str(launcher_site)) in child
+    assert child.index(os.path.realpath(selected_site)) < child.index(
+        os.path.realpath(str(launcher_site)))
+
 
 def test_python_env_ignores_packages_beside_an_installed_launcher(monkeypatch, tmp_path):
     """A pip-installed launcher shares site-packages with unrelated libraries.
@@ -187,6 +197,7 @@ def test_python_env_ignores_packages_beside_an_installed_launcher(monkeypatch, t
     )
     _write_stub_package(launcher_site, "numpy", "2.2.6-launcher-env")
     monkeypatch.setattr(cli, "__file__", str(installed_framework / "cli.py"))
+    monkeypatch.delenv("PYTHONPATH", raising=False)
 
     loaded, _ = _run_start_mcp(monkeypatch, tmp_path, env_dir, "scientific")
 
@@ -196,3 +207,6 @@ def test_python_env_ignores_packages_beside_an_installed_launcher(monkeypatch, t
     ) == str(installed_framework)
     assert loaded["numpy_version"] == "1.26.4-selected-env"
     assert os.path.commonpath([loaded["numpy_file"], selected_site]) == selected_site
+
+    # The whole point: nothing beside the launcher is reachable at all.
+    assert os.path.realpath(str(launcher_site)) not in _real_paths(loaded["sys_path"])

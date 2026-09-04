@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.4.3
+
+### Fixed
+
+- The child process started by `start_mcp --python-env NAME` no longer receives
+  the launcher's own package root on `PYTHONPATH`. 0.4.1 added it to guarantee
+  that a generated runner and the framework it drives are the same version —
+  a real failure, since 0.4.0 taught the runner to pass `require_route_headers`
+  and an older `MCPServer.run()` rejects that keyword outright, killing the
+  child before the port opens. But for the documented `pip install
+  nanohub-mcp` that root is a shared site-packages, so the fix handed the child
+  every library installed beside the framework, including a NumPy built for the
+  launcher's Python rather than the one `--python-env` selected.
+
+  0.4.2 made the entry redundant: `_pin_framework` imports the launcher's
+  `nanohubmcp` from its own file, which delivers the same version guarantee
+  without exposing a single sibling. Removing it restores the 0.3.x search
+  path — the app directory, the session's own `PYTHONPATH`, and the selected
+  environment's packages.
+
+### Changed
+
+- A package that exists *only* beside an installed launcher is no longer
+  importable from a `--python-env` child. It now raises `ModuleNotFoundError`
+  naming the package, instead of being satisfied by a copy built for the
+  launcher's interpreter and failing further into the import in a way that
+  does not name the real problem. Packages on the session's `PYTHONPATH` are
+  unaffected.
+
 ## 0.4.2
 
 ### Fixed
