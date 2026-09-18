@@ -10,6 +10,14 @@ bugs introduced with it in 0.4.0, and adds the SEP-2640 Skills Extension.
 - **`Mcp-Name` ignored `params.uri`.** The header's source is `params.name` for
   `tools/call` and `prompts/get` but `params.uri` for `resources/read`, so
   resource reads were never validated against their header.
+- **`Mcp-Name` was ignored entirely on `skills/get` and
+  `resources/directory/read`.** Both name one thing in `params.uri`, so a
+  gateway that routes or authorizes on the header could be shown one skill and
+  the server handed a body naming another. The header is now checked against
+  the body for these two, but — unlike `resources/read` — never *required*:
+  the skills extension postdates the revision that defined these headers and
+  no revision asks for one here, so demanding it would reject a conforming
+  client.
 - **Base64 sentinel values were rejected as mismatches.** A client MUST wrap any
   value that is not plain visible ASCII as `=?base64?…?=`, and a server MUST
   decode before comparing. Resource URIs are the common case.

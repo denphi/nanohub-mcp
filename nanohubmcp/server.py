@@ -455,6 +455,20 @@ class MCPServer(object):
         "resources/read": "uri",
     }
 
+    # Methods that also name one thing in `params.uri`, but for which no
+    # revision requires the header: the skills extension postdates the
+    # transport revision that defined these headers, and neither it nor the
+    # base spec asks for one here. Demanding it would reject a conforming
+    # client, so absence is fine — but a header that *is* sent is still
+    # checked against the body. A gateway that routes or authorizes on
+    # Mcp-Name is the reason the header exists, and letting a request through
+    # whose body names a different skill than its header would make that
+    # gateway a confused deputy.
+    _MCP_NAME_OPTIONAL_SOURCES = {
+        "skills/get": "uri",
+        "resources/directory/read": "uri",
+    }
+
     # A header value the client could not render as plain ASCII arrives
     # wrapped in this sentinel; servers MUST decode before comparing.
     _B64_PREFIX = "=?base64?"
@@ -550,6 +564,11 @@ class MCPServer(object):
         method = request.get("method")
         params = request.get("params") if isinstance(request.get("params"), dict) else {}
         name_field = self._MCP_NAME_SOURCES.get(method)
+        # Required only for the methods a revision actually demands it of;
+        # the rest are validated when sent and never missed when absent.
+        name_header_required = name_field is not None
+        if name_field is None:
+            name_field = self._MCP_NAME_OPTIONAL_SOURCES.get(method)
         body_name = params.get(name_field) if name_field else None
 
         required = self._route_headers_required(version or DEFAULT_NEGOTIATED_VERSION)
@@ -581,7 +600,7 @@ class MCPServer(object):
         # ── Mcp-Name: params.name for tools/prompts, params.uri for resources ─
         declared_name = header("Mcp-Name")
         if declared_name is None:
-            if required and body_name is not None:
+            if required and name_header_required and body_name is not None:
                 return bad("Missing required Mcp-Name header")
         elif body_name is not None:
             decoded = self._decode_header_value(declared_name)

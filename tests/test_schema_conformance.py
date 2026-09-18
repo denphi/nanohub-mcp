@@ -1048,6 +1048,52 @@ def test_mcp_name_reads_params_uri_for_resources_read():
     assert read(dict(good, **{"Mcp-Name": "file:///other"}))["error"]["code"] == -32020
 
 
+def test_mcp_name_is_checked_but_not_required_for_the_skills_methods(tmp_path):
+    """skills/get and resources/directory/read also name one thing in
+    params.uri, but no revision requires Mcp-Name for them — the skills
+    extension postdates the transport revision that defined the header.
+
+    So absence must be accepted, or a conforming client is rejected; and a
+    header that *is* sent must still be checked, or a gateway routing on
+    Mcp-Name can be handed a body naming a different skill than its header.
+    """
+    skill_dir = tmp_path / "private"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: private\ndescription: secret stuff\n---\nbody\n")
+
+    server = MCPServer("hdr")
+
+    @server.skill("private")
+    def _skill():
+        return str(skill_dir)
+
+    def call(method, uri, headers):
+        return server._handle_request({
+            "jsonrpc": "2.0", "id": 1, "method": method,
+            "params": {"uri": uri, "_meta": dict(MODERN_META)}}, headers=headers)
+
+    for method, uri in (("skills/get", "skill://private/SKILL.md"),
+                        ("resources/directory/read", "skill://private")):
+        base = {"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": method}
+
+        # Absent: fine, even though 2026-07-28 requires routing headers.
+        assert "result" in call(method, uri, base), method
+        # Present and agreeing: fine.
+        assert "result" in call(method, uri, dict(base, **{"Mcp-Name": uri})), method
+        # Present and contradicting: rejected, as it is for resources/read.
+        clash = dict(base, **{"Mcp-Name": "skill://somewhere-else/SKILL.md"})
+        assert call(method, uri, clash)["error"]["code"] == -32020, method
+
+    # The methods a revision *does* require it of are unaffected.
+    missing = server._handle_request({
+        "jsonrpc": "2.0", "id": 1, "method": "resources/read",
+        "params": {"uri": "skill://private/SKILL.md", "_meta": dict(MODERN_META)}},
+        headers={"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "resources/read"})
+    assert missing["error"]["code"] == -32020
+    assert "Missing required Mcp-Name" in missing["error"]["message"]
+
+
 def test_protocol_version_header_must_match_the_body():
     server = _server()
     response = server._handle_request({
