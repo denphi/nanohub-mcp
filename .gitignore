@@ -9,8 +9,14 @@ dist/
 *.egg-info/
 *.egg
 .eggs/
+.claude/
 sdist/
 wheels/
+lectures/
+promo/
+com_mcp
+com_authorize
+
 
 # Installer logs
 pip-log.txt
@@ -36,6 +42,8 @@ env/
 .nox/
 .pytest_cache/
 htmlcov/
+implementations/
+
 .coverage
 .coverage.*
 coverage.xml
