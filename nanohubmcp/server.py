@@ -99,6 +99,55 @@ MRTR_STATE_TTL_SECONDS = 10 * 60
 MAX_SUBSCRIPTIONS_PER_SESSION = 64
 
 
+class _Sentinel(object):
+    """A distinguishable stand-in for 'this is not a result'."""
+
+    def __init__(self, name):
+        # type: (str) -> None
+        self.name = name
+
+    def __repr__(self):
+        # type: () -> str
+        return self.name
+
+
+# Returned by a handler that answers nothing at all: a notification, or the
+# long-lived listen stream whose response is sent on teardown instead.
+_NO_RESPONSE = _Sentinel("_NO_RESPONSE")
+# Returned by a handler that has already built the whole JSON-RPC envelope and
+# must not have the usual result/error finalization applied on top of it.
+_RAW_RESPONSE = _Sentinel("_RAW_RESPONSE")
+
+
+class _RequestContext(object):
+    """Everything one JSON-RPC request resolved to before dispatch.
+
+    These were locals of `_handle_request` while every method was handled in
+    a single 664-line if/elif chain. They are passed to the per-method
+    handlers unchanged, so each handler reads the same values the chain did.
+    """
+
+    __slots__ = ("request", "method", "msg_id", "params", "session_id",
+                 "headers", "version", "modern", "is_notification", "meta",
+                 "progress_token")
+
+    def __init__(self, request=None, method="", msg_id=None, params=None,
+                 session_id=None, headers=None, version="", modern=False,
+                 is_notification=False, meta=None, progress_token=None):
+        # type: (...) -> None
+        self.request = request
+        self.method = method
+        self.msg_id = msg_id
+        self.params = params if params is not None else {}
+        self.session_id = session_id
+        self.headers = headers
+        self.version = version
+        self.modern = modern
+        self.is_notification = is_notification
+        self.meta = meta
+        self.progress_token = progress_token
+
+
 class InvalidParams(Exception):
     """A request the caller got wrong, reported as JSON-RPC -32602.
 
@@ -2673,580 +2722,33 @@ class MCPServer(object):
                 return None
             return {"jsonrpc": "2.0", "id": msg_id, "error": mismatch}
 
+
+        ctx = _RequestContext(
+            request=request, method=method, msg_id=msg_id, params=params,
+            session_id=session_id, headers=headers, version=version,
+            modern=modern, is_notification=is_notification, meta=meta,
+            progress_token=progress_token)
+
         result = None
         error = None
 
         try:
-            if method == "initialize":
-                self._set_session_capabilities(session_id, params.get("capabilities", {}))
-                negotiated = self._negotiate_protocol_version(
-                    params.get("protocolVersion")
-                )
-                self._set_session_protocol_version(session_id, negotiated)
-                result = {
-                    "protocolVersion": negotiated,
-                    "serverInfo": ServerInfo(self.name, self.version).to_dict(),
-                    "capabilities": self._get_capabilities().to_dict()
-                }
-
-            elif method == "initialized":
-                # Notification, no response needed
-                return None
-
-            elif method == "notifications/cancelled":
-                # A client withdrawing an in-flight request. Map it onto the
-                # work it actually started: a running task, or a listen stream.
-                self._handle_cancelled(params, session_id)
-                return None
-
-            elif method == "server/discover":
-                # Mandatory in 2026-07-28: one call returns identity, versions,
-                # and capabilities, replacing what initialize used to carry.
-                result = self._cacheable({
-                    "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
-                    "capabilities": self._get_capabilities().to_dict(),
-                }, PROTOCOL_2026_07_28)
-                if self.instructions:
-                    result["instructions"] = self.instructions
-                # Answer in the new shape regardless of the caller's declared
-                # version — the method only exists in 2026-07-28.
-                result = self._finalize_result(result, PROTOCOL_2026_07_28)
-
-            elif method == "ping":
-                if modern:
-                    error = {"code": -32601,
-                             "message": "Method not found: ping (removed in {})".format(version)}
-                else:
-                    result = {}
-
-            elif method == "subscriptions/listen":
-                if msg_id is None:
-                    error = {"code": -32600,
-                             "message": "subscriptions/listen must be a request"}
-                elif not session_id:
-                    error = {"code": -32003,
-                             "message": "subscriptions/listen requires an MCP session"}
-                else:
-                    requested = params.get("notifications")
-                    task_ids = requested.get("taskIds") if isinstance(requested, dict) else None
-                    if not isinstance(requested, dict):
-                        error = {"code": -32602,
-                                 "message": "subscriptions/listen requires a notifications filter"}
-                    elif task_ids is not None and (
-                        not isinstance(task_ids, list)
-                        or not all(isinstance(t, str) and t for t in task_ids)
-                    ):
-                        error = {"code": -32602,
-                                 "message": "notifications.taskIds must be an array of task ids"}
-                    else:
-                        # Acknowledge only tasks that exist and belong to this
-                        # session — the ack reports what the server agreed to.
-                        accepted = []
-                        with self._jobs_lock:
-                            for task_id in (task_ids or []):
-                                job = self._jobs.get(task_id)
-                                if job is None:
-                                    continue
-                                if self._task_access_error(task_id, job, session_id) is None:
-                                    accepted.append(task_id)
-
-                        # The base filters are opt-in flags; remember which
-                        # the client asked for so list_changed can honour them.
-                        filters = {
-                            key: bool(requested.get(key))
-                            for key in ("toolsListChanged", "promptsListChanged",
-                                        "resourcesListChanged")
-                            if requested.get(key)
-                        }
-                        # Per-URI subscriptions: acknowledge only URIs that
-                        # exist, so the ack states what will actually be watched.
-                        wanted_uris = requested.get("resourceSubscriptions")
-                        resource_uris = []
-                        if isinstance(wanted_uris, list):
-                            with self._registry_lock:
-                                known = set(self._resources)
-                            resource_uris = [
-                                u for u in wanted_uris
-                                if isinstance(u, str) and u in known
-                            ]
-                        with self._subs_lock:
-                            session_subs = self._subscriptions.setdefault(session_id, {})
-                            if (msg_id not in session_subs
-                                    and len(session_subs) >= MAX_SUBSCRIPTIONS_PER_SESSION):
-                                error = {
-                                    "code": -32602,
-                                    "message": "Too many open subscriptions for this "
-                                               "session (max {})".format(
-                                                   MAX_SUBSCRIPTIONS_PER_SESSION),
-                                }
-                                session_subs = None
-                            else:
-                                session_subs[msg_id] = {"task_ids": set(accepted),
-                                                    "filters": filters,
-                                                    "resource_uris": set(resource_uris)}
-                        if session_subs is None:
-                            # Over the cap: fall through to the error response.
-                            return {"jsonrpc": "2.0", "id": msg_id, "error": error}
-
-                        # MUST be the first message carrying this subscription
-                        # id, and MUST precede any notification on the stream.
-                        self._broadcast({
-                            "jsonrpc": "2.0",
-                            "method": "notifications/subscriptions/acknowledged",
-                            "params": {
-                                "notifications": dict(
-                                    filters, taskIds=accepted,
-                                    resourceSubscriptions=resource_uris),
-                                "_meta": {MCP_SUBSCRIPTION_ID_KEY: msg_id},
-                            },
-                        }, session_id=session_id)
-
-                        # The listen stream is long-lived: its response is sent
-                        # only on graceful teardown, so return nothing now.
-                        return None
-
-            elif method == "tasks/get":
-                task_id = params.get("taskId")
-                if not isinstance(task_id, str) or not task_id:
-                    error = {"code": -32602, "message": "tasks/get requires taskId"}
-                elif not self._client_supports_tasks(session_id=session_id, params=params):
-                    error = {
-                        "code": -32003,
-                        "message": "Missing required client capability",
-                        "data": {
-                            "requiredCapabilities": {
-                                "extensions": {MCP_TASKS_EXTENSION_ID: {}}
-                            }
-                        },
-                    }
-                else:
-                    with self._jobs_lock:
-                        job = self._jobs.get(task_id)
-                        access_error = self._task_access_error(task_id, job, session_id)
-                        task = (
-                            self._job_to_task(task_id, job)
-                            if access_error is None
-                            else None
-                        )
-                    if access_error is not None:
-                        error = access_error
-                    else:
-                        task["resultType"] = "complete"
-                        result = task
-
-            elif method == "tasks/update":
-                task_id = params.get("taskId")
-                if not isinstance(task_id, str) or not task_id:
-                    error = {"code": -32602, "message": "tasks/update requires taskId"}
-                elif not self._client_supports_tasks(session_id=session_id, params=params):
-                    error = {
-                        "code": -32003,
-                        "message": "Missing required client capability",
-                        "data": {
-                            "requiredCapabilities": {
-                                "extensions": {MCP_TASKS_EXTENSION_ID: {}}
-                            }
-                        },
-                    }
-                else:
-                    with self._jobs_lock:
-                        job = self._jobs.get(task_id)
-                        access_error = self._task_access_error(task_id, job, session_id)
-                    if access_error is not None:
-                        error = access_error
-                    else:
-                        responses = params.get("inputResponses")
-                        if not isinstance(responses, dict) or not responses:
-                            error = {
-                                "code": -32602,
-                                "message": "tasks/update requires inputResponses",
-                            }
-                        else:
-                            error = self._task_deliver_input(task_id, responses)
-                            if error is None:
-                                result = {"resultType": "complete"}
-
-            elif method == "tasks/cancel":
-                task_id = params.get("taskId")
-                if not isinstance(task_id, str) or not task_id:
-                    error = {"code": -32602, "message": "tasks/cancel requires taskId"}
-                elif not self._client_supports_tasks(session_id=session_id, params=params):
-                    error = {
-                        "code": -32003,
-                        "message": "Missing required client capability",
-                        "data": {
-                            "requiredCapabilities": {
-                                "extensions": {MCP_TASKS_EXTENSION_ID: {}}
-                            }
-                        },
-                    }
-                else:
-                    callbacks = []
-                    with self._jobs_lock:
-                        job = self._jobs.get(task_id)
-                        access_error = self._task_access_error(task_id, job, session_id)
-                        if access_error is None and job.get("status") in (
-                                "running", "input_required"):
-                            job["status"] = "cancelled"
-                            job["lastUpdatedAt"] = self._utc_now()
-                            event = job.get("cancel_event")
-                            if event is not None:
-                                event.set()
-                            waiting = job.get("input_event")
-                            if waiting is not None:
-                                waiting.set()
-                            callbacks = list(job.get("cancel_callbacks") or [])
-                    if access_error is not None:
-                        error = access_error
-                    else:
-                        # Outside the lock: callbacks kill process groups and
-                        # must not block every other job's bookkeeping.
-                        self._fire_cancel_callbacks(task_id, callbacks)
-                        if callbacks or job is not None:
-                            self._notify_task_status(task_id)
-                        result = {"resultType": "complete"}
-
-            elif method == "tools/list":
-                # Deterministic order: 2026-07-28 asks for it so clients can
-                # cache and so LLM prompt-cache hit rates stay high.
-                with self._registry_lock:
-                    tool_dicts = [
-                        self._tools[name]["definition"].to_dict()
-                        for name in sorted(self._tools)
-                    ]
-                result = self._cacheable(
-                    self._paginate(tool_dicts, params, "tools", {}, "name"), version)
-
-            elif method == "tools/call":
-                tool_name = params.get("name")
-                arguments = params.get("arguments", {})
-
-                if not isinstance(arguments, dict):
-                    error = {"code": -32602,
-                             "message": "tools/call arguments must be a JSON object"}
-                elif tool_name not in self._tools:
-                    error = {"code": -32601, "message": "Tool not found: {}".format(tool_name)}
-                else:
-                    tool_entry = self._tools[tool_name]
-                    handler = tool_entry["handler"]
-
-                    if tool_entry.get("is_async"):
-                        # Return a task to clients that opted into the MCP
-                        # Tasks extension; older clients keep the existing
-                        # get_job_result polling-tool flow.
-                        supports_tasks = self._client_supports_tasks(
-                            session_id=session_id, params=params
-                        )
-                        if supports_tasks and not session_id and not modern:
-                            error = {
-                                "code": -32003,
-                                "message": "Task-capable async tool calls require an MCP session",
-                            }
-                        else:
-                            job_id = self._start_async_tool_job(
-                                handler, msg_id, arguments,
-                                session_id=session_id,
-                                progress_token=progress_token,
-                                meta=meta,
-                                prepare=tool_entry.get("prepare"),
-                                protocol_version=version,
-                            )
-                        if supports_tasks and not error:
-                            with self._jobs_lock:
-                                job = self._jobs[job_id]
-                                result = self._job_to_task(
-                                    job_id, job, include_terminal_payload=False
-                                )
-                            result["resultType"] = "task"
-                        elif not error:
-                            legacy_body = {
-                                "status": "running",
-                                "job_id": job_id,
-                                "message": "Job started. Poll with get_job_result(job_id=\"{}\")".format(job_id)
-                            }
-                            with self._jobs_lock:
-                                started = self._jobs.get(job_id) or {}
-                                task_meta = dict(started.get("task_meta") or {})
-                            if task_meta:
-                                # Legacy clients never read `_meta`; give them
-                                # the same handles in the body they do read.
-                                legacy_body["meta"] = task_meta
-                            result = {
-                                "content": [{"type": "text", "text": json.dumps(legacy_body)}],
-                                "isError": False
-                            }
-                    else:
-                        # MRTR: fold in answers the client already gave, from
-                        # this retry and from earlier rounds of the same request.
-                        request_state = params.get("requestState")
-                        if not isinstance(request_state, str):
-                            request_state = None
-                        collected = self._mrtr_load(request_state, session_id)
-                        supplied = params.get("inputResponses")
-                        if isinstance(supplied, dict):
-                            collected.update(supplied)
-                        try:
-                            call_result = self._call_handler(
-                                handler, msg_id, arguments,
-                                session_id=session_id,
-                                progress_token=progress_token,
-                                meta=meta,
-                                protocol_version=version,
-                                input_responses=collected,
-                                request_state=request_state,
-                            )
-                            self._mrtr_discard(request_state)
-
-                            # Wrap result in proper format
-                            if isinstance(call_result, ToolResult):
-                                result = call_result.to_dict()
-                            elif isinstance(call_result, dict):
-                                # structuredContent (MCP spec): required when the
-                                # tool declares outputSchema, and lets mcp-apps
-                                # widgets consume data without re-parsing text.
-                                result = {
-                                    "content": [{"type": "text", "text": json.dumps(call_result)}],
-                                    "structuredContent": call_result,
-                                    "isError": False
-                                }
-                            else:
-                                result = {
-                                    "content": [{"type": "text", "text": str(call_result)}],
-                                    "isError": False
-                                }
-                        except InputRequired as needed:
-                            # Not an error: the handler is telling the client
-                            # what it needs. The client answers by retrying this
-                            # same call with inputResponses + requestState.
-                            result = {
-                                "resultType": "input_required",
-                                "inputRequests": needed.requests,
-                                "requestState": self._mrtr_save(
-                                    request_state, collected, session_id
-                                ),
-                            }
-                        except Exception as e:
-                            self._mrtr_discard(request_state)
-                            traceback.print_exc()
-                            result = {
-                                "content": [{"type": "text", "text": str(e)}],
-                                "isError": True
-                            }
-
-            elif method == "resources/list":
-                resources = []
-                with self._registry_lock:
-                    # Sorted for the same reasons tools/list is: a stable order
-                    # lets clients cache, and offset paging can only be walked
-                    # safely when the order does not shuffle between pages.
-                    entries = [self._resources[uri] for uri in sorted(self._resources)]
-                for r in entries:
-                    resource_dict = r["definition"].to_dict()
-                    resources.append(resource_dict)
-                result = self._cacheable(
-                    self._paginate(resources, params, "resources", {}, "uri"),
-                    version)
-
-            elif method == "resources/templates/list":
-                # No URI-template resources are registered by this framework;
-                # answering with an empty list beats a "method not found" for
-                # a client that walks every resources/* endpoint.
-                result = self._cacheable({"resourceTemplates": []}, version)
-
-            elif method == "resources/read":
-                uri = params.get("uri")
-
-                # Validated before use: a non-string uri reached a dict lookup
-                # and raised TypeError, which surfaced as an internal error
-                # with a traceback — blaming the server for the caller's
-                # malformed request, and logging a stack trace per bad request.
-                if not isinstance(uri, str) or not uri:
-                    error = {"code": -32602,
-                             "message": "resources/read requires a string uri"}
-                else:
-                    # Strip proxy prefix from URI for lookup
-                    lookup_uri = self._strip_proxy_prefix(uri)
-
-                    if lookup_uri in self._skill_resources:
-                        # SEP-2640 skill file. No handler to call: the bytes
-                        # come straight off disk, read fresh on every call
-                        # (never cached ahead of need, per the SEP).
-                        skill_entry = self._skill_resources[lookup_uri]
-                        try:
-                            data = skill_entry["path"].read_bytes()
-                            content_item = {
-                                "uri": uri,
-                                "mimeType": skill_entry["mimeType"],
-                            }
-                            try:
-                                content_item["text"] = data.decode("utf-8")
-                            except UnicodeDecodeError:
-                                content_item["blob"] = base64.b64encode(
-                                    data).decode("ascii")
-                            result = self._cacheable(
-                                {"contents": [content_item]}, version)
-                        except Exception as e:
-                            traceback.print_exc()
-                            error = {"code": -32603, "message": str(e)}
-                    elif lookup_uri not in self._resources:
-                        # 2026-07-28 aligns resource-not-found with JSON-RPC's
-                        # Invalid Params; older clients keep the code they know.
-                        error = {
-                            "code": -32602 if modern else -32601,
-                            "message": "Resource not found: {}".format(uri),
-                        }
-                    else:
-                        entry = self._resources[lookup_uri]
-                        handler = entry["handler"]
-                        definition = entry["definition"]
-                        res_mime = getattr(definition, "mimeType", None)
-                        res_meta = getattr(definition, "meta", None) or {}
-                        try:
-                            content = self._call_handler(
-                                handler, msg_id,
-                                session_id=session_id,
-                                progress_token=progress_token,
-                                meta=meta,
-                            )
-
-                            if isinstance(content, ResourceResult):
-                                result = content.to_dict()
-                            elif isinstance(content, dict):
-                                result = {
-                                    "contents": [{
-                                        "uri": uri,
-                                        "text": json.dumps(content)
-                                    }]
-                                }
-                            else:
-                                result = {
-                                    "contents": [{
-                                        "uri": uri,
-                                        "text": str(content)
-                                    }]
-                                }
-
-                            # Decorate each content entry with the registered
-                            # mimeType and `_meta` (mcp-apps CSP, permissions,
-                            # etc.). Don't override values the handler already
-                            # supplied via ResourceContent.
-                            for item in result.get("contents", []):
-                                if not isinstance(item, dict):
-                                    continue
-                                if res_mime and "mimeType" not in item:
-                                    item["mimeType"] = res_mime
-                                if res_meta and "_meta" not in item:
-                                    item["_meta"] = res_meta
-
-                            # A read is a CacheableResult too, exactly like the
-                            # list methods above. Hosts that validate the result
-                            # schema reject a resources/read with no ttlMs and no
-                            # cacheScope, and for an MCP Apps server that rejection
-                            # means the app resource never loads at all.
-                            result = self._cacheable(result, version)
-                        except Exception as e:
-                            traceback.print_exc()
-                            error = {"code": -32603, "message": str(e)}
-
-            elif method == "prompts/list":
-                with self._registry_lock:
-                    prompt_dicts = [self._prompts[name]["definition"].to_dict()
-                                    for name in sorted(self._prompts)]
-                result = self._cacheable(
-                    self._paginate(prompt_dicts, params, "prompts", {}, "name"),
-                    version)
-
-            elif method == "prompts/get":
-                prompt_name = params.get("name")
-                arguments = params.get("arguments", {})
-
-                if not isinstance(prompt_name, str) or not prompt_name:
-                    error = {"code": -32602,
-                             "message": "prompts/get requires a string name"}
-                elif not isinstance(arguments, dict):
-                    error = {"code": -32602,
-                             "message": "prompts/get arguments must be a JSON object"}
-                elif prompt_name not in self._prompts:
-                    error = {"code": -32601, "message": "Prompt not found: {}".format(prompt_name)}
-                else:
-                    handler = self._prompts[prompt_name]["handler"]
-                    try:
-                        prompt_result = self._call_handler(
-                            handler, msg_id, arguments,
-                            session_id=session_id,
-                            progress_token=progress_token,
-                            meta=meta,
-                        )
-
-                        if isinstance(prompt_result, PromptResult):
-                            result = prompt_result.to_dict()
-                        elif isinstance(prompt_result, list):
-                            # Assume list of message dicts
-                            result = {"messages": prompt_result}
-                        else:
-                            result = {"messages": [{"role": "user", "content": {"type": "text", "text": str(prompt_result)}}]}
-                    except Exception as e:
-                        traceback.print_exc()
-                        error = {"code": -32603, "message": str(e)}
-
-            elif method == "skills/list":
-                # SEP-2640. Every entry is already a complete manifest
-                # (frontmatter verbatim, every file's digest and size), so
-                # there is nothing to compute here beyond sorting and paging.
-                with self._registry_lock:
-                    skill_dicts = [self._skills[uri]["definition"].to_dict()
-                                   for uri in sorted(self._skills)]
-                result = self._cacheable(
-                    self._paginate(skill_dicts, params, "skills", {}, "uri"),
-                    version)
-
-            elif method == "skills/get":
-                skill_uri = params.get("uri")
-                if not isinstance(skill_uri, str) or not skill_uri:
-                    error = {"code": -32602,
-                             "message": "skills/get requires a string uri"}
-                else:
-                    with self._registry_lock:
-                        entry = self._skills.get(skill_uri)
-                    if entry is None:
-                        # Same code resources/read uses for an unknown URI,
-                        # per SEP-2640.
-                        error = {"code": -32602,
-                                 "message": "Skill not found: {}".format(skill_uri)}
-                    else:
-                        result = self._cacheable(
-                            {"skill": entry["definition"].to_dict()}, version)
-
-            elif method == "resources/directory/read":
-                dir_uri = params.get("uri")
-                if not isinstance(dir_uri, str) or not dir_uri:
-                    error = {"code": -32602,
-                             "message": "resources/directory/read requires a string uri"}
-                else:
-                    with self._registry_lock:
-                        children = self._skill_directories.get(dir_uri)
-                        children = list(children) if children is not None else None
-                    if children is None:
-                        error = {"code": -32602,
-                                 "message": "Not a directory resource: {}".format(dir_uri)}
-                    else:
-                        result = self._cacheable(
-                            self._paginate(children, params, "resources", {}, "uri"),
-                            version)
-
-            elif method == "logging/setLevel":
-                if modern:
-                    # Removed: log level is per-request via _meta instead.
-                    error = {"code": -32601,
-                             "message": "Method not found: logging/setLevel "
-                                        "(removed in {}; use _meta {})".format(
-                                            version, META_LOG_LEVEL)}
-                else:
-                    result = {}
-
-            else:
+            handler_name = self._RPC_METHODS.get(method)
+            if handler_name is None:
                 error = {"code": -32601, "message": "Method not found: {}".format(method)}
-
+            else:
+                # Normally (result, error). The two sentinels claim the first
+                # slot, and then the second carries whatever they need: nothing
+                # for a notification, and a complete envelope for a handler
+                # that built its own.
+                outcome, payload = getattr(self, handler_name)(ctx)
+                if outcome is _NO_RESPONSE:
+                    return None
+                if outcome is _RAW_RESPONSE:
+                    # Already a whole JSON-RPC envelope; the postamble below
+                    # would finalize a finalized response a second time.
+                    return payload
+                result, error = outcome, payload
         except InvalidParams as e:
             # The caller's input was wrong — not the server failing.
             error = {"code": -32602, "message": str(e)}
@@ -3266,6 +2768,717 @@ class MCPServer(object):
             response["result"] = self._finalize_result(result, version)
 
         return response
+
+    # JSON-RPC method -> the name of the method on this class that
+    # handles it. Attribute names, not functions, so the table can sit
+    # above the handlers it points at.
+    _RPC_METHODS = {
+        "initialize": "_rpc_initialize",
+        "initialized": "_rpc_initialized",
+        "notifications/cancelled": "_rpc_notifications_cancelled",
+        "server/discover": "_rpc_server_discover",
+        "ping": "_rpc_ping",
+        "subscriptions/listen": "_rpc_subscriptions_listen",
+        "tasks/get": "_rpc_tasks_get",
+        "tasks/update": "_rpc_tasks_update",
+        "tasks/cancel": "_rpc_tasks_cancel",
+        "tools/list": "_rpc_tools_list",
+        "tools/call": "_rpc_tools_call",
+        "resources/list": "_rpc_resources_list",
+        "resources/templates/list": "_rpc_resources_templates_list",
+        "resources/read": "_rpc_resources_read",
+        "prompts/list": "_rpc_prompts_list",
+        "prompts/get": "_rpc_prompts_get",
+        "skills/list": "_rpc_skills_list",
+        "skills/get": "_rpc_skills_get",
+        "resources/directory/read": "_rpc_resources_directory_read",
+        "logging/setLevel": "_rpc_logging_setlevel",
+    }
+
+    def _rpc_initialize(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `initialize` method."""
+        params, session_id = ctx.params, ctx.session_id
+        result = None
+
+        self._set_session_capabilities(session_id, params.get("capabilities", {}))
+        negotiated = self._negotiate_protocol_version(
+            params.get("protocolVersion")
+        )
+        self._set_session_protocol_version(session_id, negotiated)
+        result = {
+            "protocolVersion": negotiated,
+            "serverInfo": ServerInfo(self.name, self.version).to_dict(),
+            "capabilities": self._get_capabilities().to_dict()
+        }
+        return result, None
+
+    def _rpc_initialized(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `initialized` method."""
+        return _NO_RESPONSE, None
+
+    def _rpc_notifications_cancelled(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `notifications/cancelled` method."""
+        params, session_id = ctx.params, ctx.session_id
+
+        self._handle_cancelled(params, session_id)
+        return _NO_RESPONSE, None
+
+    def _rpc_server_discover(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `server/discover` method."""
+        result = None
+
+        result = self._cacheable({
+            "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
+            "capabilities": self._get_capabilities().to_dict(),
+        }, PROTOCOL_2026_07_28)
+        if self.instructions:
+            result["instructions"] = self.instructions
+        # Answer in the new shape regardless of the caller's declared
+        # version — the method only exists in 2026-07-28.
+        result = self._finalize_result(result, PROTOCOL_2026_07_28)
+        return result, None
+
+    def _rpc_ping(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `ping` method."""
+        version, modern = ctx.version, ctx.modern
+        result = None
+        error = None
+
+        if modern:
+            error = {"code": -32601,
+                     "message": "Method not found: ping (removed in {})".format(version)}
+        else:
+            result = {}
+        return result, error
+
+    def _rpc_subscriptions_listen(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `subscriptions/listen` method."""
+        msg_id, params = ctx.msg_id, ctx.params
+        session_id = ctx.session_id
+        error = None
+
+        if msg_id is None:
+            error = {"code": -32600,
+                     "message": "subscriptions/listen must be a request"}
+        elif not session_id:
+            error = {"code": -32003,
+                     "message": "subscriptions/listen requires an MCP session"}
+        else:
+            requested = params.get("notifications")
+            task_ids = requested.get("taskIds") if isinstance(requested, dict) else None
+            if not isinstance(requested, dict):
+                error = {"code": -32602,
+                         "message": "subscriptions/listen requires a notifications filter"}
+            elif task_ids is not None and (
+                not isinstance(task_ids, list)
+                or not all(isinstance(t, str) and t for t in task_ids)
+            ):
+                error = {"code": -32602,
+                         "message": "notifications.taskIds must be an array of task ids"}
+            else:
+                # Acknowledge only tasks that exist and belong to this
+                # session — the ack reports what the server agreed to.
+                accepted = []
+                with self._jobs_lock:
+                    for task_id in (task_ids or []):
+                        job = self._jobs.get(task_id)
+                        if job is None:
+                            continue
+                        if self._task_access_error(task_id, job, session_id) is None:
+                            accepted.append(task_id)
+
+                # The base filters are opt-in flags; remember which
+                # the client asked for so list_changed can honour them.
+                filters = {
+                    key: bool(requested.get(key))
+                    for key in ("toolsListChanged", "promptsListChanged",
+                                "resourcesListChanged")
+                    if requested.get(key)
+                }
+                # Per-URI subscriptions: acknowledge only URIs that
+                # exist, so the ack states what will actually be watched.
+                wanted_uris = requested.get("resourceSubscriptions")
+                resource_uris = []
+                if isinstance(wanted_uris, list):
+                    with self._registry_lock:
+                        known = set(self._resources)
+                    resource_uris = [
+                        u for u in wanted_uris
+                        if isinstance(u, str) and u in known
+                    ]
+                with self._subs_lock:
+                    session_subs = self._subscriptions.setdefault(session_id, {})
+                    if (msg_id not in session_subs
+                            and len(session_subs) >= MAX_SUBSCRIPTIONS_PER_SESSION):
+                        error = {
+                            "code": -32602,
+                            "message": "Too many open subscriptions for this "
+                                       "session (max {})".format(
+                                           MAX_SUBSCRIPTIONS_PER_SESSION),
+                        }
+                        session_subs = None
+                    else:
+                        session_subs[msg_id] = {"task_ids": set(accepted),
+                                            "filters": filters,
+                                            "resource_uris": set(resource_uris)}
+                if session_subs is None:
+                    # Over the cap: fall through to the error response.
+                    return _RAW_RESPONSE, {"jsonrpc": "2.0", "id": msg_id, "error": error}
+
+                # MUST be the first message carrying this subscription
+                # id, and MUST precede any notification on the stream.
+                self._broadcast({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/subscriptions/acknowledged",
+                    "params": {
+                        "notifications": dict(
+                            filters, taskIds=accepted,
+                            resourceSubscriptions=resource_uris),
+                        "_meta": {MCP_SUBSCRIPTION_ID_KEY: msg_id},
+                    },
+                }, session_id=session_id)
+
+                # The listen stream is long-lived: its response is sent
+                # only on graceful teardown, so return nothing now.
+                return _NO_RESPONSE, None
+        return None, error
+
+    def _rpc_tasks_get(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `tasks/get` method."""
+        params, session_id = ctx.params, ctx.session_id
+        result = None
+        error = None
+
+        task_id = params.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            error = {"code": -32602, "message": "tasks/get requires taskId"}
+        elif not self._client_supports_tasks(session_id=session_id, params=params):
+            error = {
+                "code": -32003,
+                "message": "Missing required client capability",
+                "data": {
+                    "requiredCapabilities": {
+                        "extensions": {MCP_TASKS_EXTENSION_ID: {}}
+                    }
+                },
+            }
+        else:
+            with self._jobs_lock:
+                job = self._jobs.get(task_id)
+                access_error = self._task_access_error(task_id, job, session_id)
+                task = (
+                    self._job_to_task(task_id, job)
+                    if access_error is None
+                    else None
+                )
+            if access_error is not None:
+                error = access_error
+            else:
+                task["resultType"] = "complete"
+                result = task
+        return result, error
+
+    def _rpc_tasks_update(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `tasks/update` method."""
+        params, session_id = ctx.params, ctx.session_id
+        result = None
+        error = None
+
+        task_id = params.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            error = {"code": -32602, "message": "tasks/update requires taskId"}
+        elif not self._client_supports_tasks(session_id=session_id, params=params):
+            error = {
+                "code": -32003,
+                "message": "Missing required client capability",
+                "data": {
+                    "requiredCapabilities": {
+                        "extensions": {MCP_TASKS_EXTENSION_ID: {}}
+                    }
+                },
+            }
+        else:
+            with self._jobs_lock:
+                job = self._jobs.get(task_id)
+                access_error = self._task_access_error(task_id, job, session_id)
+            if access_error is not None:
+                error = access_error
+            else:
+                responses = params.get("inputResponses")
+                if not isinstance(responses, dict) or not responses:
+                    error = {
+                        "code": -32602,
+                        "message": "tasks/update requires inputResponses",
+                    }
+                else:
+                    error = self._task_deliver_input(task_id, responses)
+                    if error is None:
+                        result = {"resultType": "complete"}
+        return result, error
+
+    def _rpc_tasks_cancel(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `tasks/cancel` method."""
+        params, session_id = ctx.params, ctx.session_id
+        result = None
+        error = None
+
+        task_id = params.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            error = {"code": -32602, "message": "tasks/cancel requires taskId"}
+        elif not self._client_supports_tasks(session_id=session_id, params=params):
+            error = {
+                "code": -32003,
+                "message": "Missing required client capability",
+                "data": {
+                    "requiredCapabilities": {
+                        "extensions": {MCP_TASKS_EXTENSION_ID: {}}
+                    }
+                },
+            }
+        else:
+            callbacks = []
+            with self._jobs_lock:
+                job = self._jobs.get(task_id)
+                access_error = self._task_access_error(task_id, job, session_id)
+                if access_error is None and job.get("status") in (
+                        "running", "input_required"):
+                    job["status"] = "cancelled"
+                    job["lastUpdatedAt"] = self._utc_now()
+                    event = job.get("cancel_event")
+                    if event is not None:
+                        event.set()
+                    waiting = job.get("input_event")
+                    if waiting is not None:
+                        waiting.set()
+                    callbacks = list(job.get("cancel_callbacks") or [])
+            if access_error is not None:
+                error = access_error
+            else:
+                # Outside the lock: callbacks kill process groups and
+                # must not block every other job's bookkeeping.
+                self._fire_cancel_callbacks(task_id, callbacks)
+                if callbacks or job is not None:
+                    self._notify_task_status(task_id)
+                result = {"resultType": "complete"}
+        return result, error
+
+    def _rpc_tools_list(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `tools/list` method."""
+        params, version = ctx.params, ctx.version
+        result = None
+
+        with self._registry_lock:
+            tool_dicts = [
+                self._tools[name]["definition"].to_dict()
+                for name in sorted(self._tools)
+            ]
+        result = self._cacheable(
+            self._paginate(tool_dicts, params, "tools", {}, "name"), version)
+        return result, None
+
+    def _rpc_tools_call(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `tools/call` method."""
+        msg_id, params, session_id = ctx.msg_id, ctx.params, ctx.session_id
+        version, modern, meta = ctx.version, ctx.modern, ctx.meta
+        progress_token = ctx.progress_token
+        result = None
+        error = None
+
+        tool_name = params.get("name")
+        arguments = params.get("arguments", {})
+
+        if not isinstance(arguments, dict):
+            error = {"code": -32602,
+                     "message": "tools/call arguments must be a JSON object"}
+        elif tool_name not in self._tools:
+            error = {"code": -32601, "message": "Tool not found: {}".format(tool_name)}
+        else:
+            tool_entry = self._tools[tool_name]
+            handler = tool_entry["handler"]
+
+            if tool_entry.get("is_async"):
+                # Return a task to clients that opted into the MCP
+                # Tasks extension; older clients keep the existing
+                # get_job_result polling-tool flow.
+                supports_tasks = self._client_supports_tasks(
+                    session_id=session_id, params=params
+                )
+                if supports_tasks and not session_id and not modern:
+                    error = {
+                        "code": -32003,
+                        "message": "Task-capable async tool calls require an MCP session",
+                    }
+                else:
+                    job_id = self._start_async_tool_job(
+                        handler, msg_id, arguments,
+                        session_id=session_id,
+                        progress_token=progress_token,
+                        meta=meta,
+                        prepare=tool_entry.get("prepare"),
+                        protocol_version=version,
+                    )
+                if supports_tasks and not error:
+                    with self._jobs_lock:
+                        job = self._jobs[job_id]
+                        result = self._job_to_task(
+                            job_id, job, include_terminal_payload=False
+                        )
+                    result["resultType"] = "task"
+                elif not error:
+                    legacy_body = {
+                        "status": "running",
+                        "job_id": job_id,
+                        "message": "Job started. Poll with get_job_result(job_id=\"{}\")".format(job_id)
+                    }
+                    with self._jobs_lock:
+                        started = self._jobs.get(job_id) or {}
+                        task_meta = dict(started.get("task_meta") or {})
+                    if task_meta:
+                        # Legacy clients never read `_meta`; give them
+                        # the same handles in the body they do read.
+                        legacy_body["meta"] = task_meta
+                    result = {
+                        "content": [{"type": "text", "text": json.dumps(legacy_body)}],
+                        "isError": False
+                    }
+            else:
+                # MRTR: fold in answers the client already gave, from
+                # this retry and from earlier rounds of the same request.
+                request_state = params.get("requestState")
+                if not isinstance(request_state, str):
+                    request_state = None
+                collected = self._mrtr_load(request_state, session_id)
+                supplied = params.get("inputResponses")
+                if isinstance(supplied, dict):
+                    collected.update(supplied)
+                try:
+                    call_result = self._call_handler(
+                        handler, msg_id, arguments,
+                        session_id=session_id,
+                        progress_token=progress_token,
+                        meta=meta,
+                        protocol_version=version,
+                        input_responses=collected,
+                        request_state=request_state,
+                    )
+                    self._mrtr_discard(request_state)
+
+                    # Wrap result in proper format
+                    if isinstance(call_result, ToolResult):
+                        result = call_result.to_dict()
+                    elif isinstance(call_result, dict):
+                        # structuredContent (MCP spec): required when the
+                        # tool declares outputSchema, and lets mcp-apps
+                        # widgets consume data without re-parsing text.
+                        result = {
+                            "content": [{"type": "text", "text": json.dumps(call_result)}],
+                            "structuredContent": call_result,
+                            "isError": False
+                        }
+                    else:
+                        result = {
+                            "content": [{"type": "text", "text": str(call_result)}],
+                            "isError": False
+                        }
+                except InputRequired as needed:
+                    # Not an error: the handler is telling the client
+                    # what it needs. The client answers by retrying this
+                    # same call with inputResponses + requestState.
+                    result = {
+                        "resultType": "input_required",
+                        "inputRequests": needed.requests,
+                        "requestState": self._mrtr_save(
+                            request_state, collected, session_id
+                        ),
+                    }
+                except Exception as e:
+                    self._mrtr_discard(request_state)
+                    traceback.print_exc()
+                    result = {
+                        "content": [{"type": "text", "text": str(e)}],
+                        "isError": True
+                    }
+        return result, error
+
+    def _rpc_resources_list(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `resources/list` method."""
+        params, version = ctx.params, ctx.version
+        result = None
+
+        resources = []
+        with self._registry_lock:
+            # Sorted for the same reasons tools/list is: a stable order
+            # lets clients cache, and offset paging can only be walked
+            # safely when the order does not shuffle between pages.
+            entries = [self._resources[uri] for uri in sorted(self._resources)]
+        for r in entries:
+            resource_dict = r["definition"].to_dict()
+            resources.append(resource_dict)
+        result = self._cacheable(
+            self._paginate(resources, params, "resources", {}, "uri"),
+            version)
+        return result, None
+
+    def _rpc_resources_templates_list(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `resources/templates/list` method."""
+        version = ctx.version
+        result = None
+
+        result = self._cacheable({"resourceTemplates": []}, version)
+        return result, None
+
+    def _rpc_resources_read(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `resources/read` method."""
+        msg_id, params, session_id = ctx.msg_id, ctx.params, ctx.session_id
+        version, modern, meta = ctx.version, ctx.modern, ctx.meta
+        progress_token = ctx.progress_token
+        result = None
+        error = None
+
+        uri = params.get("uri")
+
+        # Validated before use: a non-string uri reached a dict lookup
+        # and raised TypeError, which surfaced as an internal error
+        # with a traceback — blaming the server for the caller's
+        # malformed request, and logging a stack trace per bad request.
+        if not isinstance(uri, str) or not uri:
+            error = {"code": -32602,
+                     "message": "resources/read requires a string uri"}
+        else:
+            # Strip proxy prefix from URI for lookup
+            lookup_uri = self._strip_proxy_prefix(uri)
+
+            if lookup_uri in self._skill_resources:
+                # SEP-2640 skill file. No handler to call: the bytes
+                # come straight off disk, read fresh on every call
+                # (never cached ahead of need, per the SEP).
+                skill_entry = self._skill_resources[lookup_uri]
+                try:
+                    data = skill_entry["path"].read_bytes()
+                    content_item = {
+                        "uri": uri,
+                        "mimeType": skill_entry["mimeType"],
+                    }
+                    try:
+                        content_item["text"] = data.decode("utf-8")
+                    except UnicodeDecodeError:
+                        content_item["blob"] = base64.b64encode(
+                            data).decode("ascii")
+                    result = self._cacheable(
+                        {"contents": [content_item]}, version)
+                except Exception as e:
+                    traceback.print_exc()
+                    error = {"code": -32603, "message": str(e)}
+            elif lookup_uri not in self._resources:
+                # 2026-07-28 aligns resource-not-found with JSON-RPC's
+                # Invalid Params; older clients keep the code they know.
+                error = {
+                    "code": -32602 if modern else -32601,
+                    "message": "Resource not found: {}".format(uri),
+                }
+            else:
+                entry = self._resources[lookup_uri]
+                handler = entry["handler"]
+                definition = entry["definition"]
+                res_mime = getattr(definition, "mimeType", None)
+                res_meta = getattr(definition, "meta", None) or {}
+                try:
+                    content = self._call_handler(
+                        handler, msg_id,
+                        session_id=session_id,
+                        progress_token=progress_token,
+                        meta=meta,
+                    )
+
+                    if isinstance(content, ResourceResult):
+                        result = content.to_dict()
+                    elif isinstance(content, dict):
+                        result = {
+                            "contents": [{
+                                "uri": uri,
+                                "text": json.dumps(content)
+                            }]
+                        }
+                    else:
+                        result = {
+                            "contents": [{
+                                "uri": uri,
+                                "text": str(content)
+                            }]
+                        }
+
+                    # Decorate each content entry with the registered
+                    # mimeType and `_meta` (mcp-apps CSP, permissions,
+                    # etc.). Don't override values the handler already
+                    # supplied via ResourceContent.
+                    for item in result.get("contents", []):
+                        if not isinstance(item, dict):
+                            continue
+                        if res_mime and "mimeType" not in item:
+                            item["mimeType"] = res_mime
+                        if res_meta and "_meta" not in item:
+                            item["_meta"] = res_meta
+
+                    # A read is a CacheableResult too, exactly like the
+                    # list methods above. Hosts that validate the result
+                    # schema reject a resources/read with no ttlMs and no
+                    # cacheScope, and for an MCP Apps server that rejection
+                    # means the app resource never loads at all.
+                    result = self._cacheable(result, version)
+                except Exception as e:
+                    traceback.print_exc()
+                    error = {"code": -32603, "message": str(e)}
+        return result, error
+
+    def _rpc_prompts_list(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `prompts/list` method."""
+        params, version = ctx.params, ctx.version
+        result = None
+
+        with self._registry_lock:
+            prompt_dicts = [self._prompts[name]["definition"].to_dict()
+                            for name in sorted(self._prompts)]
+        result = self._cacheable(
+            self._paginate(prompt_dicts, params, "prompts", {}, "name"),
+            version)
+        return result, None
+
+    def _rpc_prompts_get(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `prompts/get` method."""
+        msg_id, params, session_id = ctx.msg_id, ctx.params, ctx.session_id
+        meta, progress_token = ctx.meta, ctx.progress_token
+        result = None
+        error = None
+
+        prompt_name = params.get("name")
+        arguments = params.get("arguments", {})
+
+        if not isinstance(prompt_name, str) or not prompt_name:
+            error = {"code": -32602,
+                     "message": "prompts/get requires a string name"}
+        elif not isinstance(arguments, dict):
+            error = {"code": -32602,
+                     "message": "prompts/get arguments must be a JSON object"}
+        elif prompt_name not in self._prompts:
+            error = {"code": -32601, "message": "Prompt not found: {}".format(prompt_name)}
+        else:
+            handler = self._prompts[prompt_name]["handler"]
+            try:
+                prompt_result = self._call_handler(
+                    handler, msg_id, arguments,
+                    session_id=session_id,
+                    progress_token=progress_token,
+                    meta=meta,
+                )
+
+                if isinstance(prompt_result, PromptResult):
+                    result = prompt_result.to_dict()
+                elif isinstance(prompt_result, list):
+                    # Assume list of message dicts
+                    result = {"messages": prompt_result}
+                else:
+                    result = {"messages": [{"role": "user", "content": {"type": "text", "text": str(prompt_result)}}]}
+            except Exception as e:
+                traceback.print_exc()
+                error = {"code": -32603, "message": str(e)}
+        return result, error
+
+    def _rpc_skills_list(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `skills/list` method."""
+        params, version = ctx.params, ctx.version
+        result = None
+
+        with self._registry_lock:
+            skill_dicts = [self._skills[uri]["definition"].to_dict()
+                           for uri in sorted(self._skills)]
+        result = self._cacheable(
+            self._paginate(skill_dicts, params, "skills", {}, "uri"),
+            version)
+        return result, None
+
+    def _rpc_skills_get(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `skills/get` method."""
+        params, version = ctx.params, ctx.version
+        result = None
+        error = None
+
+        skill_uri = params.get("uri")
+        if not isinstance(skill_uri, str) or not skill_uri:
+            error = {"code": -32602,
+                     "message": "skills/get requires a string uri"}
+        else:
+            with self._registry_lock:
+                entry = self._skills.get(skill_uri)
+            if entry is None:
+                # Same code resources/read uses for an unknown URI,
+                # per SEP-2640.
+                error = {"code": -32602,
+                         "message": "Skill not found: {}".format(skill_uri)}
+            else:
+                result = self._cacheable(
+                    {"skill": entry["definition"].to_dict()}, version)
+        return result, error
+
+    def _rpc_resources_directory_read(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `resources/directory/read` method."""
+        params, version = ctx.params, ctx.version
+        result = None
+        error = None
+
+        dir_uri = params.get("uri")
+        if not isinstance(dir_uri, str) or not dir_uri:
+            error = {"code": -32602,
+                     "message": "resources/directory/read requires a string uri"}
+        else:
+            with self._registry_lock:
+                children = self._skill_directories.get(dir_uri)
+                children = list(children) if children is not None else None
+            if children is None:
+                error = {"code": -32602,
+                         "message": "Not a directory resource: {}".format(dir_uri)}
+            else:
+                result = self._cacheable(
+                    self._paginate(children, params, "resources", {}, "uri"),
+                    version)
+        return result, error
+
+    def _rpc_logging_setlevel(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `logging/setLevel` method."""
+        version, modern = ctx.version, ctx.modern
+        result = None
+        error = None
+
+        if modern:
+            # Removed: log level is per-request via _meta instead.
+            error = {"code": -32601,
+                     "message": "Method not found: logging/setLevel "
+                                "(removed in {}; use _meta {})".format(
+                                    version, META_LOG_LEVEL)}
+        else:
+            result = {}
+        return result, error
+
+
 
     def _register_client(self, session_id, client_queue):
         # type: (str, _SSEQueue) -> None
