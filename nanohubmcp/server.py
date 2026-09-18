@@ -20,7 +20,6 @@ import inspect
 import json
 import sys
 import threading
-import time
 import traceback
 import uuid
 from datetime import datetime
@@ -49,7 +48,12 @@ from .transport import (  # noqa: F401
     SSE_HEARTBEAT_INTERVAL,
     _SSEQueue,
 )
+from .protocol import MCP_SUBSCRIPTION_ID_KEY  # noqa: F401
 from . import skills as _skills
+from . import tasks as _tasks
+# Used by _get_capabilities, which stays here; the rest of the tasks
+# constants are read only by the module that now owns them.
+from .tasks import MCP_TASKS_EXTENSION_ID  # noqa: F401
 # Re-exported for the same reason as the transport names above: these were
 # defined here before the skills registry moved out, and are imported from
 # `nanohubmcp.server` by existing code and tests.
@@ -97,8 +101,6 @@ ERR_UNSUPPORTED_PROTOCOL_VERSION = -32004   # remapped to -32022 for modern clie
 CACHEABLE_TTL_MS = 60 * 1000
 CACHEABLE_SCOPE = "private"
 
-# How long a partially-answered MRTR request is remembered between retries.
-MRTR_STATE_TTL_SECONDS = 10 * 60
 
 # A client picks its own subscription ids (they are its JSON-RPC request ids),
 # so the count has to be bounded somewhere. Far above any real use.
@@ -170,21 +172,6 @@ class InvalidParams(Exception):
 MCP_APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
 MCP_APPS_MIME_TYPE = "text/html;profile=mcp-app"
 
-# MCP Tasks extension (https://github.com/modelcontextprotocol/experimental-ext-tasks).
-# Async tools can return a task handle to clients that opt into this extension,
-# while older clients continue to receive the existing get_job_result flow.
-MCP_TASKS_EXTENSION_ID = "io.modelcontextprotocol/tasks"
-MCP_TASK_TTL_MS = 60 * 60 * 1000
-MCP_TASK_POLL_INTERVAL_MS = 1000
-
-# The Tasks `Task` object is a closed shape with no `_meta`, but
-# `CreateTaskResult = Result & Task` and `GetTaskResult = Result & ...`, so the
-# *response envelope* carries the base-protocol `_meta`. That is where a tool's
-# durable handles ride. Unqualified keys set by tools get this prefix; MCP
-# reserves any prefix whose second label is `modelcontextprotocol` or `mcp`.
-TASK_META_PREFIX = "org.nanohub/"
-MCP_SUBSCRIPTION_ID_KEY = "io.modelcontextprotocol/subscriptionId"
-_RESERVED_META_LABELS = ("modelcontextprotocol", "mcp")
 
 
 
@@ -311,126 +298,6 @@ class MCPServer(object):
         # registered, so servers without any async tools don't advertise it.
         self._job_polling_registered = False  # type: bool
 
-    def _register_get_job_result(self):
-        # type: () -> None
-        """Auto-register the built-in get_job_result polling tool."""
-        server_instance = self
-
-        def get_job_result(job_id):
-            # type: (str) -> Dict[str, Any]
-            """Poll the result of a long-running async tool call.
-
-            Returns status 'running' while the job is in progress, or the final
-            result/error once it completes. The first successful poll consumes
-            the job — subsequent polls return ``not_found`` — so the server
-            doesn't accumulate finished-job state for the lifetime of the
-            process.
-
-            Args:
-                job_id: The job ID returned by an async tool call.
-            """
-            with server_instance._jobs_lock:
-                job = server_instance._jobs.get(job_id)
-                if job is None:
-                    return {"status": "not_found", "job_id": job_id}
-                task_meta = dict(job.get("task_meta") or {})
-                if job["status"] == "running":
-                    running = {"status": "running", "job_id": job_id}
-                    if task_meta:
-                        running["meta"] = task_meta
-                    return running
-                # Terminal state — remove so memory doesn't grow unbounded.
-                server_instance._jobs.pop(job_id, None)
-
-            if job["status"] == "cancelled":
-                payload = {"status": "cancelled", "job_id": job_id}
-            elif job["status"] == "error":
-                payload = {"status": "error", "job_id": job_id, "error": job["result"]}
-            else:
-                payload = {"status": "done", "job_id": job_id, "result": job["result"]}
-            if task_meta:
-                payload["meta"] = task_meta
-            return payload
-
-        decorated = tool(
-            name="get_job_result",
-            description=(
-                "Poll the result of a long-running async tool call. "
-                "Pass the job_id returned by an async tool. "
-                "Returns {\"status\": \"running\"} until complete, then the final result."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {"job_id": {"type": "string"}},
-                "required": ["job_id"]
-            }
-        )(get_job_result)
-        self._register_tool_function(decorated)
-
-    @staticmethod
-    def _normalize_task_meta(metadata):
-        # type: (Dict[str, Any]) -> Dict[str, Any]
-        """Namespace and validate task `_meta` keys per the MCP naming rules.
-
-        Bare keys (``jobHandle``) get :data:`TASK_META_PREFIX`; already-qualified
-        keys pass through. Prefixes reserved by MCP raise ``ValueError`` rather
-        than emitting non-conformant traffic.
-        """
-        normalized = {}
-        for key, value in (metadata or {}).items():
-            if not isinstance(key, str) or not key:
-                raise ValueError("task metadata keys must be non-empty strings")
-            if "/" in key:
-                prefix, _, name = key.partition("/")
-                labels = prefix.split(".")
-                if len(labels) >= 2 and labels[1] in _RESERVED_META_LABELS:
-                    raise ValueError(
-                        "task metadata key {!r} uses an MCP-reserved prefix".format(key)
-                    )
-                if not name:
-                    raise ValueError("task metadata key {!r} has no name".format(key))
-                normalized[key] = value
-            else:
-                normalized[TASK_META_PREFIX + key] = value
-        return normalized
-
-    def _notify_task_status(self, job_id):
-        # type: (str) -> None
-        """Push `notifications/tasks` to sessions subscribed to this task.
-
-        Complements polling rather than replacing it: the spec says servers MAY
-        push status updates *in addition to* servicing `tasks/get`, and clients
-        MAY keep polling. Sending is strictly opt-in — only sessions that named
-        this task in a `subscriptions/listen` request receive anything.
-        """
-        with self._jobs_lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return
-            session_id = job.get("session_id")
-            task = self._job_to_task(job_id, job)
-
-        if not session_id:
-            return
-
-        with self._subs_lock:
-            subscriptions = [
-                sub_id
-                for sub_id, sub in (self._subscriptions.get(session_id) or {}).items()
-                if job_id in sub.get("task_ids", ())
-            ]
-
-        for sub_id in subscriptions:
-            params = dict(task)
-            meta = dict(params.get("_meta") or {})
-            meta[MCP_SUBSCRIPTION_ID_KEY] = sub_id
-            params["_meta"] = meta
-            self._broadcast({
-                "jsonrpc": "2.0",
-                "method": "notifications/tasks",
-                "params": params,
-            }, session_id=session_id)
-
     def _drop_subscriptions(self, session_id):
         # type: (str) -> None
         """Forget a session's subscriptions.
@@ -485,128 +352,6 @@ class MCPServer(object):
         self._notify_task_status(job_id)
         return True
 
-    def _start_async_tool_job(self, handler, msg_id, arguments, session_id=None,
-                              progress_token=None, meta=None, prepare=None,
-                              protocol_version=None):
-        # type: (Any, Any, Dict[str, Any], Optional[str], Optional[Any], Optional[Dict[str, Any]], Optional[Callable]) -> str
-        """Spawn a background thread for an async tool; return a job_id immediately.
-
-        ``prepare`` runs synchronously on the request thread *before* the
-        worker starts, so anything it publishes via ``ctx.set_task_metadata()``
-        (or returns as a dict) is already on the job record when the initial
-        task handle is built. That is the only way for a durable handle to
-        reach the caller at dispatch — the handler itself has not run yet. A
-        raising ``prepare`` aborts the call and starts no job.
-        """
-        # Snapshot the arguments dict — the closure runs on a background thread
-        # and we don't want later mutations of the caller's dict to leak in.
-        arguments = dict(arguments) if arguments else {}
-
-        job_id = str(uuid.uuid4())
-        now = self._utc_now()
-        with self._jobs_lock:
-            self._jobs[job_id] = {
-                "status": "running",
-                "result": None,
-                "createdAt": now,
-                "lastUpdatedAt": now,
-                "ttlMs": MCP_TASK_TTL_MS,
-                "pollIntervalMs": MCP_TASK_POLL_INTERVAL_MS,
-                "session_id": session_id,
-                "request_id": msg_id,
-                "expires_at": time.time() + (MCP_TASK_TTL_MS / 1000.0),
-                "cancel_event": threading.Event(),
-                "cancel_callbacks": [],
-                "task_meta": {},
-                # MRTR for tasks: the worker parks here while the client
-                # answers, rather than re-running like a sync call does.
-                "input_requests": {},
-                "input_responses": {},
-                "input_event": threading.Event(),
-            }
-
-        if prepare is not None:
-            try:
-                prepared = self._call_handler(
-                    prepare, msg_id, arguments,
-                    session_id=session_id,
-                    progress_token=progress_token,
-                    meta=meta,
-                    job_id=job_id,
-                    protocol_version=protocol_version,
-                )
-            except Exception:
-                # No worker was started, so drop the record rather than leave a
-                # phantom "running" task the client would poll forever.
-                with self._jobs_lock:
-                    self._jobs.pop(job_id, None)
-                raise
-            if isinstance(prepared, dict) and prepared:
-                normalized = self._normalize_task_meta(prepared)
-                with self._jobs_lock:
-                    job = self._jobs.get(job_id)
-                    if job is not None:
-                        job.setdefault("task_meta", {}).update(normalized)
-
-        server_instance = self
-
-        def _run():
-            try:
-                call_result = self._call_handler(
-                    handler, msg_id, arguments,
-                    session_id=session_id,
-                    progress_token=progress_token,
-                    meta=meta,
-                    job_id=job_id,
-                    protocol_version=protocol_version,
-                )
-
-                # If the tool signalled failure via ToolResult(isError=True),
-                # surface that as a job error rather than a successful result.
-                if isinstance(call_result, ToolResult):
-                    payload = call_result.to_dict()
-                    if payload.get("isError"):
-                        items = payload.get("content", [])
-                        message = (
-                            items[0]["text"]
-                            if len(items) == 1 and "text" in items[0]
-                            else payload
-                        )
-                        with server_instance._jobs_lock:
-                            if server_instance._jobs[job_id].get("status") == "cancelled":
-                                return
-                            server_instance._jobs[job_id]["status"] = "error"
-                            server_instance._jobs[job_id]["result"] = message
-                            server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
-                        # Outside the lock: notifying takes other locks.
-                        server_instance._notify_task_status(job_id)
-                        return
-                    result = payload
-                elif isinstance(call_result, dict):
-                    result = call_result
-                else:
-                    result = str(call_result)
-                with server_instance._jobs_lock:
-                    if server_instance._jobs[job_id].get("status") == "cancelled":
-                        return
-                    server_instance._jobs[job_id]["status"] = "done"
-                    server_instance._jobs[job_id]["result"] = result
-                    server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
-                server_instance._notify_task_status(job_id)
-            except Exception as e:
-                with server_instance._jobs_lock:
-                    if server_instance._jobs[job_id].get("status") == "cancelled":
-                        return
-                    server_instance._jobs[job_id]["status"] = "error"
-                    server_instance._jobs[job_id]["result"] = str(e)
-                    server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
-                server_instance._notify_task_status(job_id)
-                traceback.print_exc()
-
-        t = threading.Thread(target=_run)
-        t.daemon = True
-        t.start()
-        return job_id
 
     @staticmethod
     def _utc_now():
@@ -614,46 +359,6 @@ class MCPServer(object):
         """Return an MCP-friendly UTC timestamp."""
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
-    def _job_to_task(self, task_id, job, include_terminal_payload=True):
-        # type: (str, Dict[str, Any], bool) -> Dict[str, Any]
-        """Convert an internal async-job record into an MCP Task object."""
-        status_map = {
-            "running": "working",
-            "input_required": "input_required",
-            "done": "completed",
-            "error": "failed",
-            "cancelled": "cancelled",
-        }
-        status = status_map.get(job.get("status"), "working")
-        now = self._utc_now()
-        task = {
-            "taskId": task_id,
-            "status": status,
-            "createdAt": job.get("createdAt", now),
-            "lastUpdatedAt": job.get("lastUpdatedAt", now),
-            "ttlMs": job.get("ttlMs", MCP_TASK_TTL_MS),
-            "pollIntervalMs": job.get("pollIntervalMs", MCP_TASK_POLL_INTERVAL_MS),
-        }
-        task_meta = job.get("task_meta") or {}
-        if task_meta:
-            # Task itself has no _meta; the Result half of the intersection does.
-            task["_meta"] = dict(task_meta)
-        if status == "input_required":
-            # InputRequiredTask requires the outstanding asks.
-            task["inputRequests"] = dict(job.get("input_requests") or {})
-            task["statusMessage"] = "Waiting for input from the client."
-        elif status == "working":
-            task["statusMessage"] = "The operation is in progress."
-        elif status == "cancelled":
-            task["statusMessage"] = "Cancellation was requested."
-        elif include_terminal_payload and status == "completed":
-            task["result"] = self._tool_result_payload(job.get("result"))
-        elif include_terminal_payload and status == "failed":
-            task["error"] = {
-                "code": -32603,
-                "message": str(job.get("result", "Task failed")),
-            }
-        return task
 
     def _tool_result_payload(self, value):
         # type: (Any) -> Dict[str, Any]
@@ -683,26 +388,6 @@ class MCPServer(object):
             and "isError" in value
         )
 
-    def _task_access_error(self, task_id, job, session_id):
-        # type: (str, Optional[Dict[str, Any]], Optional[str]) -> Optional[Dict[str, Any]]
-        """Return a JSON-RPC error when the caller cannot access a task.
-
-        Handshake-era clients are confined to tasks their own session created.
-        A stateless (2026-07-28) task has no owning session: the server-minted
-        `taskId` is itself the unguessable handle, which is the cross-call
-        state mechanism that revision prescribes.
-        """
-        if job is None:
-            return {"code": -32602, "message": "Unknown taskId: {}".format(task_id)}
-        owner = job.get("session_id")
-        if owner is None:
-            return None
-        if owner != session_id:
-            return {
-                "code": -32003,
-                "message": "Task is not available in this session",
-            }
-        return None
 
     def _handle_cancelled(self, params, session_id):
         # type: (Dict[str, Any], Optional[str]) -> None
@@ -1079,164 +764,12 @@ class MCPServer(object):
         # A null value is treated as absent: the client MUST omit the header.
         return (node is not None), node
 
-    def _task_await_input(self, job_id, requests, timeout):
-        # type: (str, Dict[str, Any], float) -> Dict[str, Any]
-        """Park an async worker in `input_required` until the client answers.
 
-        Unlike a sync call — which the client re-drives from the top — the
-        worker thread is still alive and holding its state, so it waits here
-        and resumes in place. Nothing needs to be idempotent.
-        """
-        with self._jobs_lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                raise RuntimeError("Task {} no longer exists".format(job_id))
-            if job.get("status") != "running":
-                raise RuntimeError("Task {} is not running".format(job_id))
-            job["input_requests"] = dict(requests)
-            job["status"] = "input_required"
-            job["lastUpdatedAt"] = self._utc_now()
-            event = job.get("input_event")
-            if event is None:
-                event = threading.Event()
-                job["input_event"] = event
-            event.clear()
-            cancel_event = job.get("cancel_event")
 
-        # Tell subscribers the task now needs something, so a client that
-        # pushes rather than polls still learns about the ask.
-        self._notify_task_status(job_id)
 
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if cancel_event is not None and cancel_event.is_set():
-                raise RuntimeError("Task {} was cancelled while awaiting input".format(job_id))
-            if event.wait(0.1):
-                break
-        else:
-            with self._jobs_lock:
-                job = self._jobs.get(job_id)
-                if job is not None and job.get("status") == "input_required":
-                    job["status"] = "running"
-                    job["input_requests"] = {}
-                    job["lastUpdatedAt"] = self._utc_now()
-            raise RuntimeError("Timed out waiting for client input on task {}".format(job_id))
 
-        # Cancellation wakes this same event, so re-check it before reading:
-        # otherwise a cancelled task reports "no response supplied", and a
-        # handler failing closed on RuntimeError logs the wrong cause.
-        if cancel_event is not None and cancel_event.is_set():
-            raise RuntimeError(
-                "Task {} was cancelled while awaiting input".format(job_id))
 
-        with self._jobs_lock:
-            job = self._jobs.get(job_id) or {}
-            answers = dict(job.get("input_responses") or {})
-        return answers
 
-    def _task_deliver_input(self, job_id, responses):
-        # type: (str, Dict[str, Any]) -> Optional[Dict[str, Any]]
-        """Hand tasks/update answers to a parked worker and wake it."""
-        with self._jobs_lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return {"code": -32602, "message": "Unknown taskId: {}".format(job_id)}
-            if job.get("status") != "input_required":
-                return {
-                    "code": -32602,
-                    "message": "Task {} is not awaiting input".format(job_id),
-                }
-            outstanding = set(job.get("input_requests") or {})
-            unknown = [k for k in responses if k not in outstanding]
-            if unknown:
-                return {
-                    "code": -32602,
-                    "message": "inputResponses keys not outstanding: {}".format(
-                        ", ".join(sorted(unknown))),
-                }
-            job.setdefault("input_responses", {}).update(responses)
-            job["input_requests"] = {}
-            job["status"] = "running"
-            job["lastUpdatedAt"] = self._utc_now()
-            event = job.get("input_event")
-        if event is not None:
-            event.set()
-        self._notify_task_status(job_id)
-        return None
-
-    def _mrtr_load(self, request_state, session_id=None):
-        # type: (Optional[str], Optional[str]) -> Dict[str, Any]
-        """Answers already collected for this logical request.
-
-        Bound to the session that created the state, exactly as a task is.
-        Without that, one session presenting another's `requestState` inherits
-        answers a different user gave — including an approval it never asked
-        for. Returning empty rather than erroring means the worst case is being
-        asked again, which is the safe direction.
-        """
-        if not request_state:
-            return {}
-        with self._mrtr_lock:
-            entry = self._mrtr_states.get(request_state)
-            if entry is None or entry.get("expires_at", 0) <= time.time():
-                self._mrtr_states.pop(request_state, None)
-                return {}
-            if entry.get("session_id") != session_id:
-                return {}
-            return dict(entry.get("responses") or {})
-
-    def _mrtr_save(self, request_state, responses, session_id=None):
-        # type: (Optional[str], Dict[str, Any], Optional[str]) -> str
-        """Persist accumulated answers; return the state id to hand the client.
-
-        A multi-step handler asks once per round trip, so answers must survive
-        between retries even though the client may only resend the newest one.
-        """
-        state_id = request_state or ("mrtr_" + uuid.uuid4().hex)
-        with self._mrtr_lock:
-            existing = self._mrtr_states.get(state_id)
-            if existing is not None and existing.get("session_id") != session_id:
-                # Someone else's state. Never rebind it — overwriting the owner
-                # would let any session permanently break another's in-flight
-                # request just by naming its id. Start a fresh one instead.
-                state_id = "mrtr_" + uuid.uuid4().hex
-            self._mrtr_states[state_id] = {
-                "responses": dict(responses or {}),
-                "session_id": session_id,
-                "expires_at": time.time() + MRTR_STATE_TTL_SECONDS,
-            }
-        return state_id
-
-    def _mrtr_discard(self, request_state):
-        # type: (Optional[str]) -> None
-        """Drop state once the request has finally completed or failed."""
-        if not request_state:
-            return
-        with self._mrtr_lock:
-            self._mrtr_states.pop(request_state, None)
-
-    def _prune_expired_mrtr_states(self):
-        # type: () -> None
-        """Expire abandoned round-trips so memory can't grow unbounded."""
-        now = time.time()
-        with self._mrtr_lock:
-            for state_id in [
-                k for k, v in self._mrtr_states.items()
-                if v.get("expires_at", 0) <= now
-            ]:
-                self._mrtr_states.pop(state_id, None)
-
-    def _prune_expired_jobs(self):
-        # type: () -> None
-        """Remove task/job records whose retention window has elapsed."""
-        now = time.time()
-        with self._jobs_lock:
-            expired = [
-                job_id for job_id, job in self._jobs.items()
-                if job.get("expires_at") is not None and job.get("expires_at") <= now
-            ]
-            for job_id in expired:
-                self._jobs.pop(job_id, None)
 
     def _strip_proxy_prefix(self, uri):
         # type: (str) -> str
@@ -1460,6 +993,91 @@ class MCPServer(object):
             return decorator(func)
 
         return decorator
+
+    # ── Async tools / MCP Tasks ──────────────────────────────────────
+    # Thin delegations to `nanohubmcp.tasks`. They stay methods because
+    # `nanohubmcp.context`, the transport and the tests all reach this
+    # machinery through the server object.
+
+    def _register_get_job_result(self):
+        """Auto-register the built-in get_job_result polling tool."""
+        return _tasks.register_get_job_result(self)
+
+    @staticmethod
+    def _normalize_task_meta(metadata):
+        """Namespace and validate task `_meta` keys per the MCP naming rules."""
+        return _tasks.normalize_task_meta(metadata)
+
+    def _notify_task_status(self, job_id):
+        """Push `notifications/tasks` to sessions subscribed to this task."""
+        return _tasks.notify_task_status(self, job_id)
+
+    def _start_async_tool_job(
+        self, handler, msg_id, arguments, session_id=None,
+        progress_token=None, meta=None, prepare=None, protocol_version=None
+    ):
+        """Spawn a background thread for an async tool; return a job_id immediately."""
+        return _tasks.start_async_tool_job(
+            self, handler, msg_id, arguments, session_id, progress_token, meta,
+            prepare, protocol_version)
+
+    def _job_to_task(self, task_id, job, include_terminal_payload=True):
+        """Convert an internal async-job record into an MCP Task object."""
+        return _tasks.job_to_task(self, task_id, job, include_terminal_payload)
+
+    def _task_access_error(self, task_id, job, session_id):
+        """Return a JSON-RPC error when the caller cannot access a task."""
+        return _tasks.task_access_error(self, task_id, job, session_id)
+
+    def _task_await_input(self, job_id, requests, timeout):
+        """Park an async worker in `input_required` until the client answers."""
+        return _tasks.task_await_input(self, job_id, requests, timeout)
+
+    def _task_deliver_input(self, job_id, responses):
+        """Hand tasks/update answers to a parked worker and wake it."""
+        return _tasks.task_deliver_input(self, job_id, responses)
+
+    def _mrtr_load(self, request_state, session_id=None):
+        """Answers already collected for this logical request."""
+        return _tasks.mrtr_load(self, request_state, session_id)
+
+    def _mrtr_save(self, request_state, responses, session_id=None):
+        """Persist accumulated answers; return the state id to hand the client."""
+        return _tasks.mrtr_save(self, request_state, responses, session_id)
+
+    def _mrtr_discard(self, request_state):
+        """Drop state once the request has finally completed or failed."""
+        return _tasks.mrtr_discard(self, request_state)
+
+    def _prune_expired_mrtr_states(self):
+        """Expire abandoned round-trips so memory can't grow unbounded."""
+        return _tasks.prune_expired_mrtr_states(self)
+
+    def _prune_expired_jobs(self):
+        """Remove task/job records whose retention window has elapsed."""
+        return _tasks.prune_expired_jobs(self)
+
+    def _client_supports_tasks(self, session_id=None, params=None):
+        """Return True when a client opted into the MCP Tasks extension."""
+        return _tasks.client_supports_tasks(self, session_id, params)
+
+    # The MCP Tasks methods. Bodies live in `nanohubmcp.tasks`, beside the job
+    # records they read.
+
+    def _rpc_tasks_get(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `tasks/get` method."""
+        return _tasks.rpc_tasks_get(self, ctx)
+
+    def _rpc_tasks_update(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `tasks/update` method."""
+        return _tasks.rpc_tasks_update(self, ctx)
+
+    def _rpc_tasks_cancel(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `tasks/cancel` method."""
+        return _tasks.rpc_tasks_cancel(self, ctx)
 
     def async_tool(
         self,
@@ -1854,28 +1472,6 @@ class MCPServer(object):
             return mode in value
         return False
 
-    def _client_supports_tasks(self, session_id=None, params=None):
-        # type: (Optional[str], Optional[Dict[str, Any]]) -> bool
-        """Return True when a client opted into the MCP Tasks extension."""
-        extension_sets = []
-
-        if isinstance(params, dict):
-            meta = params.get("_meta")
-            if isinstance(meta, dict):
-                request_caps = meta.get("io.modelcontextprotocol/clientCapabilities")
-                if isinstance(request_caps, dict):
-                    extension_sets.append(request_caps.get("extensions"))
-
-        capabilities = self._client_capabilities(session_id)
-        extension_sets.append(capabilities.get("extensions"))
-        experimental = capabilities.get("experimental")
-        if isinstance(experimental, dict):
-            extension_sets.append(experimental)
-
-        for extensions in extension_sets:
-            if isinstance(extensions, dict) and MCP_TASKS_EXTENSION_ID in extensions:
-                return True
-        return False
 
     def _negotiate_protocol_version(self, requested):
         # type: (Optional[str]) -> str
@@ -2524,127 +2120,8 @@ class MCPServer(object):
                 return _NO_RESPONSE, None
         return None, error
 
-    def _rpc_tasks_get(self, ctx):
-        # type: (_RequestContext) -> tuple
-        """Handle the JSON-RPC `tasks/get` method."""
-        params, session_id = ctx.params, ctx.session_id
-        result = None
-        error = None
 
-        task_id = params.get("taskId")
-        if not isinstance(task_id, str) or not task_id:
-            error = {"code": -32602, "message": "tasks/get requires taskId"}
-        elif not self._client_supports_tasks(session_id=session_id, params=params):
-            error = {
-                "code": -32003,
-                "message": "Missing required client capability",
-                "data": {
-                    "requiredCapabilities": {
-                        "extensions": {MCP_TASKS_EXTENSION_ID: {}}
-                    }
-                },
-            }
-        else:
-            with self._jobs_lock:
-                job = self._jobs.get(task_id)
-                access_error = self._task_access_error(task_id, job, session_id)
-                task = (
-                    self._job_to_task(task_id, job)
-                    if access_error is None
-                    else None
-                )
-            if access_error is not None:
-                error = access_error
-            else:
-                task["resultType"] = "complete"
-                result = task
-        return result, error
 
-    def _rpc_tasks_update(self, ctx):
-        # type: (_RequestContext) -> tuple
-        """Handle the JSON-RPC `tasks/update` method."""
-        params, session_id = ctx.params, ctx.session_id
-        result = None
-        error = None
-
-        task_id = params.get("taskId")
-        if not isinstance(task_id, str) or not task_id:
-            error = {"code": -32602, "message": "tasks/update requires taskId"}
-        elif not self._client_supports_tasks(session_id=session_id, params=params):
-            error = {
-                "code": -32003,
-                "message": "Missing required client capability",
-                "data": {
-                    "requiredCapabilities": {
-                        "extensions": {MCP_TASKS_EXTENSION_ID: {}}
-                    }
-                },
-            }
-        else:
-            with self._jobs_lock:
-                job = self._jobs.get(task_id)
-                access_error = self._task_access_error(task_id, job, session_id)
-            if access_error is not None:
-                error = access_error
-            else:
-                responses = params.get("inputResponses")
-                if not isinstance(responses, dict) or not responses:
-                    error = {
-                        "code": -32602,
-                        "message": "tasks/update requires inputResponses",
-                    }
-                else:
-                    error = self._task_deliver_input(task_id, responses)
-                    if error is None:
-                        result = {"resultType": "complete"}
-        return result, error
-
-    def _rpc_tasks_cancel(self, ctx):
-        # type: (_RequestContext) -> tuple
-        """Handle the JSON-RPC `tasks/cancel` method."""
-        params, session_id = ctx.params, ctx.session_id
-        result = None
-        error = None
-
-        task_id = params.get("taskId")
-        if not isinstance(task_id, str) or not task_id:
-            error = {"code": -32602, "message": "tasks/cancel requires taskId"}
-        elif not self._client_supports_tasks(session_id=session_id, params=params):
-            error = {
-                "code": -32003,
-                "message": "Missing required client capability",
-                "data": {
-                    "requiredCapabilities": {
-                        "extensions": {MCP_TASKS_EXTENSION_ID: {}}
-                    }
-                },
-            }
-        else:
-            callbacks = []
-            with self._jobs_lock:
-                job = self._jobs.get(task_id)
-                access_error = self._task_access_error(task_id, job, session_id)
-                if access_error is None and job.get("status") in (
-                        "running", "input_required"):
-                    job["status"] = "cancelled"
-                    job["lastUpdatedAt"] = self._utc_now()
-                    event = job.get("cancel_event")
-                    if event is not None:
-                        event.set()
-                    waiting = job.get("input_event")
-                    if waiting is not None:
-                        waiting.set()
-                    callbacks = list(job.get("cancel_callbacks") or [])
-            if access_error is not None:
-                error = access_error
-            else:
-                # Outside the lock: callbacks kill process groups and
-                # must not block every other job's bookkeeping.
-                self._fire_cancel_callbacks(task_id, callbacks)
-                if callbacks or job is not None:
-                    self._notify_task_status(task_id)
-                result = {"resultType": "complete"}
-        return result, error
 
     def _rpc_tools_list(self, ctx):
         # type: (_RequestContext) -> tuple
