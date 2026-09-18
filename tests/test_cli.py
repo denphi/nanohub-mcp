@@ -210,3 +210,99 @@ def test_python_env_ignores_packages_beside_an_installed_launcher(monkeypatch, t
 
     # The whole point: nothing beside the launcher is reachable at all.
     assert os.path.realpath(str(launcher_site)) not in _real_paths(loaded["sys_path"])
+
+
+# ---------------------------------------------------------------------------
+# nanoHUB session detection and the weber proxy path
+# ---------------------------------------------------------------------------
+
+def _write_resources(tmp_path, **fields):
+    """Write a resources file in the shape nanoHUB's session manager emits."""
+    lines = []
+    for key, value in fields.items():
+        lines.append('{} {}'.format(key, value))
+    path = tmp_path / "resources"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_session_detection_requires_both_env_vars(monkeypatch, tmp_path):
+    from nanohubmcp import cli
+
+    monkeypatch.delenv("SESSION", raising=False)
+    monkeypatch.delenv("SESSIONDIR", raising=False)
+    assert cli.is_nanohub_environment() is False
+
+    monkeypatch.setenv("SESSION", "12345")
+    assert cli.is_nanohub_environment() is False, "SESSION alone is not a session"
+
+    monkeypatch.setenv("SESSIONDIR", str(tmp_path))
+    assert cli.is_nanohub_environment() is True
+
+    # SESSION_ID / SESSION_DIR are accepted aliases.
+    monkeypatch.delenv("SESSION")
+    monkeypatch.delenv("SESSIONDIR")
+    monkeypatch.setenv("SESSION_ID", "9911")
+    monkeypatch.setenv("SESSION_DIR", str(tmp_path))
+    assert cli.is_nanohub_environment() is True
+
+
+def test_proxy_path_is_built_from_the_resources_file(monkeypatch, tmp_path):
+    """The weber path is {session}/{cookie}/{port % 1000} — every deployed
+    tool is reached through it, so the modulo matters."""
+    from nanohubmcp import cli
+
+    _write_resources(tmp_path, hub_url='"https://nanohub.org"',
+                     filexfer_port=28302, filexfer_cookie="abc123")
+    monkeypatch.setenv("SESSION", "9911")
+    monkeypatch.setenv("SESSIONDIR", str(tmp_path))
+
+    prefix, proxy_url, full_port = cli.get_proxy_addr()
+    assert prefix == "/weber/9911/abc123/302/"
+    assert proxy_url == "https://proxy.nanohub.org/weber/9911/abc123/302/"
+    assert full_port == 28302
+
+
+def test_proxy_path_is_none_off_session_or_with_an_incomplete_file(monkeypatch, tmp_path):
+    from nanohubmcp import cli
+
+    monkeypatch.delenv("SESSION", raising=False)
+    monkeypatch.delenv("SESSIONDIR", raising=False)
+    assert cli.get_proxy_addr() == (None, None, None)
+
+    monkeypatch.setenv("SESSION", "9911")
+    monkeypatch.setenv("SESSIONDIR", str(tmp_path))
+    # No resources file at all.
+    assert cli.get_proxy_addr() == (None, None, None)
+
+    # Present but missing the cookie: must not build a half-formed path.
+    _write_resources(tmp_path, hub_url='"https://nanohub.org"', filexfer_port=28302)
+    assert cli.get_proxy_addr() == (None, None, None)
+
+
+def test_normalize_prefix_always_brackets_with_slashes():
+    from nanohubmcp import cli
+
+    for raw in ("weber/a/b/1", "/weber/a/b/1", "weber/a/b/1/", "/weber/a/b/1/"):
+        assert cli.normalize_prefix(raw) == "/weber/a/b/1/", raw
+
+
+def test_route_header_mode_resolves_the_two_flags():
+    """Default is "auto"; each flag forces one direction."""
+    import argparse
+
+    from nanohubmcp import cli
+
+    def args(**kw):
+        ns = argparse.Namespace(require_route_headers=False,
+                                allow_missing_route_headers=False)
+        for key, value in kw.items():
+            setattr(ns, key, value)
+        return ns
+
+    assert cli._route_header_mode(args()) == "auto"
+    assert cli._route_header_mode(args(require_route_headers=True)) is True
+    assert cli._route_header_mode(args(allow_missing_route_headers=True)) is False
+    # Explicitly off wins over explicitly on: the escape hatch must be reliable.
+    assert cli._route_header_mode(
+        args(require_route_headers=True, allow_missing_route_headers=True)) is False

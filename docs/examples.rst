@@ -738,3 +738,173 @@ Full source: ``examples/simulator/start_mcp.py``
    *"Calculate the volume of 1 mole of an ideal gas at 300 K and 100,000 Pa. Then, if we treat a
    single gas particle as having a rest mass of 6.64e-27 kg (Helium-4) moving at 1000 m/s, what
    is its relativistic kinetic energy?"*
+
+
+Skills (SEP-2640)
+------------------
+
+Serves a **skill** — a ``SKILL.md`` plus supporting files — as MCP
+resources, alongside the tool the skill's instructions point at. See
+:doc:`api` for the full ``@server.skill()`` reference.
+
+.. code-block:: python
+
+   from pathlib import Path
+   from nanohubmcp import MCPServer, ToolResult
+
+   server = MCPServer("skills-demo", version="1.0.0")
+
+   _LENGTH_TO_METERS = {"m": 1.0, "um": 1e-6, "nm": 1e-9, "angstrom": 1e-10}
+   _ENERGY_TO_JOULES = {"J": 1.0, "eV": 1.602176634e-19}
+   _GROUPS = {
+       "length": _LENGTH_TO_METERS,
+       "energy": _ENERGY_TO_JOULES,
+       "temperature": {"K", "C"},
+   }
+
+   def _group_of(unit):
+       for group, members in _GROUPS.items():
+           if unit in members:
+               return group
+       return ""
+
+   @server.tool()
+   def convert_units(value, from_unit, to_unit):
+       # type: (float, str, str) -> ToolResult
+       """Convert a value between length, energy, or temperature units."""
+       value = float(value)
+       from_group, to_group = _group_of(from_unit), _group_of(to_unit)
+       if not from_group or not to_group:
+           unknown = from_unit if not from_group else to_unit
+           return ToolResult(content="Unknown unit '{}'.".format(unknown), is_error=True)
+       if from_group != to_group:
+           return ToolResult(
+               content="Cannot convert '{}' ({}) to '{}' ({}): different physical "
+                       "quantities.".format(from_unit, from_group, to_unit, to_group),
+               is_error=True)
+       if from_group == "temperature":
+           kelvin = value if from_unit == "K" else value + 273.15
+           result = kelvin if to_unit == "K" else kelvin - 273.15
+       else:
+           table = _GROUPS[from_group]
+           result = (value * table[from_unit]) / table[to_unit]
+       return ToolResult(content="{:.10g}".format(result))
+
+   @server.skill("unit-conversion")   # -> skill://unit-conversion/SKILL.md
+   def unit_conversion_skill():
+       return Path(__file__).parent / "skills" / "unit-conversion"
+
+   if __name__ == "__main__":
+       server.run(port=8000)
+
+The skill directory (``examples/skills/skills/unit-conversion/``) holds a
+``SKILL.md`` with YAML frontmatter and a ``references/UNITS.md`` the
+instructions point at:
+
+.. code-block:: text
+
+   skills/unit-conversion/
+   ├── SKILL.md
+   └── references/
+       └── UNITS.md
+
+.. code-block:: markdown
+
+   ---
+   name: unit-conversion
+   description: Convert between length, energy, and temperature units
+     commonly used in nanoscale simulations using this server's
+     convert_units tool
+   ---
+
+   # Unit Conversion
+   ...
+   See `references/UNITS.md` for the full table of supported units.
+
+Test it — enumerate the skill:
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8000/ \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":1,"method":"skills/list","params":{}}'
+
+.. code-block:: json
+
+   {
+     "jsonrpc": "2.0",
+     "id": 1,
+     "result": {
+       "skills": [
+         {
+           "uri": "skill://unit-conversion/SKILL.md",
+           "frontmatter": {
+             "name": "unit-conversion",
+             "description": "Convert between length, energy, and temperature units..."
+           },
+           "resources": [
+             {"uri": "skill://unit-conversion/SKILL.md", "digest": "sha256:...", "size": 1621},
+             {"uri": "skill://unit-conversion/references/UNITS.md", "digest": "sha256:...", "size": 813}
+           ]
+         }
+       ]
+     }
+   }
+
+Fetch one skill directly by URI, listed or not:
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8000/ \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":2,"method":"skills/get","params":{"uri":"skill://unit-conversion/SKILL.md"}}'
+
+Read a supporting file with the standard ``resources/read``:
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8000/ \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"skill://unit-conversion/references/UNITS.md"}}'
+
+List a directory's direct children (gated behind the ``directoryRead``
+capability setting, declared once any skill is registered):
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8000/ \
+     -H "Content-Type: application/json" \
+     -d '{"jsonrpc":"2.0","id":4,"method":"resources/directory/read","params":{"uri":"skill://unit-conversion"}}'
+
+.. code-block:: json
+
+   {
+     "jsonrpc": "2.0",
+     "id": 4,
+     "result": {
+       "resources": [
+         {"uri": "skill://unit-conversion/SKILL.md", "name": "SKILL.md", "mimeType": "text/markdown"},
+         {"uri": "skill://unit-conversion/references", "name": "references", "mimeType": "inode/directory"}
+       ]
+     }
+   }
+
+And call the tool the skill's instructions point at:
+
+.. code-block:: bash
+
+   curl -X POST http://localhost:8000/tools/convert_units \
+     -H "Content-Type: application/json" \
+     -d '{"value": 5.43, "from_unit": "angstrom", "to_unit": "nm"}'
+
+Full source: ``examples/skills/start_mcp.py``
+
+**Sample prompts to try with an AI client:**
+
+   *"What skills does this server offer, and what is the unit-conversion skill for?"*
+
+   *"Convert 5.43 angstrom to nanometers."*
+
+   *"A device operates at 300 K — what's that in Celsius?"*
+
+   *"Try converting 1 eV to nanometers and explain why that fails."*

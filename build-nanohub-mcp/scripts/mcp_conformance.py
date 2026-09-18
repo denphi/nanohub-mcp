@@ -6,8 +6,9 @@ One source of truth for the checks that both the offline validator
 apply, so a rule can never drift between "pre-deploy" and "post-deploy".
 
 Covers the core protocol plus the extensions nanohub-mcp implements:
-  * MCP Apps      — io.modelcontextprotocol/ui   (interactive ui:// HTML apps)
-  * MCP Tasks     — io.modelcontextprotocol/tasks (async long-running tools)
+  * MCP Apps      — io.modelcontextprotocol/ui     (interactive ui:// HTML apps)
+  * MCP Tasks     — io.modelcontextprotocol/tasks  (async long-running tools)
+  * MCP Skills    — io.modelcontextprotocol/skills (SEP-2640 skill:// content)
   * Elicitation   — core capability the server *requests* from the client
 
 Everything here is stdlib-only and print_function-safe so it runs in the same
@@ -24,6 +25,19 @@ import re
 MCP_APP_MIME = "text/html;profile=mcp-app"
 APPS_EXTENSION_ID = "io.modelcontextprotocol/ui"
 TASKS_EXTENSION_ID = "io.modelcontextprotocol/tasks"
+SKILLS_EXTENSION_ID = "io.modelcontextprotocol/skills"
+
+# SEP-2640 skills. A skill is a directory of files (minimally SKILL.md) served
+# as individually addressable resources; `skills/list` publishes a complete
+# manifest (every file's sha256 digest and byte size) that a host verifies
+# reads against, so a wrong manifest is not cosmetic — it makes the host
+# refuse the file.
+SKILL_MD_SUFFIX = "/SKILL.md"
+SKILL_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+# Per-skill limits every conforming host must accept, and past which a server
+# SHOULD NOT serve a skill (SEP-2640 "Limits").
+SKILL_MAX_RESOURCES = 512
+SKILL_MAX_TOTAL_BYTES = 16 * 1024 * 1024  # 16 MiB
 
 # ext-apps (io.modelcontextprotocol/ui) app<->host postMessage handshake.
 UI_INITIALIZE = "ui/initialize"
@@ -164,7 +178,105 @@ def check_app_handshake(html):
     return errors, warnings
 
 
-def expected_extensions(has_apps, has_async_tools):
+def check_skill_entry(entry):
+    """Validate one `skills/list` / `skills/get` entry against SEP-2640.
+
+    Returns ``(errors, warnings)``. The entry is the unit a host verifies
+    every later read against, so each rule here has a consequence at the
+    host: a malformed manifest means the skill does not load at all, and a
+    digest that does not match the bytes served means the file is rejected
+    as tampered.
+    """
+    errors = []
+    warnings = []
+
+    if not isinstance(entry, dict):
+        return ["skill entry is {}, not an object".format(type(entry).__name__)], []
+
+    uri = entry.get("uri")
+    if not isinstance(uri, str) or not uri:
+        errors.append("skill entry has no string 'uri'")
+        uri = ""
+    elif not uri.endswith(SKILL_MD_SUFFIX):
+        errors.append(
+            "skill uri {!r} must be the skill's SKILL.md — a skill is addressed "
+            "by 'skill://<skill-path>/SKILL.md', not by its directory".format(uri))
+
+    frontmatter = entry.get("frontmatter")
+    if not isinstance(frontmatter, dict):
+        errors.append("skill {!r}: 'frontmatter' must be the SKILL.md YAML "
+                      "frontmatter as an object".format(uri))
+        frontmatter = {}
+    name = frontmatter.get("name")
+    if not isinstance(name, str) or not name:
+        errors.append("skill {!r}: frontmatter.name is required".format(uri))
+    elif uri.endswith(SKILL_MD_SUFFIX):
+        # The final <skill-path> segment MUST equal the frontmatter name, which
+        # is what lets a host recover the name from the URI alone.
+        final_segment = uri[:-len(SKILL_MD_SUFFIX)].rsplit("/", 1)[-1]
+        if final_segment != name:
+            errors.append(
+                "skill {!r}: frontmatter.name {!r} must equal the final path "
+                "segment {!r}".format(uri, name, final_segment))
+    if not frontmatter.get("description"):
+        errors.append("skill {!r}: frontmatter.description is required — it is "
+                      "what the host shows the model to decide relevance".format(uri))
+
+    resources = entry.get("resources")
+    if resources == "dynamic":
+        warnings.append(
+            "skill {!r} declares 'resources: dynamic': it offers no content "
+            "integrity and cannot be content-bound, and some hosts decline to "
+            "load such skills".format(uri))
+        return errors, warnings
+    if not isinstance(resources, list):
+        errors.append("skill {!r}: 'resources' must be an array of "
+                      "{{uri, digest, size}} or the string \"dynamic\"".format(uri))
+        return errors, warnings
+
+    total = 0
+    seen = set()
+    for item in resources:
+        if not isinstance(item, dict):
+            errors.append("skill {!r}: resources entry is not an object".format(uri))
+            continue
+        item_uri = item.get("uri")
+        if not isinstance(item_uri, str) or not item_uri:
+            errors.append("skill {!r}: a resources entry has no 'uri'".format(uri))
+        elif item_uri in seen:
+            errors.append("skill {!r}: {!r} listed twice; each file appears "
+                          "exactly once".format(uri, item_uri))
+        else:
+            seen.add(item_uri)
+        digest = item.get("digest")
+        if not isinstance(digest, str) or not SKILL_DIGEST_RE.match(digest):
+            errors.append(
+                "skill {!r}: {!r} digest {!r} must be 'sha256:' + 64 lowercase "
+                "hex chars".format(uri, item_uri, digest))
+        size = item.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            errors.append("skill {!r}: {!r} needs an integer byte 'size'".format(
+                uri, item_uri))
+        else:
+            total += size
+
+    if uri and uri not in seen:
+        errors.append(
+            "skill {!r}: 'resources' must be complete and include the SKILL.md "
+            "itself; a file missing from it is unreadable to a conforming "
+            "host".format(uri))
+    if len(resources) > SKILL_MAX_RESOURCES:
+        warnings.append("skill {!r} has {} files, over the {}-file limit hosts "
+                        "are required to accept".format(
+                            uri, len(resources), SKILL_MAX_RESOURCES))
+    if total > SKILL_MAX_TOTAL_BYTES:
+        warnings.append("skill {!r} totals {} bytes, over the {}-byte limit "
+                        "hosts are required to accept".format(
+                            uri, total, SKILL_MAX_TOTAL_BYTES))
+    return errors, warnings
+
+
+def expected_extensions(has_apps, has_async_tools, has_skills=False):
     """The extension IDs a server with these features MUST advertise at
     ``initialize`` (per nanohubmcp/server.py _get_capabilities)."""
     expected = {}
@@ -172,4 +284,6 @@ def expected_extensions(has_apps, has_async_tools):
         expected[APPS_EXTENSION_ID] = {"mimeTypes": [MCP_APP_MIME]}
     if has_async_tools:
         expected[TASKS_EXTENSION_ID] = {}
+    if has_skills:
+        expected[SKILLS_EXTENSION_ID] = {"directoryRead": True}
     return expected

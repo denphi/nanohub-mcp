@@ -30,8 +30,10 @@ from mcp_conformance import (  # noqa: E402
     MCP_APP_MIME,
     APPS_EXTENSION_ID,
     TASKS_EXTENSION_ID,
+    SKILLS_EXTENSION_ID,
     ELICITATION_METHOD,
     check_app_handshake,
+    check_skill_entry,
     expected_extensions,
 )
 
@@ -141,15 +143,46 @@ def check_security_hints(report, label, handler, schema):
             report.warn("{}: input '{}' has no description/units".format(label, name))
 
 
-def check_extensions(report, server, has_apps, has_async):
+def check_skills(report, server):
+    """Validate every registered SEP-2640 skill's published entry offline.
+
+    The entry is what a host verifies later reads against, so a wrong
+    manifest is caught here rather than as an unexplained "skill won't
+    load" after deployment.
+    """
+    skills = getattr(server, "_skills", None)
+    if not skills:
+        return 0
+    for uri in sorted(skills):
+        try:
+            entry = skills[uri]["definition"].to_dict()
+        except Exception as exc:  # pragma: no cover - framework shape drift
+            report.warn("could not read skill {} ({}); skipping".format(uri, exc))
+            continue
+        errors, warnings = check_skill_entry(entry)
+        for message in errors:
+            report.error(message)
+        for message in warnings:
+            report.warn(message)
+    report.info("skills registered: {}".format(", ".join(sorted(skills))))
+    return len(skills)
+
+
+def check_extensions(report, server, has_apps, has_async, has_skills=False):
     """Confirm the server advertises the extensions its features require.
 
-    Offline surrogate for the live "does initialize advertise ui/tasks?" check:
-    call the framework's own `_get_capabilities()` and compare its `extensions`
-    to what a server with these features must declare. Catches, e.g., an app
-    resource that won't be renderable because the capability was suppressed.
+    Offline surrogate for the live "does initialize advertise ui/tasks/skills?"
+    check: call the framework's own `_get_capabilities()` and compare its
+    `extensions` to what a server with these features must declare. Catches,
+    e.g., an app resource that won't be renderable because the capability was
+    suppressed.
     """
-    expected = expected_extensions(has_apps, has_async)
+    triggers = {
+        APPS_EXTENSION_ID: "ui:// app resources",
+        TASKS_EXTENSION_ID: "async tools",
+        SKILLS_EXTENSION_ID: "registered skills",
+    }
+    expected = expected_extensions(has_apps, has_async, has_skills)
     try:
         caps = server._get_capabilities().to_dict()
     except Exception as exc:  # pragma: no cover - framework shape drift
@@ -162,12 +195,18 @@ def check_extensions(report, server, has_apps, has_async):
         if ext_id not in advertised:
             report.error("extension {} must be advertised at initialize (server "
                          "has {}) but is absent from capabilities".format(
-                             ext_id, "apps" if ext_id == APPS_EXTENSION_ID else "async tools"))
+                             ext_id, triggers.get(ext_id, "the feature")))
         elif ext_id == APPS_EXTENSION_ID:
             mimes = (advertised.get(ext_id) or {}).get("mimeTypes") or []
             if MCP_APP_MIME not in mimes:
                 report.error("extension {} advertises mimeTypes {} — must include "
                              "{!r}".format(ext_id, mimes, MCP_APP_MIME))
+    if has_skills and not caps.get("resources"):
+        # SEP-2640: a server declaring the skills extension MUST also declare
+        # the base resources capability — skill files are read with
+        # resources/read, and a host that respects capabilities won't try.
+        report.error("skills are registered but the base 'resources' capability "
+                     "is not advertised; skill files are read via resources/read")
     if expected:
         report.info("extensions advertised: {}".format(", ".join(sorted(advertised)) or "none"))
 
@@ -305,9 +344,13 @@ def validate(server, render_apps=False, limit_mb=8.0):
             (report.error if size > limit_bytes else report.info)(
                 "{}: {:.2f} MB ({})".format(label, size / 1048576.0, status))
 
+    # ── Skills (SEP-2640): validate each published manifest ─────────────────
+    n_skills = check_skills(report, server)
+
     # ── Extension advertisement (offline: call the server's own capability
     # logic and confirm it declares what its features require) ───────────────
-    check_extensions(report, server, has_apps=n_apps > 0, has_async=n_async > 0)
+    check_extensions(report, server, has_apps=n_apps > 0, has_async=n_async > 0,
+                     has_skills=n_skills > 0)
 
     # ── Elicitation usage hygiene ───────────────────────────────────────────
     check_elicitation_usage(report, tools)

@@ -50,6 +50,7 @@ skill/references/connecting-clients
 skill/references/troubleshooting
 skill/references/verification
 skill/references/mcp-apps
+skill/references/skills
 skill/references/elicitation
 skill/references/quota-and-etiquette
 skill/references/oauth-dcr

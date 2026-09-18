@@ -1,5 +1,138 @@
 # Changelog
 
+## 0.4.4
+
+Completes the 2026-07-28 transport surface, fixes three header-validation
+bugs introduced with it in 0.4.0, and adds the SEP-2640 Skills Extension.
+
+### Fixed
+
+- **`Mcp-Name` ignored `params.uri`.** The header's source is `params.name` for
+  `tools/call` and `prompts/get` but `params.uri` for `resources/read`, so
+  resource reads were never validated against their header.
+- **Base64 sentinel values were rejected as mismatches.** A client MUST wrap any
+  value that is not plain visible ASCII as `=?base64?…?=`, and a server MUST
+  decode before comparing. Resource URIs are the common case.
+- **Header names were compared case-sensitively.** RFC 9110 field names are
+  case-insensitive and both sides MUST treat them so.
+- **A blob resource emitted `"text": ""` alongside its blob.** The spec splits
+  these into `TextResourceContents` (requires `text`) and
+  `BlobResourceContents` (requires `blob`); sending both matched neither
+  variant cleanly and read as empty text to a strict client.
+
+### Added
+
+- **SEP-2640 Skills Extension** — `@server.skill(skill_path)` registers a
+  directory (a `SKILL.md` plus supporting files) served as individually
+  addressable resources under `skill://<skill_path>/<file-path>`. Adds
+  `skills/list` and `skills/get`, and `resources/directory/read` for
+  navigating a skill's subdirectories; `resources/read` serves each file
+  (text or, for binary content, a base64 `blob`). Every file's SHA-256
+  digest and size are computed once at registration, so listings and
+  `skills/get` answer without touching disk again. Dotfiles and
+  dot-directories are excluded from the walk, so a skill directory that is a
+  git checkout does not publish `.git/config` or `.env`. Declared under
+  `capabilities.extensions["io.modelcontextprotocol/skills"]`, with
+  `directoryRead: true`, only once a skill is registered; `resources` is
+  advertised too, as the extension requires, even with no plain
+  `@server.resource()` in use.
+- **`MCP-Protocol-Version` header validation** — it MUST match the body's
+  `_meta` protocol version; a disagreement is `HeaderMismatch` (`-32020`).
+- **`x-mcp-header` / `Mcp-Param-{Name}`** — a tool may annotate an input-schema
+  property so clients mirror that argument into a header. The server validates
+  the mirrored value against the body, decoding the Base64 sentinel and
+  comparing numbers numerically. Only statically reachable properties (a chain
+  of `properties` keys) are honoured, as the spec requires.
+- **Resource subscriptions** — `subscriptions/listen` accepts
+  `resourceSubscriptions`, and `server.resource_updated(uri)` emits
+  `notifications/resources/updated` to exactly the subscribers watching that
+  URI. Re-registering a resource fires it too. `resources.subscribe` is now
+  advertised when the server has resources. This was the last unimplemented
+  filter.
+- **Cursor pagination** — `MCPServer(..., list_page_size=N)` paginates
+  `tools/list`, `resources/list` and `prompts/list` with an opaque
+  `nextCursor`. **Off by default**: with no page size the whole list is
+  returned exactly as before. A cursor the server did not mint is `-32602`.
+- `prompts/list` is now returned in a deterministic order, as `tools/list`
+  already was.
+
+### Security and robustness (found in successive review passes)
+
+- **MRTR request state is bound to its session**, as tasks already were. A
+  `requestState` is presented by the client, so without an owner check a second
+  session naming another's in-flight state inherited answers a different user
+  gave — including an approval it never asked for. A save also never rebinds an
+  existing state to a new owner: doing so would let any session permanently
+  break another's request just by naming its id.
+- **Subscriptions per session are capped.** Subscription ids are the client's
+  own JSON-RPC request ids, so the count was client-controlled and unbounded
+  until the session ended.
+- **A cancelled task waiting on input now reports the cancellation.**
+  Cancellation wakes the same event an answer does, so the handler saw "no
+  response supplied" — a tool failing closed on `RuntimeError` recorded the
+  wrong cause.
+- **`Origin` is validated on every method**, not only POST: the SSE stream is a
+  long-lived channel a page can open cross-origin with `EventSource`.
+- **Cursor paging no longer skips entries.** The cursor carries the last key
+  rather than an offset. With dynamic registration in the same release,
+  removing an entry ahead of an offset cursor shifted the list down and one
+  entry was never returned at all.
+- **A latent lock inversion** in `_unregister_client`, which nested
+  subscriptions inside sessions where every other path takes them the other way
+  round.
+- **Malformed `resources/read` / `prompts/get` params are `-32602`.** A
+  non-string `uri` reached a dict lookup and raised `TypeError`, surfacing as
+  an internal error with a stack trace per bad request.
+
+### Hardening (found in a second review pass)
+
+- **`x-mcp-header` annotations are validated at registration.** An invalid one
+  is not a cosmetic problem: a conforming client **MUST** exclude the whole
+  tool from `tools/list`, so the tool silently vanished for the user with
+  nothing reported anywhere. The server now refuses to register it, checking
+  every constraint the spec sets — non-empty, valid HTTP field-name token (so a
+  CRLF injection attempt is rejected), case-insensitively unique, applied only
+  to `string`/`integer`/`boolean`, and statically reachable through a chain of
+  `properties` keys only. The validated map is cached, so `tools/call` no
+  longer re-walks the schema.
+- **`Origin` validation** for DNS-rebinding protection, which the transport
+  spec requires: `run(allowed_origins=[...])` refuses a browser request from
+  an origin outside the list with HTTP 403. Off by default — a library cannot
+  know which origins are legitimate — and requests without an `Origin` (every
+  non-browser client) are never affected. **Set it in any deployment a browser
+  can reach.**
+
+### Also fixed (found reviewing the above before release)
+
+- A cursor error raised `ValueError`, and the handler caught `ValueError`
+  broadly — so a genuine server-side error (a reserved `_meta` prefix, an
+  unsupported elicitation mode) was reported to the caller as `-32602` Invalid
+  params, blaming them for a server bug. Cursor errors now use a dedicated
+  exception and everything else stays `-32603`.
+- `MCP-Protocol-Version` was compared against the server's *resolved* version,
+  which falls back to the session's negotiation and then to a default. A
+  2025-06-18 client — whose revision defines the header but carries no `_meta`
+  — was rejected whenever the gateway dropped its session id. It is now
+  compared only against a version the body actually declares.
+- Registering a resource for the first time emitted
+  `notifications/resources/updated`; only replacing a handler is an update.
+- `resources/list` is now returned in a deterministic order, like `tools/list`
+  and `prompts/list` — required for offset paging to be walkable.
+
+### Testing
+
+- Coverage 75% → 83%; 112 → 192 tests.
+- New `tests/test_schema_inference.py` covers type-expression inference and
+  wire serialisation directly — both are contract surfaces a happy-path
+  integration test never exercises. The blob bug above was found writing it.
+- New tests for the MRTR sampling, roots and URL-elicitation routes, multi-round
+  answer accumulation, the nanoHUB weber proxy path, and the CLI flag
+  resolution.
+- New `tests/test_protocol_branches.py` and `tests/test_context_and_annotations.py`
+  cover the task/prompt error branches, tool-annotation validation (a misspelled
+  hint is dropped silently by clients, so it raises at decoration time instead),
+  and the Context surface off-session.
+
 ## 0.4.3
 
 ### Fixed

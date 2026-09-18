@@ -175,8 +175,17 @@ class ResourceContent(object):
     ):
         # type: (...) -> None
         self.uri = uri
-        # Support both 'content' and 'text' for compatibility
-        self.text = text if text is not None else content
+        # Support both 'content' and 'text' for compatibility.
+        # A blob resource emits no `text` at all: the spec splits these into
+        # TextResourceContents (requires text) and BlobResourceContents
+        # (requires blob), so sending an empty string alongside a blob matches
+        # neither variant cleanly and reads as empty text to a strict client.
+        if text is not None:
+            self.text = text
+        elif content or blob is None:
+            self.text = content
+        else:
+            self.text = None
         self.blob = blob  # base64 encoded
         self.mime_type = mime_type
 
@@ -230,6 +239,36 @@ class ResourceResult(object):
 
 # Backwards compatibility alias
 ReadResourceResult = ResourceResult
+
+
+class Skill(object):
+    """
+    MCP Skill entry (SEP-2640 Skills Extension).
+
+    Returned by skills/list and skills/get: a skill's SKILL.md URI, its
+    frontmatter verbatim, and a manifest of every file it serves.
+    """
+
+    def __init__(
+        self,
+        uri,  # type: str
+        frontmatter,  # type: Dict[str, Any]
+        resources  # type: Union[List[Dict[str, Any]], str]
+    ):
+        # type: (...) -> None
+        self.uri = uri
+        self.frontmatter = frontmatter
+        # Either a list of {"uri", "digest", "size"} entries, or the literal
+        # string "dynamic" for a skill whose content has no stable digests.
+        self.resources = resources
+
+    def to_dict(self):
+        # type: () -> Dict[str, Any]
+        return {
+            "uri": self.uri,
+            "frontmatter": self.frontmatter,
+            "resources": self.resources,
+        }
 
 
 class Message(object):
@@ -355,8 +394,8 @@ class ServerCapabilities(object):
     """Server capabilities advertised during initialization."""
 
     def __init__(self, tools=False, resources=False, prompts=False, logging=False,
-                 extensions=None, list_changed=False):
-        # type: (bool, bool, bool, bool, Optional[Dict[str, Any]], bool) -> None
+                 extensions=None, list_changed=False, subscribe=False):
+        # type: (bool, bool, bool, bool, Optional[Dict[str, Any]], bool, bool) -> None
         self.tools = tools
         self.resources = resources
         self.prompts = prompts
@@ -365,6 +404,8 @@ class ServerCapabilities(object):
         # True once the server can gain or lose tools/resources/prompts after
         # start-up, which is what makes a listChanged notification meaningful.
         self.list_changed = list_changed
+        # True when the server can emit notifications/resources/updated.
+        self.subscribe = subscribe
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
@@ -374,7 +415,8 @@ class ServerCapabilities(object):
         if self.tools:
             caps["tools"] = {"listChanged": changed}  # Not empty to ensure {} in JSON
         if self.resources:
-            caps["resources"] = {"listChanged": changed, "subscribe": False}
+            caps["resources"] = {"listChanged": changed,
+                                 "subscribe": bool(self.subscribe)}
         if self.prompts:
             caps["prompts"] = {"listChanged": changed}
         if self.logging:

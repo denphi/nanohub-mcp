@@ -34,6 +34,8 @@ Run against a local server first; the hub deployment is not your working tree.
 from __future__ import print_function
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import sys
@@ -46,8 +48,10 @@ from mcp_conformance import (  # noqa: E402
     MCP_APP_MIME,
     APPS_EXTENSION_ID,
     TASKS_EXTENSION_ID,
+    SKILLS_EXTENSION_ID,
     PROTOCOL_2026_07_28,
     check_app_handshake,
+    check_skill_entry,
 )
 
 # Client capabilities we advertise so the server exposes everything it can:
@@ -57,6 +61,7 @@ _CLIENT_CAPABILITIES = {
     "extensions": {
         APPS_EXTENSION_ID: {"mimeTypes": [MCP_APP_MIME]},
         TASKS_EXTENSION_ID: {},
+        SKILLS_EXTENSION_ID: {},
     },
 }
 
@@ -245,6 +250,89 @@ def run(url, token=None, call_tool=None, tool_args=None, task_tool=None,
         rep.check("error" not in cr, "tools/call {} accepted".format(task_tool),
                   json.dumps(cr)[:200])
 
+    # ── skills extension (SEP-2640) ─────────────────────────────────────────
+    print("== extension: MCP Skills (io.modelcontextprotocol/skills) ==")
+    skills_advertised = SKILLS_EXTENSION_ID in advertised
+    _c, sl = d.request("skills/list")
+    if skills_advertised:
+        # Declaring the extension commits the server to both methods.
+        listed = (sl.get("result") or {}).get("skills")
+        rep.check(isinstance(listed, list), "skills/list returns a skills array",
+                  json.dumps(sl)[:200])
+        rep.check(bool(caps.get("resources")),
+                  "skills extension => base 'resources' capability advertised",
+                  "skill files are read with resources/read")
+        for entry in (listed or []):
+            uri = (entry or {}).get("uri", "?")
+            errors, warnings = check_skill_entry(entry)
+            rep.check(not errors, "skill {} entry conformant".format(uri),
+                      "; ".join(errors))
+            for w in warnings:
+                rep.info("warn: {}".format(w))
+
+            # skills/get MUST answer for every skill the server serves, with
+            # the same entry the listing carried.
+            _c, sg = d.request("skills/get", {"uri": uri})
+            fetched = (sg.get("result") or {}).get("skill")
+            rep.check(fetched == entry,
+                      "skills/get {} matches the listing entry".format(uri),
+                      json.dumps(sg)[:200])
+
+            # Every manifest entry must actually be readable, and the bytes
+            # must match the digest the manifest published — that comparison
+            # is exactly what a host does before it will use the content.
+            for item in (entry.get("resources") or []):
+                if not isinstance(item, dict):
+                    continue
+                item_uri = item.get("uri")
+                _c, rr = d.request("resources/read", {"uri": item_uri})
+                contents = (rr.get("result") or {}).get("contents") or []
+                if not rep.check(bool(contents), "resources/read {}".format(item_uri),
+                                 json.dumps(rr)[:160]):
+                    continue
+                first = contents[0] if isinstance(contents[0], dict) else {}
+                if "text" in first:
+                    raw = (first.get("text") or "").encode("utf-8")
+                elif "blob" in first:
+                    try:
+                        raw = base64.b64decode(first.get("blob") or "")
+                    except Exception:
+                        rep.check(False, "{} blob is valid base64".format(item_uri))
+                        continue
+                else:
+                    rep.check(False, "{} returned neither text nor blob".format(item_uri))
+                    continue
+                actual = "sha256:" + hashlib.sha256(raw).hexdigest()
+                rep.check(actual == item.get("digest"),
+                          "{} content matches published digest".format(item_uri),
+                          "manifest {} vs actual {}".format(item.get("digest"), actual))
+                rep.check(len(raw) == item.get("size"),
+                          "{} content matches published size".format(item_uri),
+                          "manifest {} vs actual {}".format(item.get("size"), len(raw)))
+
+        # directoryRead is opt-in; only probe it when the server claims it.
+        if (advertised.get(SKILLS_EXTENSION_ID) or {}).get("directoryRead") and listed:
+            root = str(listed[0].get("uri", ""))[:-len("/SKILL.md")]
+            _c, dr = d.request("resources/directory/read", {"uri": root})
+            children = (dr.get("result") or {}).get("resources")
+            rep.check(isinstance(children, list),
+                      "resources/directory/read {} lists children".format(root),
+                      json.dumps(dr)[:200])
+            rep.check(any(str(c.get("uri", "")).endswith("/SKILL.md")
+                          for c in (children or []) if isinstance(c, dict)),
+                      "{} lists its SKILL.md".format(root))
+
+        # An unknown skill URI is Invalid Params, the same code resources/read
+        # uses for an unknown resource.
+        _c, miss = d.request("skills/get", {
+            "uri": "skill://conformance-nonexistent-{}/SKILL.md".format(uuid.uuid4().hex)})
+        rep.check((miss.get("error") or {}).get("code") == -32602,
+                  "skills/get on an unknown uri is -32602", json.dumps(miss)[:160])
+    else:
+        # Not advertised: the methods must not silently answer as though they
+        # were, but a plain "method not found" is the correct reply.
+        rep.info("skills extension not advertised (server serves no skills)")
+
     # ── elicitation ─────────────────────────────────────────────────────────
     print("== core: elicitation ==")
     # We declared elicitation at initialize; a conformant server accepted it
@@ -266,7 +354,16 @@ def run(url, token=None, call_tool=None, tool_args=None, task_tool=None,
         "io.modelcontextprotocol/protocolVersion": PROTOCOL_2026_07_28,
         "io.modelcontextprotocol/clientCapabilities": {},
     }
-    _c, discover = d.request("server/discover", {"_meta": modern_meta})
+    # 2026-07-28 makes the routing headers mandatory, so a probe that sends
+    # only `_meta` is rejected with -32020 before the check it meant to make
+    # ever runs — which looked like six server failures against a perfectly
+    # conformant server.
+    def modern_headers(method):
+        return {"Mcp-Method": method,
+                "MCP-Protocol-Version": PROTOCOL_2026_07_28}
+
+    _c, discover = d.request("server/discover", {"_meta": modern_meta},
+                             headers=modern_headers("server/discover"))
     if "error" in discover and discover["error"].get("code") == -32601:
         rep.info("server/discover absent — server predates 2026-07-28 (skipped)")
     else:
@@ -281,7 +378,8 @@ def run(url, token=None, call_tool=None, tool_args=None, task_tool=None,
         rep.check(PROTOCOL_2026_07_28 in (result.get("supportedVersions") or []),
                   "2026-07-28 advertised in supportedVersions")
 
-        _c, listed = d.request("tools/list", {"_meta": modern_meta})
+        _c, listed = d.request("tools/list", {"_meta": modern_meta},
+                               headers=modern_headers("tools/list"))
         lr = listed.get("result", {})
         rep.check(lr.get("resultType") == "complete",
                   "tools/list carries resultType for a 2026-07-28 client")

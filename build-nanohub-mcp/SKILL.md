@@ -1,6 +1,6 @@
 ---
 name: build-nanohub-mcp
-description: Transform scientific Python code into a secure, bounded MCP server built with nanohub-mcp, test it locally and in CI, package it as a nanoHUB headless tool, publish it through HubZero/com_mcp, connect real MCP clients, and diagnose gateway, OAuth, session, CORS, Tasks, Resources, and MCP Apps failures. Use when wrapping a simulation, solver, analysis routine, or scientific workflow for conversational use on nanoHUB, or when repairing a nanoHUB MCP deployment.
+description: Transform scientific Python code into a secure, bounded MCP server built with nanohub-mcp, test it locally and in CI, package it as a nanoHUB headless tool, publish it through HubZero/com_mcp, connect real MCP clients, and diagnose gateway, OAuth, session, CORS, Tasks, Resources, Skills, and MCP Apps failures. Use when wrapping a simulation, solver, analysis routine, or scientific workflow for conversational use on nanoHUB, when shipping agent skills (SKILL.md) alongside a tool, or when repairing a nanoHUB MCP deployment.
 ---
 
 # Build a scientific MCP for nanoHUB
@@ -129,8 +129,11 @@ set (`scripts/mcp_conformance.py`) and together verify conformance to the core
 protocol plus every extension nanohub-mcp implements — **MCP Apps**
 (`io.modelcontextprotocol/ui`, including the `ui/initialize` handshake shape
 that renders blank on strict hosts when wrong), **MCP Tasks**
-(`io.modelcontextprotocol/tasks`), and **elicitation**. See
-[references/mcp-apps.md](references/mcp-apps.md) and
+(`io.modelcontextprotocol/tasks`), **MCP Skills**
+(`io.modelcontextprotocol/skills`, re-hashing every published file against its
+manifest digest exactly as a host does), and **elicitation**. See
+[references/mcp-apps.md](references/mcp-apps.md),
+[references/skills.md](references/skills.md), and
 [references/verification.md](references/verification.md).
 
 ## 5. Package and publish
@@ -179,6 +182,12 @@ for the manual equivalents.
 
 - Use [references/mcp-apps.md](references/mcp-apps.md) for an interactive
   `ui://` application after plain tools work.
+- Use [references/skills.md](references/skills.md) to ship a `SKILL.md` that
+  teaches a model the *procedure* your schemas cannot carry — which tool comes
+  first, what a physically sensible range is, when to refuse. Reach for it when
+  server `instructions` is getting long; skip it if the content is one sentence
+  per tool. Skill content is published to every client and is never an
+  enforcement boundary: tools still validate their own arguments.
 - Use [references/elicitation.md](references/elicitation.md) for capability-
   gated forms and URL flows. Confirmations of risky actions are not optional —
   design them in at step 1.
@@ -192,8 +201,8 @@ for the manual equivalents.
 | Resource | Use |
 |---|---|
 | `scripts/new_tool.py NAME` | Scaffold a secure server, tests, invoke file, validator, docs, and CI |
-| `scripts/validate_server.py APP` | Offline: validate contracts, security hazards, and extension conformance (renders ui:// apps, checks the ext-apps handshake shape) before deployment |
-| `scripts/check_conformance.py URL` | Live: drive a running server and assert core + extension conformance (Apps ⇔ capability advertised + handshake, Tasks, elicitation) over the wire |
+| `scripts/validate_server.py APP` | Offline: validate contracts, security hazards, and extension conformance (renders ui:// apps, checks the ext-apps handshake shape, validates each skill's published manifest) before deployment |
+| `scripts/check_conformance.py URL` | Live: drive a running server and assert core + extension conformance (Apps ⇔ capability advertised + handshake, Tasks, Skills ⇔ manifest digests match served bytes, elicitation) over the wire |
 | `scripts/mcp_conformance.py` | Shared invariant rules imported by both validators so a check can't drift between offline and live |
 | `scripts/smoke_live.sh` | Verify discovery, CORS, OAuth metadata, sessions, resources, and optional Tasks/DCR |
 | [references/security.md](references/security.md) | Apply input, path, process, result, secret, and resource controls |
@@ -206,6 +215,7 @@ for the manual equivalents.
 | [references/troubleshooting.md](references/troubleshooting.md) | Diagnose symptom → cause → fix |
 | [references/verification.md](references/verification.md) | Run local and deployed checks manually |
 | [references/mcp-apps.md](references/mcp-apps.md) | Add an MCP App |
+| [references/skills.md](references/skills.md) | Ship a SKILL.md and supporting files over MCP (SEP-2640) |
 | [references/elicitation.md](references/elicitation.md) | Ask for user input through the MCP session |
 | [references/quota-and-etiquette.md](references/quota-and-etiquette.md) | Control context, calls, storage, and session costs |
 | [references/oauth-dcr.md](references/oauth-dcr.md) | Understand hub-provided OAuth and DCR |

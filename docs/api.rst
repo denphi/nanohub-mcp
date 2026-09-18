@@ -122,6 +122,89 @@ With explicit options:
    widgets consume the data without re-parsing the text block.
 
 
+Resource subscriptions
+----------------------
+
+A client opts in with ``subscriptions/listen``, naming the resource URIs it
+cares about:
+
+.. code-block:: json
+
+   {"jsonrpc":"2.0","id":"sub-1","method":"subscriptions/listen",
+    "params":{"notifications":{"resourceSubscriptions":["config://a"]}}}
+
+The server acknowledges only URIs that exist, so the ack states what will
+actually be watched. Signal a change with:
+
+.. code-block:: python
+
+   server.resource_updated("config://a")   # returns how many subscribers were told
+
+Nothing infers this. A resource handler is just a function, and the server
+cannot know when whatever it reads from has moved underneath — call it when you
+know it has. Re-registering a resource at the same URI fires it automatically,
+since replacing the handler *is* an update.
+
+List pagination
+---------------
+
+Off by default. Set a page size and the three list endpoints paginate with an
+opaque cursor:
+
+.. code-block:: python
+
+   server = MCPServer("mytool", list_page_size=50)
+
+With no page size the whole list is returned and no ``nextCursor`` appears —
+identical to earlier releases. A cursor the server did not mint is rejected as
+``-32602`` (Invalid params) rather than silently restarting the walk.
+
+Mirrored request headers
+------------------------
+
+The Streamable HTTP transport mirrors selected body fields into headers so a
+gateway can route without parsing the body — which only works if the two agree.
+The server validates that, always: a contradicting ``MCP-Protocol-Version``,
+``Mcp-Method``, ``Mcp-Name`` or ``Mcp-Param-*`` is ``HeaderMismatch``
+(``-32020``, HTTP 400).
+
+A tool can ask clients to mirror one of its arguments:
+
+.. code-block:: python
+
+   @server.tool(input_schema={"type": "object", "properties": {
+       "region": {"type": "string", "x-mcp-header": "Region"},
+       "query": {"type": "string"}}, "required": ["region", "query"]})
+   def execute_sql(region, query):
+       """Execute SQL in a named region."""
+
+A conforming client then sends ``Mcp-Param-Region: us-west1``, and the server
+checks it against the argument. Annotations are validated when the tool is
+registered and an invalid one raises immediately — a conforming client is
+required to drop the *entire tool* from ``tools/list`` rather than ignore a bad
+annotation, so failing at import is far kinder than letting the tool disappear
+in deployment.
+
+Origin validation
+-----------------
+
+The transport spec requires servers to validate the ``Origin`` header, since a
+page on any origin can otherwise script requests to a server reachable from the
+victim's browser (DNS rebinding):
+
+.. code-block:: python
+
+   server.run(allowed_origins=["https://claude.ai", "https://nanohub.org"])
+
+A browser request from an origin outside the list gets HTTP 403. It is off by
+default because a library cannot know which origins a deployment considers
+legitimate, and requests with no ``Origin`` — every non-browser client — are
+never affected. **Configure it wherever a browser can reach the server.** Values that are not plain ASCII arrive
+Base64-wrapped as ``=?base64?…?=`` and are decoded before comparison; integers
+compare numerically. Only properties reachable by a chain of ``properties``
+keys may be annotated — an annotation behind ``items``, ``oneOf`` or ``$ref``
+is not honoured.
+
 Dynamic registration
 --------------------
 
@@ -387,6 +470,73 @@ With MIME type:
      - dict
      - ``None``
      - Metadata dictionary
+
+
+@server.skill()
+----------------
+
+Register a skill (`SEP-2640 <https://modelcontextprotocol.io/seps/2640>`_):
+a directory containing a ``SKILL.md`` plus any supporting files, served as
+individually addressable resources under ``skill://<skill_path>/<file-path>``.
+
+The decorated function is called once, at registration, and must return the
+skill's directory:
+
+.. code-block:: python
+
+   from pathlib import Path
+
+   @server.skill("git-workflow")           # -> skill://git-workflow/SKILL.md
+   def git_workflow():
+       return Path(__file__).parent / "skills" / "git-workflow"
+
+A nested skill path organizes skills by domain, team, or any other axis; the
+final segment must equal the ``name`` field of the skill's ``SKILL.md``
+frontmatter:
+
+.. code-block:: python
+
+   @server.skill("acme/billing/refunds")   # -> skill://acme/billing/refunds/SKILL.md
+   def refunds():
+       return "./skills/refunds"
+
+``SKILL.md`` must begin with YAML frontmatter containing at least ``name``
+and ``description``, per the `Agent Skills specification
+<https://agentskills.io/specification>`_. Registration computes a SHA-256
+digest and size for every file up front, so ``skills/list`` and
+``skills/get`` answer from the registry alone; ``resources/read`` still
+reads each file's bytes lazily, on demand. Registration raises
+``ValueError`` if ``SKILL.md`` is missing, its frontmatter has no
+``description``, or its ``name`` does not match the skill path's final
+segment.
+
+Three methods become available once any skill is registered:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Method
+     - Description
+   * - ``skills/list``
+     - Enumerates every registered skill: its ``uri``, verbatim
+       ``frontmatter``, and a ``resources`` manifest (``uri``, ``digest``,
+       ``size`` per file).
+   * - ``skills/get``
+     - Returns one skill's entry by its ``SKILL.md`` URI, whether or not it
+       was listed.
+   * - ``resources/directory/read``
+     - Lists the direct children of a directory resource (e.g.
+       ``skill://git-workflow/references``), for navigating a skill's
+       subdirectories without a full ``resources/list``.
+
+The extension is declared in ``capabilities.extensions`` as
+``{"io.modelcontextprotocol/skills": {"directoryRead": true}}``, and the
+base ``resources`` capability is declared alongside it, as the SEP requires,
+even if no plain ``@server.resource()`` is registered.
+
+See :doc:`examples` for a full runnable server plus ``skills/list``,
+``skills/get``, and ``resources/directory/read`` request/response examples.
 
 
 @server.prompt()

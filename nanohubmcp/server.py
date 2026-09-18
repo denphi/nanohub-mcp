@@ -15,15 +15,21 @@ Usage:
 
 from __future__ import print_function
 
+import base64
+import hashlib
 import inspect
 import json
+import mimetypes
 import os
+import re
 import sys
 import threading
 import time
 import traceback
 import uuid
+import warnings
 from datetime import datetime
+from pathlib import Path
 
 try:
     from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -42,7 +48,7 @@ except ImportError:
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from .types import (
-    Tool, Resource, Prompt, TextContent, ImageContent, InputRequired,
+    Tool, Resource, Prompt, Skill, TextContent, ImageContent, InputRequired,
     ToolResult, ResourceResult, ResourceContent,
     PromptResult, Message, Role,
     ServerCapabilities, ServerInfo
@@ -88,6 +94,21 @@ CACHEABLE_SCOPE = "private"
 # How long a partially-answered MRTR request is remembered between retries.
 MRTR_STATE_TTL_SECONDS = 10 * 60
 
+# A client picks its own subscription ids (they are its JSON-RPC request ids),
+# so the count has to be bounded somewhere. Far above any real use.
+MAX_SUBSCRIPTIONS_PER_SESSION = 64
+
+
+class InvalidParams(Exception):
+    """A request the caller got wrong, reported as JSON-RPC -32602.
+
+    Distinct from ValueError on purpose: the server raises ValueError for its
+    own programming errors (a reserved `_meta` prefix, an unsupported
+    elicitation mode), and those are -32603. Catching ValueError broadly here
+    would blame the caller for a server bug.
+    """
+
+
 # MCP Apps extension (https://github.com/modelcontextprotocol/ext-apps).
 # Servers advertising this extension can attach UI resources to tools via
 # `_meta.ui.resourceUri` and serve `text/html;profile=mcp-app` resources.
@@ -110,6 +131,35 @@ TASK_META_PREFIX = "org.nanohub/"
 MCP_SUBSCRIPTION_ID_KEY = "io.modelcontextprotocol/subscriptionId"
 _RESERVED_META_LABELS = ("modelcontextprotocol", "mcp")
 
+# MCP Skills extension (SEP-2640: https://modelcontextprotocol.io/seps/2640).
+# Skills are directories (a SKILL.md plus supporting files) served as
+# individually addressable resources under skill://<skill-path>/<file-path>.
+# This server always implements resources/directory/read once any skill is
+# registered, so directoryRead is unconditionally true whenever we declare
+# the extension at all.
+MCP_SKILLS_EXTENSION_ID = "io.modelcontextprotocol/skills"
+SKILL_URI_SCHEME = "skill"
+SKILL_MAX_RESOURCES = 512
+SKILL_MAX_TOTAL_BYTES = 16 * 1024 * 1024  # 16 MiB, per SEP-2640 Limits
+
+# Python's stdlib `mimetypes` has no `.md` entry, but skill content is
+# overwhelmingly Markdown (SKILL.md itself, references/, examples/), and
+# SEP-2640 says a skill's SKILL.md resource `mimeType` SHOULD be
+# text/markdown. Applied to every skill file by extension, not just
+# SKILL.md, so a plain `references/GUIDE.md` gets it too.
+_SKILL_MIME_OVERRIDES = {
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+}
+
+
+def _guess_skill_mime_type(rel_path):
+    # type: (str) -> str
+    ext = os.path.splitext(rel_path)[1].lower()
+    if ext in _SKILL_MIME_OVERRIDES:
+        return _SKILL_MIME_OVERRIDES[ext]
+    return mimetypes.guess_type(rel_path)[0] or "application/octet-stream"
+
 # Seconds between SSE heartbeats — keeps idle connections alive through proxies
 # (nginx, wrwroxy, etc.) that drop connections after ~30-60s of inactivity.
 SSE_HEARTBEAT_INTERVAL = 20.0
@@ -117,6 +167,261 @@ SSE_HEARTBEAT_INTERVAL = 20.0
 # Cap on request bodies. Anything larger gets a 413 without being read into
 # memory. Generous default for tool payloads but bounds worst-case allocation.
 MAX_REQUEST_BYTES = 16 * 1024 * 1024  # 16 MiB
+
+
+def _yaml_split_flow(inner):
+    # type: (str) -> List[str]
+    """Split the inside of a flow collection (`[...]` or `{...}`) on
+    top-level commas, respecting quotes and nested brackets."""
+    parts = []
+    depth = 0
+    quote = None
+    current = ""
+    for ch in inner:
+        if quote:
+            current += ch
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+            current += ch
+        elif ch in "[{":
+            depth += 1
+            current += ch
+        elif ch in "]}":
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        parts.append(current)
+    return parts
+
+
+# A YAML number, which is narrower than what Python's int()/float() accept.
+_YAML_NUMBER_RE = re.compile(r"^[-+]?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?$")
+
+
+def _yaml_strip_comment(raw):
+    # type: (str) -> str
+    """Drop a trailing `#` comment from an unquoted scalar.
+
+    YAML starts a comment only at the beginning of a line or after
+    whitespace, so `a#b` is the string `a#b` while `a # b` is `a`. A `#`
+    inside quotes is literal.
+    """
+    quote = None
+    for index, ch in enumerate(raw):
+        if quote:
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch == "#" and (index == 0 or raw[index - 1] in " \t"):
+            return raw[:index].rstrip()
+    return raw
+
+
+def _yaml_flow_scalar(raw):
+    # type: (str) -> Any
+    """Parse one YAML scalar, flow list (`[a, b]`), or flow mapping
+    (`{a: b}`). No external YAML dependency: this library ships with zero
+    dependencies, and SKILL.md frontmatter (per the Agent Skills spec) only
+    ever needs this subset — quoted/plain strings, booleans, null, numbers,
+    and simple flow collections."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    if len(raw) >= 2 and raw[0] in "\"'" and raw[-1] == raw[0]:
+        return raw[1:-1]
+    raw = _yaml_strip_comment(raw)
+    if not raw:
+        return None
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    if raw in ("null", "~"):
+        return None
+    if raw.startswith("[") and raw.endswith("]"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return []
+        return [_yaml_flow_scalar(part) for part in _yaml_split_flow(inner)]
+    if raw.startswith("{") and raw.endswith("}"):
+        inner = raw[1:-1].strip()
+        if not inner:
+            return {}
+        mapping = {}
+        for part in _yaml_split_flow(inner):
+            key, _, value = part.partition(":")
+            mapping[key.strip().strip("\"'")] = _yaml_flow_scalar(value)
+        return mapping
+    # Python accepts digit separators (`1_000`) and the bare words `nan`/`inf`
+    # that YAML does not: the first would silently change an author's string
+    # into a number, and the second two produce floats that `json.dumps`
+    # renders as bare NaN/Infinity — not JSON, and rejected outright by strict
+    # parsers on the client side.
+    if _YAML_NUMBER_RE.match(raw):
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+    return raw
+
+
+def _yaml_block_scalar(lines, start, indent, style):
+    # type: (List[str], int, int, str) -> Any
+    """Parse a `|` (literal) or `>` (folded) block scalar's body: every
+    following line indented more than `indent`. Returns `(text, next_index)`.
+    """
+    i = start
+    body = []
+    body_indent = None
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            body.append("")
+            i += 1
+            continue
+        cur_indent = len(line) - len(line.lstrip(" "))
+        if cur_indent <= indent:
+            break
+        if body_indent is None:
+            body_indent = cur_indent
+        body.append(line[body_indent:])
+        i += 1
+    while body and body[-1] == "":
+        body.pop()
+    joiner = " " if style.startswith(">") else "\n"
+    text = joiner.join(body)
+    if not style.endswith("-"):
+        text += "\n"
+    return text, i
+
+
+def _yaml_parse_block_with_end(lines, start, indent):
+    # type: (List[str], int, int) -> Any
+    """Parse a YAML mapping or block list at `indent`, starting at `lines[start]`.
+
+    Returns `(value, next_index)`. Recurses into nested blocks by
+    indentation, the same subset used by `_yaml_flow_scalar`'s caller.
+    """
+    if start < len(lines) and lines[start].strip().startswith("- "):
+        i = start
+        items = []
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                i += 1
+                continue
+            cur_indent = len(line) - len(line.lstrip(" "))
+            if cur_indent < indent or not stripped.startswith("- "):
+                break
+            items.append(_yaml_flow_scalar(stripped[2:]))
+            i += 1
+        return items, i
+
+    i = start
+    mapping = {}
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        cur_indent = len(line) - len(line.lstrip(" "))
+        if cur_indent < indent:
+            break
+        key, _, rest = stripped.partition(":")
+        key = key.strip().strip("\"'")
+        rest = rest.strip()
+        i += 1
+        if rest in ("|", "|-", "|+", ">", ">-", ">+"):
+            mapping[key], i = _yaml_block_scalar(lines, i, cur_indent, rest)
+            continue
+        if rest:
+            # A plain scalar continues onto any following line indented more
+            # than its key, folded with spaces. Wrapping a long `description:`
+            # this way is ordinary in SKILL.md, and reading only the first
+            # line both truncates the value and turns each continuation into
+            # a bogus top-level key.
+            while i < len(lines):
+                nxt = lines[i]
+                if not nxt.strip():
+                    break
+                nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+                if nxt_indent <= cur_indent:
+                    break
+                rest += " " + nxt.strip()
+                i += 1
+            mapping[key] = _yaml_flow_scalar(rest)
+            continue
+        j = i
+        while j < len(lines) and not lines[j].strip():
+            j += 1
+        if j >= len(lines):
+            mapping[key] = None
+            continue
+        next_indent = len(lines[j]) - len(lines[j].lstrip(" "))
+        # A block sequence may sit at its key's own indent, not only deeper:
+        #     allowed-tools:
+        #     - Bash
+        # is valid YAML and parsed each item as a separate key before.
+        if next_indent == cur_indent and lines[j].strip().startswith("- "):
+            mapping[key], i = _yaml_parse_block_with_end(lines, j, next_indent)
+            continue
+        if next_indent <= cur_indent:
+            mapping[key] = None
+            continue
+        mapping[key], i = _yaml_parse_block_with_end(lines, j, next_indent)
+    return mapping, i
+
+
+def _parse_skill_frontmatter(markdown_text):
+    # type: (str) -> Dict[str, Any]
+    """Parse a SKILL.md file's YAML frontmatter into a dict.
+
+    Raises ValueError if the file has no `---`-delimited frontmatter block,
+    per the Agent Skills spec that SEP-2640 defers the skill format to.
+
+    Covers scalars, quoted strings, booleans/null, numbers, flow and block
+    lists, flow and block mappings, and `|`/`>` block scalars — everything
+    seen in the Agent Skills examples. Not covered: YAML anchors/aliases,
+    multi-document streams, and `>` folding's blank-line-becomes-newline
+    rule (blank lines fold to a space here rather than a paragraph break).
+    A frontmatter field using one of these is not rejected; it is parsed
+    into something other than what a full YAML parser would produce, which
+    is a real divergence from "verbatim" for those fields specifically.
+    """
+    text = markdown_text
+    if text.startswith("﻿"):
+        text = text[1:]
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise ValueError(
+            "SKILL.md must begin with YAML frontmatter delimited by '---'")
+    end = None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            end = idx
+            break
+    if end is None:
+        raise ValueError("SKILL.md frontmatter is not terminated with '---'")
+    frontmatter, _ = _yaml_parse_block_with_end(lines[1:end], 0, 0)
+    if not isinstance(frontmatter, dict):
+        raise ValueError("SKILL.md frontmatter must be a YAML mapping")
+    return frontmatter
 
 
 class _SSEQueue(list):
@@ -167,7 +472,8 @@ class MCPServer(object):
         self,
         name,  # type: str
         version="1.0.0",  # type: str
-        instructions=None  # type: Optional[str]
+        instructions=None,  # type: Optional[str]
+        list_page_size=None  # type: Optional[int]
     ):
         # type: (...) -> None
         """
@@ -184,10 +490,22 @@ class MCPServer(object):
         self.name = name
         self.version = version
         self.instructions = instructions
+        # None means "return everything in one response", which is what every
+        # release before 0.4.4 did. Set it and the list endpoints paginate.
+        self.list_page_size = list_page_size
 
         self._tools = {}  # type: Dict[str, Dict[str, Any]]
         self._resources = {}  # type: Dict[str, Dict[str, Any]]
         self._prompts = {}  # type: Dict[str, Dict[str, Any]]
+        # SEP-2640 skills. Keyed by the skill's SKILL.md URI.
+        self._skills = {}  # type: Dict[str, Dict[str, Any]]
+        # Every file of every registered skill, keyed by its own resource URI,
+        # for O(1) resources/read lookups without scanning each skill.
+        self._skill_resources = {}  # type: Dict[str, Dict[str, Any]]
+        # Every directory level of every registered skill (skill root and each
+        # subdirectory), keyed by its URI, mapping to its direct children in
+        # the shape resources/directory/read returns.
+        self._skill_directories = {}  # type: Dict[str, List[Dict[str, Any]]]
         # Guards *mutation* of the three registries above and any iteration
         # over them. Single-key lookups stay lock-free: dict.get is atomic
         # under the GIL, and tools/call is the hot path. Re-entrant because
@@ -217,6 +535,8 @@ class MCPServer(object):
         # headers only for requests that declare 2026-07-28, the revision that
         # requires them — see run() for why that is the default.
         self._require_route_headers = "auto"  # type: Any
+        # None means "no Origin policy configured"; see run(allowed_origins=).
+        self._allowed_origins = None  # type: Optional[set]
         self._path_prefix = ""  # type: str
         # job_id -> {"status": "running"|"done"|"error", "result": Any}
         self._jobs = {}  # type: Dict[str, Dict[str, Any]]
@@ -652,6 +972,18 @@ class MCPServer(object):
         for job_id in targets:
             self.cancel_job(job_id)
 
+    def origin_allowed(self, origin):
+        # type: (Optional[str]) -> bool
+        """Whether a browser Origin may talk to this server.
+
+        No ``Origin`` means a non-browser client, which this cannot protect
+        and does not try to. No configured allowlist means no policy, so
+        everything passes — a library cannot guess a deployment's origins.
+        """
+        if not origin or self._allowed_origins is None:
+            return True
+        return origin.rstrip("/").lower() in self._allowed_origins
+
     def _route_headers_required(self, version):
         # type: (str) -> bool
         """Whether a *missing* routing header should be rejected.
@@ -665,13 +997,66 @@ class MCPServer(object):
             return self._is_stateless(version)
         return bool(setting)
 
+    # Methods whose Mcp-Name header is required, and where its value lives.
+    _MCP_NAME_SOURCES = {
+        "tools/call": "name",
+        "prompts/get": "name",
+        "resources/read": "uri",
+    }
+
+    # A header value the client could not render as plain ASCII arrives
+    # wrapped in this sentinel; servers MUST decode before comparing.
+    _B64_PREFIX = "=?base64?"
+    _B64_SUFFIX = "?="
+
+    @classmethod
+    def _decode_header_value(cls, value):
+        # type: (Optional[str]) -> Optional[str]
+        """Undo the Base64 sentinel encoding, if present.
+
+        Clients MUST use it for any value that is not plain visible ASCII —
+        which includes most resource URIs the moment they carry non-ASCII —
+        and for any literal value that would look like the sentinel.
+        """
+        if not isinstance(value, str):
+            return value
+        if not (value.startswith(cls._B64_PREFIX) and value.endswith(cls._B64_SUFFIX)):
+            return value
+        payload = value[len(cls._B64_PREFIX):-len(cls._B64_SUFFIX)]
+        try:
+            return base64.b64decode(payload, validate=True).decode("utf-8")
+        except Exception:
+            # Malformed encoding is a header validation failure, not a value.
+            return None
+
+    @staticmethod
+    def _header_values_match(declared, body_value):
+        # type: (Optional[str], Any) -> bool
+        """Compare a decoded header against the body value it mirrors.
+
+        Numbers compare numerically, so "42" and 42 agree — the spec calls
+        this out because a header is always a string on the wire.
+        """
+        if declared is None:
+            return False
+        if isinstance(body_value, bool):
+            return declared == ("true" if body_value else "false")
+        if isinstance(body_value, (int, float)):
+            try:
+                return float(declared) == float(body_value)
+            except (TypeError, ValueError):
+                return False
+        return declared == body_value
+
     def _header_mismatch(self, request, headers, version=None):
         # type: (Any, Any, Optional[str]) -> Optional[Dict[str, Any]]
-        """Check the 2026-07-28 routing headers against the body.
+        """Validate the mirrored HTTP headers against the request body.
 
-        `Mcp-Method` and `Mcp-Name` let a gateway route and authorize without
-        parsing the body — which is exactly why they must agree with it. A
-        contradicting header is always rejected.
+        The transport mirrors selected body fields into headers so a gateway
+        can route and authorize without parsing the body. That only works if
+        the two agree — a load balancer acting on the header while the server
+        acts on the body is the vulnerability this check exists to close. So a
+        contradicting header is always rejected, whatever the revision.
 
         A *missing* header is rejected only where the declaring revision
         requires one — see :meth:`_route_headers_required`. ``run()`` can force
@@ -682,49 +1067,251 @@ class MCPServer(object):
             return None
 
         def header(name):
+            # RFC 9110: field names are case-insensitive, and both sides MUST
+            # compare them that way. http.client's message object already does;
+            # a plain dict (tests, other transports) does not.
             getter = getattr(headers, "get", None) if headers else None
-            return getter(name) if getter else None
+            if getter is None:
+                return None
+            found = getter(name)
+            if found is not None:
+                return found
+            wanted = name.lower()
+            try:
+                items = headers.items()
+            except AttributeError:
+                return None
+            for key, value in items:
+                if isinstance(key, str) and key.lower() == wanted:
+                    return value
+            return None
+
+        def bad(message):
+            return {"code": -32020, "message": message}
 
         # Only an HTTP POST carries a header collection. A direct in-process
         # call, the SSE channel, and stdio have nowhere to put these, so a
         # missing header there means "not applicable", not "omitted".
         transport_has_headers = getattr(headers, "get", None) is not None
+        if not transport_has_headers:
+            return None
 
         method = request.get("method")
-        params = request.get("params")
-        body_name = params.get("name") if isinstance(params, dict) else None
+        params = request.get("params") if isinstance(request.get("params"), dict) else {}
+        name_field = self._MCP_NAME_SOURCES.get(method)
+        body_name = params.get(name_field) if name_field else None
 
-        required = (transport_has_headers
-                    and self._route_headers_required(
-                        version or DEFAULT_NEGOTIATED_VERSION))
+        required = self._route_headers_required(version or DEFAULT_NEGOTIATED_VERSION)
+
+        # ── MCP-Protocol-Version must agree with the body's _meta ───────────
+        # Compared against the *declared* value only. `version` falls back to
+        # the session's negotiation and then to a default, and a 2025-06-18
+        # client — whose revision introduced this header but not `_meta` —
+        # would otherwise be rejected whenever the gateway dropped its
+        # session id, which is a known failure mode rather than a rare one.
+        declared_version = header("MCP-Protocol-Version")
+        body_meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
+        body_version = body_meta.get(META_PROTOCOL_VERSION)
+        if (declared_version is not None and isinstance(body_version, str)
+                and body_version and declared_version != body_version):
+            return bad(
+                "MCP-Protocol-Version header {!r} does not match body version "
+                "{!r}".format(declared_version, body_version))
+
+        # ── Mcp-Method ─────────────────────────────────────────────────────
         declared_method = header("Mcp-Method")
-        if declared_method is None and required and method:
-            return {
-                "code": -32020,
-                "message": "Missing required Mcp-Method header",
-            }
-        if header("Mcp-Name") is None and required and body_name is not None:
-            return {
-                "code": -32020,
-                "message": "Missing required Mcp-Name header",
-            }
+        if declared_method is None:
+            if required and method:
+                return bad("Missing required Mcp-Method header")
+        elif declared_method != method:
+            return bad("Mcp-Method header {!r} does not match body method {!r}".format(
+                declared_method, method))
 
-        if declared_method and declared_method != request.get("method"):
-            return {
-                "code": -32020,
-                "message": "Mcp-Method header {!r} does not match body method {!r}".format(
-                    declared_method, request.get("method")),
-            }
-
+        # ── Mcp-Name: params.name for tools/prompts, params.uri for resources ─
         declared_name = header("Mcp-Name")
-        if declared_name:
-            if body_name is not None and declared_name != body_name:
-                return {
-                    "code": -32020,
-                    "message": "Mcp-Name header {!r} does not match body name {!r}".format(
-                        declared_name, body_name),
-                }
+        if declared_name is None:
+            if required and body_name is not None:
+                return bad("Missing required Mcp-Name header")
+        elif body_name is not None:
+            decoded = self._decode_header_value(declared_name)
+            if decoded is None:
+                return bad("Mcp-Name header is not valid Base64 sentinel encoding")
+            if decoded != body_name:
+                return bad("Mcp-Name header {!r} does not match body {} {!r}".format(
+                    decoded, name_field, body_name))
+
+        # ── Mcp-Param-{Name}: arguments mirrored via x-mcp-header ──────────
+        if method == "tools/call":
+            mirrored = self._mirrored_params(params.get("name"))
+            arguments = params.get("arguments")
+            arguments = arguments if isinstance(arguments, dict) else {}
+            for header_name, path in mirrored.items():
+                present, body_value = self._value_at_path(arguments, path)
+                declared = header("Mcp-Param-" + header_name)
+                if not present:
+                    # The client MUST omit the header when the value is absent.
+                    if declared is not None:
+                        return bad("Mcp-Param-{} sent but {} is absent from "
+                                   "arguments".format(header_name, ".".join(path)))
+                    continue
+                if declared is None:
+                    if required:
+                        return bad("Missing required Mcp-Param-{} header".format(
+                            header_name))
+                    continue
+                decoded = self._decode_header_value(declared)
+                if decoded is None:
+                    return bad("Mcp-Param-{} is not valid Base64 sentinel "
+                               "encoding".format(header_name))
+                if not self._header_values_match(decoded, body_value):
+                    return bad("Mcp-Param-{} header {!r} does not match argument "
+                               "{!r}".format(header_name, decoded, body_value))
+
         return None
+
+    # RFC 9110 tchar: the characters an HTTP field name may contain.
+    _TCHAR = set("!#$%&'*+-.^_`|~0123456789"
+                 "abcdefghijklmnopqrstuvwxyz"
+                 "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+    # x-mcp-header may only mirror a primitive. `number` is excluded by the
+    # spec — a float has no single canonical header representation.
+    _MIRRORABLE_TYPES = ("string", "integer", "boolean")
+
+    @classmethod
+    def _validate_mirrored_params(cls, schema, tool_name):
+        # type: (Any, str) -> Dict[str, List[str]]
+        """Check a tool's x-mcp-header annotations, or raise ValueError.
+
+        This is validated at registration because the failure is otherwise
+        silent and total: a conforming client MUST exclude a tool with an
+        invalid annotation from `tools/list`, so the tool simply vanishes for
+        the user with nothing logged anywhere.
+        """
+        if not isinstance(schema, dict):
+            return {}
+
+        reachable = {}   # header name (lowercased) -> property path
+        seen_at = {}     # header name -> the path that claimed it first
+
+        def collect(node, path):
+            properties = node.get("properties")
+            if not isinstance(properties, dict):
+                return
+            for key, prop in properties.items():
+                if not isinstance(prop, dict):
+                    continue
+                here = path + [key]
+                annotation = prop.get("x-mcp-header")
+                if annotation is not None:
+                    cls._check_mirror_annotation(
+                        annotation, prop, here, tool_name, seen_at)
+                    reachable[annotation.lower()] = here
+                collect(prop, here)
+
+        collect(schema, [])
+
+        # An annotation anywhere unreachable — behind items, a composition or
+        # conditional keyword, or a $ref — invalidates the whole definition.
+        stray = cls._stray_mirror_annotations(schema, reachable)
+        if stray:
+            raise ValueError(
+                "Tool {!r}: x-mcp-header on {} is not statically reachable; the "
+                "path must be a chain of 'properties' keys only".format(
+                    tool_name, ", ".join(sorted(stray))))
+        return reachable
+
+    @classmethod
+    def _check_mirror_annotation(cls, annotation, prop, path, tool_name, seen_at):
+        # type: (Any, Dict[str, Any], List[str], str, Dict[str, List[str]]) -> None
+        """Validate one x-mcp-header value against the spec's constraints."""
+        where = ".".join(path)
+        if not isinstance(annotation, str) or not annotation:
+            raise ValueError("Tool {!r}: x-mcp-header on {!r} must be a "
+                             "non-empty string".format(tool_name, where))
+        if any(ch not in cls._TCHAR for ch in annotation):
+            raise ValueError(
+                "Tool {!r}: x-mcp-header {!r} on {!r} is not a valid HTTP "
+                "field-name token".format(tool_name, annotation, where))
+
+        lowered = annotation.lower()
+        if lowered in seen_at:
+            raise ValueError(
+                "Tool {!r}: x-mcp-header {!r} on {!r} duplicates the one on "
+                "{!r} (names are case-insensitive)".format(
+                    tool_name, annotation, where, ".".join(seen_at[lowered])))
+        seen_at[lowered] = path
+
+        prop_type = prop.get("type")
+        if prop_type not in cls._MIRRORABLE_TYPES:
+            raise ValueError(
+                "Tool {!r}: x-mcp-header on {!r} needs type one of {}; got "
+                "{!r}".format(tool_name, where,
+                              ", ".join(cls._MIRRORABLE_TYPES), prop_type))
+
+    @staticmethod
+    def _stray_mirror_annotations(schema, reachable):
+        # type: (Dict[str, Any], Dict[str, List[str]]) -> set
+        """Find x-mcp-header annotations outside the reachable property tree.
+
+        Reachable means: every step from the schema root was a `properties`
+        key. An annotation under `items`, `oneOf`/`anyOf`/`allOf`/`not`,
+        `if`/`then`/`else`, or `$ref` is invalid, and invalidates the tool.
+        """
+        allowed = set(reachable)
+        stray = set()
+
+        def walk(node, reachable_here):
+            if isinstance(node, list):
+                for item in node:
+                    walk(item, False)
+                return
+            if not isinstance(node, dict):
+                return
+
+            annotation = node.get("x-mcp-header")
+            if isinstance(annotation, str) and annotation:
+                if not reachable_here or annotation.lower() not in allowed:
+                    stray.add(annotation)
+
+            for key, value in node.items():
+                if key == "x-mcp-header":
+                    continue
+                if key == "properties" and isinstance(value, dict):
+                    # Each property is one more reachable step.
+                    for child in value.values():
+                        walk(child, reachable_here)
+                else:
+                    walk(value, False)
+
+        walk(schema, True)
+        return stray
+
+    def _mirrored_params(self, tool_name):
+        # type: (Optional[str]) -> Dict[str, List[str]]
+        """Header name (lowercased) -> property path, for one tool.
+
+        Validated and computed when the tool was registered, so a `tools/call`
+        does not re-walk the schema.
+        """
+        if not tool_name:
+            return {}
+        entry = self._tools.get(tool_name)
+        if not entry:
+            return {}
+        return entry.get("mirrored_params") or {}
+
+    @staticmethod
+    def _value_at_path(arguments, path):
+        # type: (Dict[str, Any], List[str]) -> tuple
+        """Read the instance value at an exact property path."""
+        node = arguments
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                return False, None
+            node = node[key]
+        # A null value is treated as absent: the client MUST omit the header.
+        return (node is not None), node
 
     def _task_await_input(self, job_id, requests, timeout):
         # type: (str, Dict[str, Any], float) -> Dict[str, Any]
@@ -769,6 +1356,13 @@ class MCPServer(object):
                     job["lastUpdatedAt"] = self._utc_now()
             raise RuntimeError("Timed out waiting for client input on task {}".format(job_id))
 
+        # Cancellation wakes this same event, so re-check it before reading:
+        # otherwise a cancelled task reports "no response supplied", and a
+        # handler failing closed on RuntimeError logs the wrong cause.
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError(
+                "Task {} was cancelled while awaiting input".format(job_id))
+
         with self._jobs_lock:
             job = self._jobs.get(job_id) or {}
             answers = dict(job.get("input_responses") or {})
@@ -804,9 +1398,16 @@ class MCPServer(object):
         self._notify_task_status(job_id)
         return None
 
-    def _mrtr_load(self, request_state):
-        # type: (Optional[str]) -> Dict[str, Any]
-        """Answers already collected for this logical request."""
+    def _mrtr_load(self, request_state, session_id=None):
+        # type: (Optional[str], Optional[str]) -> Dict[str, Any]
+        """Answers already collected for this logical request.
+
+        Bound to the session that created the state, exactly as a task is.
+        Without that, one session presenting another's `requestState` inherits
+        answers a different user gave — including an approval it never asked
+        for. Returning empty rather than erroring means the worst case is being
+        asked again, which is the safe direction.
+        """
         if not request_state:
             return {}
         with self._mrtr_lock:
@@ -814,10 +1415,12 @@ class MCPServer(object):
             if entry is None or entry.get("expires_at", 0) <= time.time():
                 self._mrtr_states.pop(request_state, None)
                 return {}
+            if entry.get("session_id") != session_id:
+                return {}
             return dict(entry.get("responses") or {})
 
-    def _mrtr_save(self, request_state, responses):
-        # type: (Optional[str], Dict[str, Any]) -> str
+    def _mrtr_save(self, request_state, responses, session_id=None):
+        # type: (Optional[str], Dict[str, Any], Optional[str]) -> str
         """Persist accumulated answers; return the state id to hand the client.
 
         A multi-step handler asks once per round trip, so answers must survive
@@ -825,8 +1428,15 @@ class MCPServer(object):
         """
         state_id = request_state or ("mrtr_" + uuid.uuid4().hex)
         with self._mrtr_lock:
+            existing = self._mrtr_states.get(state_id)
+            if existing is not None and existing.get("session_id") != session_id:
+                # Someone else's state. Never rebind it — overwriting the owner
+                # would let any session permanently break another's in-flight
+                # request just by naming its id. Start a fresh one instead.
+                state_id = "mrtr_" + uuid.uuid4().hex
             self._mrtr_states[state_id] = {
                 "responses": dict(responses or {}),
+                "session_id": session_id,
                 "expires_at": time.time() + MRTR_STATE_TTL_SECONDS,
             }
         return state_id
@@ -924,6 +1534,10 @@ class MCPServer(object):
         """
         name = func._mcp_tool_name
         is_async = getattr(func, "_mcp_async_tool", False)
+        # Raises before the tool is registered, so a definition a conforming
+        # client would silently drop never reaches tools/list.
+        mirrored = self._validate_mirrored_params(
+            func._mcp_tool_input_schema, name)
         with self._registry_lock:
             self._tools[name] = {
                 "definition": Tool(
@@ -937,6 +1551,9 @@ class MCPServer(object):
                 "handler": func,
                 "is_async": is_async,
                 "prepare": getattr(func, "_mcp_async_prepare", None),
+                # Computed once here rather than re-walking the schema on
+                # every tools/call that carries headers.
+                "mirrored_params": mirrored,
             }
         self._mark_dynamic("tools")
         if is_async:
@@ -954,6 +1571,7 @@ class MCPServer(object):
         """Register a decorated resource function, at import or while serving."""
         uri = func._mcp_resource_uri
         with self._registry_lock:
+            replaced = uri in self._resources
             self._resources[uri] = {
                 "definition": Resource(
                     uri=uri,
@@ -965,6 +1583,10 @@ class MCPServer(object):
                 "handler": func
             }
         self._mark_dynamic("resources")
+        # Only a *replacement* is an update; a first registration is a
+        # creation, which list_changed already reports.
+        if replaced:
+            self.resource_updated(uri)
 
     def _register_prompt_function(self, func):
         # type: (Callable) -> None
@@ -980,6 +1602,206 @@ class MCPServer(object):
                 "handler": func
             }
         self._mark_dynamic("prompts")
+
+    def _register_skill_directory(self, skill_path, directory):
+        # type: (str, Any) -> None
+        """Register a skill (SEP-2640) served from a directory on disk.
+
+        Walks the directory once, parses SKILL.md's frontmatter, and
+        computes a SHA-256 digest and size for every file up front, so
+        skills/list, skills/get, and resources/directory/read all answer
+        from the registry with no further disk access. `resources/read`
+        still reads each file's bytes lazily, on demand.
+        """
+        directory = Path(directory)
+        skill_path = skill_path.strip("/")
+        if not skill_path:
+            raise ValueError("Skill path must not be empty")
+        skill_name = skill_path.rsplit("/", 1)[-1]
+
+        skill_md_path = directory / "SKILL.md"
+        if not skill_md_path.is_file():
+            raise ValueError(
+                "Skill '{}' has no SKILL.md at {}".format(skill_path, skill_md_path))
+
+        frontmatter = _parse_skill_frontmatter(
+            skill_md_path.read_text(encoding="utf-8"))
+        if frontmatter.get("name") != skill_name:
+            raise ValueError(
+                "Skill '{}': SKILL.md frontmatter name '{}' must equal the "
+                "final path segment '{}'".format(
+                    skill_path, frontmatter.get("name"), skill_name))
+        if not frontmatter.get("description"):
+            raise ValueError(
+                "Skill '{}': SKILL.md frontmatter is missing "
+                "'description'".format(skill_path))
+
+        root_uri = "{}://{}".format(SKILL_URI_SCHEME, skill_path)
+        skill_md_uri = root_uri + "/SKILL.md"
+
+        files = []  # type: List[tuple]
+        subdirs = []  # type: List[str]
+        for dirpath, dirnames, filenames in os.walk(str(directory)):
+            # Dotfiles are editor state, VCS metadata, and secrets — a skill
+            # directory that is a git checkout would otherwise publish
+            # `.git/config` and `.env` in its manifest, readable by every
+            # connected client. Pruning `dirnames` in place also stops the
+            # walk from descending into them.
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for dirname in dirnames:
+                rel_dir = (Path(dirpath) / dirname).relative_to(directory).as_posix()
+                subdirs.append(rel_dir)
+            for filename in sorted(filenames):
+                if filename.startswith("."):
+                    continue
+                abs_path = Path(dirpath) / filename
+                rel_path = abs_path.relative_to(directory).as_posix()
+                files.append((rel_path, abs_path))
+
+        if len(files) > SKILL_MAX_RESOURCES:
+            warnings.warn(
+                "Skill '{}' has {} files, exceeding the SEP-2640 limit of "
+                "{}; some hosts may decline to load it".format(
+                    skill_path, len(files), SKILL_MAX_RESOURCES))
+
+        resource_entries = []
+        skill_files = {}
+        total_bytes = 0
+        for rel_path, abs_path in files:
+            data = abs_path.read_bytes()
+            digest = "sha256:" + hashlib.sha256(data).hexdigest()
+            size = len(data)
+            total_bytes += size
+            uri = "{}/{}".format(root_uri, rel_path)
+            mime_type = _guess_skill_mime_type(rel_path)
+            resource_entries.append({"uri": uri, "digest": digest, "size": size})
+            skill_files[uri] = {
+                "path": abs_path,
+                "mimeType": mime_type,
+            }
+
+        if total_bytes > SKILL_MAX_TOTAL_BYTES:
+            warnings.warn(
+                "Skill '{}' totals {} bytes, exceeding the SEP-2640 limit "
+                "of {}; some hosts may decline to load it".format(
+                    skill_path, total_bytes, SKILL_MAX_TOTAL_BYTES))
+
+        resource_entries.sort(key=lambda e: e["uri"])
+
+        # Direct children per directory level, for resources/directory/read.
+        # Sorting by name also sorts by uri, since uri is a fixed prefix (the
+        # parent directory) plus name.
+        directories = {}  # type: Dict[str, Dict[str, Dict[str, Any]]]
+        directories[root_uri] = {}
+        # Seeded from the walk's directory names, not inferred from file
+        # paths: an empty subdirectory has no files to infer it from, and the
+        # spec requires the method to answer for *every* directory in the
+        # namespace — an empty one with an empty `resources` array.
+        for rel_dir in subdirs:
+            directories.setdefault(root_uri + "/" + rel_dir, {})
+        for rel_path, abs_path in files:
+            parts = rel_path.split("/")
+            parent_uri = root_uri
+            for depth, part in enumerate(parts):
+                directories.setdefault(parent_uri, {})
+                child_uri = parent_uri + "/" + part
+                if depth == len(parts) - 1:
+                    child = {
+                        "uri": child_uri,
+                        "name": part,
+                        "mimeType": skill_files[child_uri]["mimeType"],
+                    }
+                    if child_uri == skill_md_uri:
+                        # The SKILL.md resource's name and description SHOULD
+                        # come from its frontmatter, so a host can build its
+                        # skill registry without fetching the file.
+                        child["name"] = frontmatter.get("name") or part
+                        description = frontmatter.get("description")
+                        if isinstance(description, str) and description:
+                            child["description"] = description
+                    directories[parent_uri][part] = child
+                else:
+                    directories.setdefault(child_uri, {})
+                    directories[parent_uri][part] = {
+                        "uri": child_uri,
+                        "name": part,
+                        "mimeType": "inode/directory",
+                    }
+                parent_uri = child_uri
+
+        # Organizational prefix segments (`acme`, `acme/billing` for a skill at
+        # `acme/billing/refunds`) are directories in the namespace too, even
+        # though nothing on disk corresponds to them. A host walking a virtual
+        # mount with `ls` reaches the skill through them.
+        prefix_dirs = {}  # type: Dict[str, Dict[str, Dict[str, Any]]]
+        segments = skill_path.split("/")
+        for depth in range(len(segments) - 1):
+            parent = "{}://{}".format(SKILL_URI_SCHEME, "/".join(segments[:depth + 1]))
+            child_name = segments[depth + 1]
+            prefix_dirs.setdefault(parent, {})[child_name] = {
+                "uri": parent + "/" + child_name,
+                "name": child_name,
+                "mimeType": "inode/directory",
+            }
+
+        skill = Skill(uri=skill_md_uri, frontmatter=frontmatter,
+                       resources=resource_entries)
+
+        with self._registry_lock:
+            self._skills[skill_md_uri] = {"definition": skill}
+            self._skill_resources.update(skill_files)
+            for dir_uri, children in directories.items():
+                self._skill_directories[dir_uri] = sorted(
+                    children.values(), key=lambda c: c["name"])
+            # Merged, not replaced: two skills under one prefix (acme/billing/
+            # refunds and acme/billing/invoices) are both children of it, and
+            # whichever registered second would otherwise hide the first.
+            for dir_uri, children in prefix_dirs.items():
+                merged = {c["name"]: c for c in self._skill_directories.get(dir_uri, [])}
+                merged.update(children)
+                self._skill_directories[dir_uri] = sorted(
+                    merged.values(), key=lambda c: c["name"])
+        # Deliberately no `_mark_dynamic`: the extension defines no
+        # skills/list_changed notification, so there is nothing to send, and
+        # flipping the dynamic-registry flag would make tools, resources and
+        # prompts start advertising listChanged over a registry that did not
+        # change.
+
+    def skill(self, skill_path):
+        # type: (str) -> Callable
+        """
+        Decorator to register a skill (SEP-2640 Skills Extension), served
+        from a directory containing a SKILL.md.
+
+        The decorated function is called once, at registration, and must
+        return the skill's directory (a path or pathlib.Path):
+
+            @server.skill("git-workflow")        # -> skill://git-workflow/SKILL.md
+            def git_workflow():
+                return Path(__file__).parent / "skills" / "git-workflow"
+
+            @server.skill("acme/billing/refunds")  # -> skill://acme/billing/refunds/SKILL.md
+            def refunds():
+                return "./skills/refunds"
+
+        Every file in the directory is served as an MCP resource under
+        skill://<skill_path>/<relative-file-path>, readable via the
+        standard resources/read. A SHA-256 digest and size are computed for
+        each file up front so skills/list and skills/get can answer from
+        the registry alone.
+
+        Args:
+            skill_path: The skill's path within this server's skill
+                namespace (e.g. "git-workflow" or "acme/billing/refunds").
+                Its final segment must equal the `name` field of the
+                skill's SKILL.md frontmatter.
+        """
+        def decorator(func):
+            # type: (Callable) -> Callable
+            directory = func()
+            self._register_skill_directory(skill_path, directory)
+            return func
+        return decorator
 
     def tool(
         self,
@@ -1196,6 +2018,33 @@ class MCPServer(object):
             self._dynamic_registry = True
         self._notify_list_changed(kind)
 
+    def resource_updated(self, uri):
+        # type: (str) -> int
+        """Tell subscribers a resource's content changed; returns how many.
+
+        The counterpart to `subscriptions/listen` with `resourceSubscriptions`.
+        Nothing infers this — a resource handler is just a function, and the
+        server cannot know when whatever it reads from has moved underneath.
+        Call this when you know it has.
+        """
+        sent = 0
+        with self._subs_lock:
+            targets = [
+                (session_id, sub_id)
+                for session_id, subs in self._subscriptions.items()
+                for sub_id, sub in (subs or {}).items()
+                if uri in (sub.get("resource_uris") or ())
+            ]
+        for session_id, sub_id in targets:
+            self._broadcast({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": {"uri": uri,
+                           "_meta": {MCP_SUBSCRIPTION_ID_KEY: sub_id}},
+            }, session_id=session_id)
+            sent += 1
+        return sent
+
     def remove_tool(self, name):
         # type: (str) -> bool
         """Unregister a tool by name. Returns True if one was removed.
@@ -1239,13 +2088,21 @@ class MCPServer(object):
             }
         if self._has_async_tools():
             extensions[MCP_TASKS_EXTENSION_ID] = {}
+        if self._skills:
+            # This server always implements resources/directory/read for its
+            # skill namespaces once any skill is registered.
+            extensions[MCP_SKILLS_EXTENSION_ID] = {"directoryRead": True}
         return ServerCapabilities(
             tools=len(self._tools) > 0,
-            resources=len(self._resources) > 0,
+            # A server declaring the skills extension MUST also declare the
+            # base resources capability (SEP-2640), even if no plain
+            # @server.resource() was ever registered.
+            resources=len(self._resources) > 0 or len(self._skills) > 0,
             prompts=len(self._prompts) > 0,
             logging=True,
             extensions=extensions,
             list_changed=self._dynamic_registry,
+            subscribe=len(self._resources) > 0,
         )
 
     def _has_mcp_app_resources(self):
@@ -1528,6 +2385,59 @@ class MCPServer(object):
             error = dict(error)
             error["code"] = remapped
         return error
+
+    def _paginate(self, items, params, result_key, result, key_field):
+        # type: (List[Any], Dict[str, Any], str, Dict[str, Any], str) -> Dict[str, Any]
+        """Apply cursor paging to a list result, if a page size is configured.
+
+        Off by default: with no ``list_page_size`` the whole list is returned
+        and no ``nextCursor`` appears, exactly as before 0.4.4.
+
+        The cursor carries the last key returned, not an offset. Offsets are
+        wrong here because these registries can change while a client is
+        walking them — removing an entry ahead of the cursor shifts everything
+        down and an entry is skipped entirely, never seen. Resuming *after a
+        key* is stable under both insertion and removal, and works even when
+        the keyed entry is itself gone. It relies on the list being sorted by
+        that key, which tools, resources and prompts all are.
+        """
+        page_size = self.list_page_size
+        if not page_size or page_size <= 0:
+            result[result_key] = items
+            return result
+
+        start = 0
+        cursor = params.get("cursor") if isinstance(params, dict) else None
+        if cursor is not None:
+            if not isinstance(cursor, str):
+                raise InvalidParams("Invalid cursor")
+            try:
+                # Decoded with validate=True, which `urlsafe_b64decode` has no
+                # parameter for — hence the manual translation. Without it
+                # base64 *discards* every character outside its alphabet, so a
+                # junk cursor like "!!!" decodes to b"" rather than raising and
+                # silently restarts paging at page one, instead of rejecting a
+                # token this server never minted.
+                after = base64.b64decode(
+                    cursor.replace("-", "+").replace("_", "/").encode("ascii"),
+                    validate=True).decode("utf-8")
+            except Exception:
+                # `from None`: the base64 failure is noise. What matters is
+                # that the token is not one this server minted.
+                raise InvalidParams("Invalid cursor") from None
+            start = len(items)
+            for index, item in enumerate(items):
+                if str(item.get(key_field, "")) > after:
+                    start = index
+                    break
+
+        page = items[start:start + page_size]
+        result[result_key] = page
+        if page and start + len(page) < len(items):
+            result["nextCursor"] = base64.urlsafe_b64encode(
+                str(page[-1].get(key_field, "")).encode("utf-8")
+            ).decode("ascii")
+        return result
 
     def _cacheable(self, result, version):
         # type: (Dict[str, Any], str) -> Dict[str, Any]
@@ -1859,10 +2769,35 @@ class MCPServer(object):
                                         "resourcesListChanged")
                             if requested.get(key)
                         }
+                        # Per-URI subscriptions: acknowledge only URIs that
+                        # exist, so the ack states what will actually be watched.
+                        wanted_uris = requested.get("resourceSubscriptions")
+                        resource_uris = []
+                        if isinstance(wanted_uris, list):
+                            with self._registry_lock:
+                                known = set(self._resources)
+                            resource_uris = [
+                                u for u in wanted_uris
+                                if isinstance(u, str) and u in known
+                            ]
                         with self._subs_lock:
                             session_subs = self._subscriptions.setdefault(session_id, {})
-                            session_subs[msg_id] = {"task_ids": set(accepted),
-                                                    "filters": filters}
+                            if (msg_id not in session_subs
+                                    and len(session_subs) >= MAX_SUBSCRIPTIONS_PER_SESSION):
+                                error = {
+                                    "code": -32602,
+                                    "message": "Too many open subscriptions for this "
+                                               "session (max {})".format(
+                                                   MAX_SUBSCRIPTIONS_PER_SESSION),
+                                }
+                                session_subs = None
+                            else:
+                                session_subs[msg_id] = {"task_ids": set(accepted),
+                                                    "filters": filters,
+                                                    "resource_uris": set(resource_uris)}
+                        if session_subs is None:
+                            # Over the cap: fall through to the error response.
+                            return {"jsonrpc": "2.0", "id": msg_id, "error": error}
 
                         # MUST be the first message carrying this subscription
                         # id, and MUST precede any notification on the stream.
@@ -1870,7 +2805,9 @@ class MCPServer(object):
                             "jsonrpc": "2.0",
                             "method": "notifications/subscriptions/acknowledged",
                             "params": {
-                                "notifications": dict(filters, taskIds=accepted),
+                                "notifications": dict(
+                                    filters, taskIds=accepted,
+                                    resourceSubscriptions=resource_uris),
                                 "_meta": {MCP_SUBSCRIPTION_ID_KEY: msg_id},
                             },
                         }, session_id=session_id)
@@ -1988,7 +2925,8 @@ class MCPServer(object):
                         self._tools[name]["definition"].to_dict()
                         for name in sorted(self._tools)
                     ]
-                result = self._cacheable({"tools": tool_dicts}, version)
+                result = self._cacheable(
+                    self._paginate(tool_dicts, params, "tools", {}, "name"), version)
 
             elif method == "tools/call":
                 tool_name = params.get("name")
@@ -2054,7 +2992,7 @@ class MCPServer(object):
                         request_state = params.get("requestState")
                         if not isinstance(request_state, str):
                             request_state = None
-                        collected = self._mrtr_load(request_state)
+                        collected = self._mrtr_load(request_state, session_id)
                         supplied = params.get("inputResponses")
                         if isinstance(supplied, dict):
                             collected.update(supplied)
@@ -2095,7 +3033,7 @@ class MCPServer(object):
                                 "resultType": "input_required",
                                 "inputRequests": needed.requests,
                                 "requestState": self._mrtr_save(
-                                    request_state, collected
+                                    request_state, collected, session_id
                                 ),
                             }
                         except Exception as e:
@@ -2109,11 +3047,16 @@ class MCPServer(object):
             elif method == "resources/list":
                 resources = []
                 with self._registry_lock:
-                    entries = list(self._resources.values())
+                    # Sorted for the same reasons tools/list is: a stable order
+                    # lets clients cache, and offset paging can only be walked
+                    # safely when the order does not shuffle between pages.
+                    entries = [self._resources[uri] for uri in sorted(self._resources)]
                 for r in entries:
                     resource_dict = r["definition"].to_dict()
                     resources.append(resource_dict)
-                result = self._cacheable({"resources": resources}, version)
+                result = self._cacheable(
+                    self._paginate(resources, params, "resources", {}, "uri"),
+                    version)
 
             elif method == "resources/templates/list":
                 # No URI-template resources are registered by this framework;
@@ -2124,80 +3067,114 @@ class MCPServer(object):
             elif method == "resources/read":
                 uri = params.get("uri")
 
-                # Strip proxy prefix from URI for lookup
-                lookup_uri = self._strip_proxy_prefix(uri) if uri else uri
-
-                if lookup_uri not in self._resources:
-                    # 2026-07-28 aligns resource-not-found with JSON-RPC's
-                    # Invalid Params; older clients keep the code they know.
-                    error = {
-                        "code": -32602 if modern else -32601,
-                        "message": "Resource not found: {}".format(uri),
-                    }
+                # Validated before use: a non-string uri reached a dict lookup
+                # and raised TypeError, which surfaced as an internal error
+                # with a traceback — blaming the server for the caller's
+                # malformed request, and logging a stack trace per bad request.
+                if not isinstance(uri, str) or not uri:
+                    error = {"code": -32602,
+                             "message": "resources/read requires a string uri"}
                 else:
-                    entry = self._resources[lookup_uri]
-                    handler = entry["handler"]
-                    definition = entry["definition"]
-                    res_mime = getattr(definition, "mimeType", None)
-                    res_meta = getattr(definition, "meta", None) or {}
-                    try:
-                        content = self._call_handler(
-                            handler, msg_id,
-                            session_id=session_id,
-                            progress_token=progress_token,
-                            meta=meta,
-                        )
+                    # Strip proxy prefix from URI for lookup
+                    lookup_uri = self._strip_proxy_prefix(uri)
 
-                        if isinstance(content, ResourceResult):
-                            result = content.to_dict()
-                        elif isinstance(content, dict):
-                            result = {
-                                "contents": [{
-                                    "uri": uri,
-                                    "text": json.dumps(content)
-                                }]
+                    if lookup_uri in self._skill_resources:
+                        # SEP-2640 skill file. No handler to call: the bytes
+                        # come straight off disk, read fresh on every call
+                        # (never cached ahead of need, per the SEP).
+                        skill_entry = self._skill_resources[lookup_uri]
+                        try:
+                            data = skill_entry["path"].read_bytes()
+                            content_item = {
+                                "uri": uri,
+                                "mimeType": skill_entry["mimeType"],
                             }
-                        else:
-                            result = {
-                                "contents": [{
-                                    "uri": uri,
-                                    "text": str(content)
-                                }]
-                            }
+                            try:
+                                content_item["text"] = data.decode("utf-8")
+                            except UnicodeDecodeError:
+                                content_item["blob"] = base64.b64encode(
+                                    data).decode("ascii")
+                            result = self._cacheable(
+                                {"contents": [content_item]}, version)
+                        except Exception as e:
+                            traceback.print_exc()
+                            error = {"code": -32603, "message": str(e)}
+                    elif lookup_uri not in self._resources:
+                        # 2026-07-28 aligns resource-not-found with JSON-RPC's
+                        # Invalid Params; older clients keep the code they know.
+                        error = {
+                            "code": -32602 if modern else -32601,
+                            "message": "Resource not found: {}".format(uri),
+                        }
+                    else:
+                        entry = self._resources[lookup_uri]
+                        handler = entry["handler"]
+                        definition = entry["definition"]
+                        res_mime = getattr(definition, "mimeType", None)
+                        res_meta = getattr(definition, "meta", None) or {}
+                        try:
+                            content = self._call_handler(
+                                handler, msg_id,
+                                session_id=session_id,
+                                progress_token=progress_token,
+                                meta=meta,
+                            )
 
-                        # Decorate each content entry with the registered
-                        # mimeType and `_meta` (mcp-apps CSP, permissions,
-                        # etc.). Don't override values the handler already
-                        # supplied via ResourceContent.
-                        for item in result.get("contents", []):
-                            if not isinstance(item, dict):
-                                continue
-                            if res_mime and "mimeType" not in item:
-                                item["mimeType"] = res_mime
-                            if res_meta and "_meta" not in item:
-                                item["_meta"] = res_meta
+                            if isinstance(content, ResourceResult):
+                                result = content.to_dict()
+                            elif isinstance(content, dict):
+                                result = {
+                                    "contents": [{
+                                        "uri": uri,
+                                        "text": json.dumps(content)
+                                    }]
+                                }
+                            else:
+                                result = {
+                                    "contents": [{
+                                        "uri": uri,
+                                        "text": str(content)
+                                    }]
+                                }
 
-                        # A read is a CacheableResult too, exactly like the
-                        # list methods above. Hosts that validate the result
-                        # schema reject a resources/read with no ttlMs and no
-                        # cacheScope, and for an MCP Apps server that rejection
-                        # means the app resource never loads at all.
-                        result = self._cacheable(result, version)
-                    except Exception as e:
-                        traceback.print_exc()
-                        error = {"code": -32603, "message": str(e)}
+                            # Decorate each content entry with the registered
+                            # mimeType and `_meta` (mcp-apps CSP, permissions,
+                            # etc.). Don't override values the handler already
+                            # supplied via ResourceContent.
+                            for item in result.get("contents", []):
+                                if not isinstance(item, dict):
+                                    continue
+                                if res_mime and "mimeType" not in item:
+                                    item["mimeType"] = res_mime
+                                if res_meta and "_meta" not in item:
+                                    item["_meta"] = res_meta
+
+                            # A read is a CacheableResult too, exactly like the
+                            # list methods above. Hosts that validate the result
+                            # schema reject a resources/read with no ttlMs and no
+                            # cacheScope, and for an MCP Apps server that rejection
+                            # means the app resource never loads at all.
+                            result = self._cacheable(result, version)
+                        except Exception as e:
+                            traceback.print_exc()
+                            error = {"code": -32603, "message": str(e)}
 
             elif method == "prompts/list":
                 with self._registry_lock:
-                    prompt_dicts = [p["definition"].to_dict()
-                                    for p in self._prompts.values()]
-                result = self._cacheable({"prompts": prompt_dicts}, version)
+                    prompt_dicts = [self._prompts[name]["definition"].to_dict()
+                                    for name in sorted(self._prompts)]
+                result = self._cacheable(
+                    self._paginate(prompt_dicts, params, "prompts", {}, "name"),
+                    version)
 
             elif method == "prompts/get":
                 prompt_name = params.get("name")
                 arguments = params.get("arguments", {})
 
-                if not isinstance(arguments, dict):
+                if not isinstance(prompt_name, str) or not prompt_name:
+                    error = {"code": -32602,
+                             "message": "prompts/get requires a string name"}
+                elif not isinstance(arguments, dict):
                     error = {"code": -32602,
                              "message": "prompts/get arguments must be a JSON object"}
                 elif prompt_name not in self._prompts:
@@ -2223,6 +3200,51 @@ class MCPServer(object):
                         traceback.print_exc()
                         error = {"code": -32603, "message": str(e)}
 
+            elif method == "skills/list":
+                # SEP-2640. Every entry is already a complete manifest
+                # (frontmatter verbatim, every file's digest and size), so
+                # there is nothing to compute here beyond sorting and paging.
+                with self._registry_lock:
+                    skill_dicts = [self._skills[uri]["definition"].to_dict()
+                                   for uri in sorted(self._skills)]
+                result = self._cacheable(
+                    self._paginate(skill_dicts, params, "skills", {}, "uri"),
+                    version)
+
+            elif method == "skills/get":
+                skill_uri = params.get("uri")
+                if not isinstance(skill_uri, str) or not skill_uri:
+                    error = {"code": -32602,
+                             "message": "skills/get requires a string uri"}
+                else:
+                    with self._registry_lock:
+                        entry = self._skills.get(skill_uri)
+                    if entry is None:
+                        # Same code resources/read uses for an unknown URI,
+                        # per SEP-2640.
+                        error = {"code": -32602,
+                                 "message": "Skill not found: {}".format(skill_uri)}
+                    else:
+                        result = self._cacheable(
+                            {"skill": entry["definition"].to_dict()}, version)
+
+            elif method == "resources/directory/read":
+                dir_uri = params.get("uri")
+                if not isinstance(dir_uri, str) or not dir_uri:
+                    error = {"code": -32602,
+                             "message": "resources/directory/read requires a string uri"}
+                else:
+                    with self._registry_lock:
+                        children = self._skill_directories.get(dir_uri)
+                        children = list(children) if children is not None else None
+                    if children is None:
+                        error = {"code": -32602,
+                                 "message": "Not a directory resource: {}".format(dir_uri)}
+                    else:
+                        result = self._cacheable(
+                            self._paginate(children, params, "resources", {}, "uri"),
+                            version)
+
             elif method == "logging/setLevel":
                 if modern:
                     # Removed: log level is per-request via _meta instead.
@@ -2236,6 +3258,9 @@ class MCPServer(object):
             else:
                 error = {"code": -32601, "message": "Method not found: {}".format(method)}
 
+        except InvalidParams as e:
+            # The caller's input was wrong — not the server failing.
+            error = {"code": -32602, "message": str(e)}
         except Exception as e:
             error = {"code": -32603, "message": str(e)}
             traceback.print_exc()
@@ -2281,7 +3306,10 @@ class MCPServer(object):
 
         with self._sessions_lock:
             self._sessions.pop(session_id, None)
-            self._drop_subscriptions(session_id)
+        # Outside the sessions lock on purpose. Everywhere else acquires
+        # subscriptions *before* sessions; nesting them the other way here
+        # would make one future edit that spans both a deadlock.
+        self._drop_subscriptions(session_id)
 
         prefix = "{}:".format(session_id)
         with self._pending_lock:
@@ -2315,8 +3343,8 @@ class MCPServer(object):
 
     def run(self, host="0.0.0.0", port=8000, path_prefix="",
             require_session_header=False, max_request_bytes=MAX_REQUEST_BYTES,
-            require_route_headers="auto"):
-        # type: (str, int, str, bool, int, Any) -> None
+            require_route_headers="auto", allowed_origins=None):
+        # type: (str, int, str, bool, int, Any, Optional[List[str]]) -> None
         """Start the MCP server.
 
         Args:
@@ -2351,6 +3379,16 @@ class MCPServer(object):
 
                 A *contradicting* header is always rejected, whatever this is
                 set to — that is the point of a header a gateway routes on.
+            allowed_origins: Origins a browser may call this server from. The
+                transport spec requires servers to validate ``Origin`` to block
+                DNS rebinding — a page on any origin can otherwise script a
+                request to a server reachable from the victim's browser.
+
+                A request carrying an ``Origin`` outside this list is refused
+                with HTTP 403. ``None`` (the default) accepts any origin,
+                because a library cannot know which are legitimate; **set it in
+                any deployment a browser can reach.** Requests with no
+                ``Origin`` at all — every non-browser client — are unaffected.
         """
         server_instance = self
         self._serving = True
@@ -2360,6 +3398,9 @@ class MCPServer(object):
         _max_bytes = int(max_request_bytes)
         self._require_route_headers = (
             "auto" if require_route_headers == "auto" else bool(require_route_headers))
+        self._allowed_origins = (
+            None if allowed_origins is None
+            else {str(o).rstrip("/").lower() for o in allowed_origins})
 
         class MCPRequestHandler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
@@ -2435,7 +3476,29 @@ class MCPServer(object):
                 separator = "&" if "?" in base else "?"
                 return "{}{}session_id={}".format(base, separator, session_id)
 
+            def _reject_forbidden_origin(self):
+                """Refuse a browser request from an origin outside the allowlist.
+
+                Checked on every method, not just POST: the SSE stream is a
+                long-lived channel a page can open cross-origin with
+                EventSource, which is the more useful target of the two.
+                """
+                if server_instance.origin_allowed(self.headers.get("Origin")):
+                    return False
+                body = json.dumps({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32600, "message": "Origin not allowed"},
+                }).encode("utf-8")
+                self.send_response(403)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return True
+
             def do_GET(self):
+                if self._reject_forbidden_origin():
+                    return
                 path = self._strip_prefix()
                 # Remove query string for path matching
                 path_only = path.split("?")[0]
@@ -2540,6 +3603,11 @@ class MCPServer(object):
 
             def do_POST(self):
                 try:
+                    # Before anything else, including reading the body: a
+                    # rebinding attempt should cost nothing.
+                    if self._reject_forbidden_origin():
+                        return
+
                     path = self._strip_prefix()
                     path_only = path.split("?")[0]
 

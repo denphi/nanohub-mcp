@@ -346,3 +346,82 @@ def test_simulator_example():
         assert status == 200
         constants = json.loads(body["result"]["contents"][0]["text"])
         assert constants["speed_of_light"]["value"] == 299792458
+
+
+def test_skills_example():
+    """SEP-2640: skills/list, skills/get, resources/read, and
+    resources/directory/read against a real skill served over HTTP, plus the
+    tool the skill's instructions point at."""
+    with ExampleServer("skills", port=18804) as srv:
+        # capabilities advertise the extension
+        status, body = srv.post("/", {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {}},
+        })
+        assert status == 200
+        caps = body["result"]["capabilities"]
+        assert caps["extensions"]["io.modelcontextprotocol/skills"] == {"directoryRead": True}
+
+        # skills/list
+        status, body = srv.post("/", {
+            "jsonrpc": "2.0", "id": 2, "method": "skills/list", "params": {},
+        })
+        assert status == 200
+        skills = body["result"]["skills"]
+        assert len(skills) == 1
+        entry = skills[0]
+        assert entry["uri"] == "skill://unit-conversion/SKILL.md"
+        assert entry["frontmatter"]["name"] == "unit-conversion"
+        resource_uris = {r["uri"] for r in entry["resources"]}
+        assert resource_uris == {
+            "skill://unit-conversion/SKILL.md",
+            "skill://unit-conversion/references/UNITS.md",
+        }
+
+        # skills/get — same entry, addressable directly by URI
+        status, body = srv.post("/", {
+            "jsonrpc": "2.0", "id": 3, "method": "skills/get",
+            "params": {"uri": "skill://unit-conversion/SKILL.md"},
+        })
+        assert status == 200
+        assert body["result"]["skill"] == entry
+
+        # skills/get on an unknown skill is Invalid Params
+        status, body = srv.post("/", {
+            "jsonrpc": "2.0", "id": 4, "method": "skills/get",
+            "params": {"uri": "skill://nope/SKILL.md"},
+        })
+        assert status == 200
+        assert body["error"]["code"] == -32602
+
+        # resources/read serves the skill's supporting file
+        status, body = srv.read_resource("skill://unit-conversion/references/UNITS.md")
+        assert status == 200
+        assert "## Length" in body["result"]["contents"][0]["text"]
+
+        # resources/directory/read lists the skill root's direct children
+        status, body = srv.post("/", {
+            "jsonrpc": "2.0", "id": 5, "method": "resources/directory/read",
+            "params": {"uri": "skill://unit-conversion"},
+        })
+        assert status == 200
+        children = body["result"]["resources"]
+        assert {r["uri"].rsplit("/", 1)[-1] for r in children} == {"SKILL.md", "references"}
+        # The SKILL.md child carries the frontmatter name and description.
+        skill_md = next(r for r in children if r["uri"].endswith("/SKILL.md"))
+        assert skill_md["name"] == "unit-conversion"
+        assert "convert_units" in skill_md["description"]
+
+        # the tool the skill's instructions point at
+        status, body = srv.call_tool(
+            "convert_units", {"value": 5.43, "from_unit": "angstrom", "to_unit": "nm"},
+            request_id=6)
+        assert status == 200 and body["result"]["isError"] is False
+        assert _tool_text(body) == "0.543"
+
+        # mismatched-group conversion is a tool error, not a transport error
+        status, body = srv.call_tool(
+            "convert_units", {"value": 1, "from_unit": "eV", "to_unit": "nm"},
+            request_id=7)
+        assert status == 200 and body["result"]["isError"] is True
+        assert "different physical quantities" in _tool_text(body)
