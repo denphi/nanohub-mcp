@@ -1,5 +1,139 @@
 # Changelog
 
+## Unreleased
+
+A conformance audit of every revision this server advertises, against the
+published specifications and the machine-readable schemas that accompany
+them. The 2026-07-28 surface was already close; nearly everything below is
+an older revision whose capability was advertised and then not backed, or a
+Streamable HTTP requirement the transport did not meet.
+
+### Fixed
+
+- **`resources.subscribe` was advertised with no method behind it.** Every
+  revision before 2026-07-28 backs that capability with `resources/subscribe`
+  and `resources/unsubscribe`, which returned `-32601 Method not found`. A
+  client that believed the capability failed every time it acted on it. Both
+  methods now exist, `resource_updated()` notifies their subscribers as well
+  as `subscriptions/listen` ones, and removing a resource drops the
+  subscriptions that watched it.
+- **The `logging` capability never delivered a log line.** `logging/setLevel`
+  returned success and discarded its argument, and `Context` read the level
+  only from 2026-07-28's `_meta`, so no pre-2026 client could ever receive a
+  `notifications/message`. The level is now recorded on the session and
+  honoured; an invalid level is `-32602` as the spec requires. Under
+  2026-07-28 a request that carried no level still emits nothing, which that
+  revision states as a MUST NOT.
+- **`outputSchema` was published and never enforced.** "Servers MUST provide
+  structured results that conform to this schema" — but a handler returning a
+  non-dict produced no `structuredContent` at all, and a non-conforming dict
+  was shipped unchecked. Results are now validated against the declared
+  schema and a breach is reported as a tool error instead of contradicting
+  what `tools/list` advertised.
+- **Tool arguments were not validated.** "Servers MUST validate all tool
+  inputs." A missing or mistyped argument reached the handler, raised a Python
+  `TypeError`, and came back as `isError` — telling the model the tool ran and
+  failed when the call never happened, in a message that leaked the handler's
+  signature. Malformed calls are now `-32602`. Genuine tool failures are still
+  reported as `isError`.
+- **`prompts/get` blamed the server for the caller's omission.** A missing
+  required argument surfaced as `-32603 Internal error`; it is now `-32602`.
+- **Responses were delivered twice, on two streams.** Streamable HTTP
+  "MUST NOT broadcast the same message across multiple streams" and "MUST NOT
+  send a JSON-RPC response on the [GET] stream"; every `/mcp` response went
+  out on the HTTP reply *and* onto every SSE queue for the session, leaving
+  clients to dedupe by id. The response now belongs to its own reply. The
+  legacy HTTP+SSE transport at `POST /` is unchanged, because delivering on
+  the stream is what that revision specifies.
+- **`@async_tool` calls took a pointless detour.** `tools/call` on an async
+  tool already returns immediately with the task handle, so handing the same
+  call to a second thread, replying `202`, and pushing the handle onto the SSE
+  stream bought no concurrency and put a response on the wrong stream. The
+  handle now comes back on the POST, like every other result.
+- **Not-found errors used codes the spec assigns to something else.** Unknown
+  tool and unknown prompt are `-32602` ("Unknown tool: ..." is the spec's own
+  example); `-32601` means the *method* does not exist. A missing resource is
+  `-32002` through 2025-11-25 and `-32602` from 2026-07-28, each with the
+  offending `uri` in `data`.
+- **Sessions could not be ended and were never collected.** There was no
+  `DELETE` handler, so the documented termination request got a `501`; a
+  session id the server no longer held was silently accepted instead of the
+  mandated `404`; and because only an SSE disconnect ever freed one, a
+  POST-only client's session lived for the life of the process. `DELETE` now
+  terminates, unknown ids get `404`, and idle sessions are swept. Closing a
+  notification stream no longer ends the session it belonged to — a client may
+  keep POSTing without one.
+- **An unsupported `MCP-Protocol-Version` header was not rejected.** The header
+  was only cross-checked against the body's `_meta`, so a header on its own —
+  all a 2025-06-18 client sends — went unvalidated. It is now `400`, as the
+  transport spec requires.
+- **`notifications/initialized` was not routed.** The table held the bare
+  `initialized`, which no conformant client sends.
+- **`202 Accepted` carried a body.** The spec says "with no body".
+- **`GET /mcp` emitted `event: open` and `event: endpoint`.** Those belong to
+  the 2024-11-05 HTTP+SSE handshake; Streamable HTTP defines neither. A GET
+  whose `Accept` excludes `text/event-stream` now gets `405`.
+- **JSON-RPC batches were accepted from every revision.** Batching was removed
+  in 2025-06-18, where the body "MUST be a single JSON-RPC request". Only a
+  session that negotiated 2024-11-05 may still send one.
+- **`ToolResult(meta=...)` was silently dropped.** `to_dict()` never emitted
+  `_meta`, so the documented argument did nothing.
+- **`Optional[X]` published a schema that denied `null`.** `Optional[str]`
+  became `{"type": "string"}`, so a client following the schema would not send
+  `null` and a validating one would reject it. It is now
+  `{"type": ["string", "null"]}`.
+- **An unannotated parameter was published as `"type": "string"`.** A guess
+  stated as fact, which would stop a client sending a number. Nothing known
+  means an empty schema.
+- **Proxy-prefix normalization matched past a path boundary.** Any URI *ending*
+  in a registered resource URI resolved to it; a match now has to fall on a
+  `/`.
+- **`subscriptions/listen` required a session.** 2026-07-28 removed sessions
+  and the GET endpoint, so the only revision that defines the method could not
+  reach it. It is now answered by holding its own POST open as the
+  notification stream, and a refused listen returns its error as JSON rather
+  than an empty stream.
+
+### Added
+
+- **URI template resources.** `@server.resource("weather://{city}/current")`
+  has been documented since the decorator was written and did nothing: the
+  template was registered as a literal resource, listed under a URI no read
+  could match, and never offered from `resources/templates/list` — which
+  returned a hardcoded empty list. Templates are now listed as templates and
+  `resources/read` matches against them, passing the extracted values to the
+  handler. Each placeholder matches one path segment; an unsupported RFC 6570
+  operator or a repeated variable is refused at registration rather than
+  silently never matching.
+- **`title` on tools, resources, prompts and templates; `annotations` and
+  `size` on resources.** Optional spec fields that had no way to be set.
+- **`AudioContent`, `ResourceLink` and `EmbeddedResource`**, and
+  `ToolResult(structured_content=...)`.
+- **`terminate_session()` and `session_exists()`** on `MCPServer`, behind the
+  `DELETE` handler.
+- **A startup warning** when the server binds a non-loopback address with no
+  `allowed_origins`. Origin validation is a MUST precisely to stop DNS
+  rebinding, and a library cannot guess the legitimate origins — so it now
+  says so instead of passing everything silently.
+- **Schema conformance tests for every advertised revision.** The vendored
+  schemas now cover 2024-11-05, 2025-06-18 and 2025-11-25 alongside
+  2026-07-28, and every list, read, get and call result is validated against
+  the revision that produced it. A revision the server accepts but never
+  checks is one it only claims to speak.
+
+### Changed
+
+- `skills/get` and `resources/directory/read` carry the offending `uri` in
+  `error.data`, matching `resources/read`. Their code stays `-32602`: the
+  extension postdates the revision that renumbered resource-not-found, so
+  there is no older code for it to have to speak.
+- `/.well-known/mcp.json` reported `"mcpVersion": "2024-11-05"` — the oldest
+  revision accepted, advertised as if it were the only one. It now reports the
+  default negotiated revision and lists every supported version.
+- Extensions are mirrored into `capabilities.experimental` for pre-2026
+  clients, which is where those revisions put non-standard features.
+  `capabilities.extensions` is still sent, so existing clients are unaffected.
+
 ## 0.4.4
 
 Completes the 2026-07-28 transport surface, fixes three header-validation

@@ -1,0 +1,744 @@
+"""Behaviours the specification requires that a schema check cannot see.
+
+`test_schema_conformance.py` proves every response has the right *shape*.
+These prove the right *thing happens*: that an advertised capability is
+backed by a working method, that an error carries the code the spec names,
+and that a session can be ended.
+"""
+
+from __future__ import print_function
+
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from nanohubmcp import MCPServer, ToolResult  # noqa: E402
+from nanohubmcp.server import (  # noqa: E402
+    LOG_LEVELS,
+    SESSION_IDLE_TIMEOUT_SECONDS,
+    _SSEQueue,
+)
+
+MODERN = {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}
+
+
+def rpc(server, method, params=None, session_id="S", msg_id=1):
+    return server._handle_request(
+        {"jsonrpc": "2.0", "id": msg_id, "method": method,
+         "params": params or {}},
+        session_id=session_id)
+
+
+def server_with(session_version="2025-06-18", session_id="S"):
+    server = MCPServer("spec")
+
+    @server.tool()
+    def echo(value):
+        """Echo a value"""
+        return value
+
+    @server.resource("config://settings")
+    def settings():
+        """Settings"""
+        return {"theme": "dark"}
+
+    @server.prompt()
+    def greet(name):
+        """Greet"""
+        return "Hello {}".format(name)
+
+    if session_version:
+        rpc(server, "initialize",
+            {"protocolVersion": session_version, "capabilities": {}}, session_id)
+    return server
+
+
+# ---------------------------------------------------------------------------
+# Error codes the spec names by number
+# ---------------------------------------------------------------------------
+
+def test_unknown_tool_is_invalid_params_not_method_not_found():
+    """The spec's own example: `Unknown tool: ...` carries -32602.
+
+    -32601 means the *method* does not exist, and `tools/call` does.
+    """
+    error = rpc(server_with(), "tools/call",
+                {"name": "nope", "arguments": {}})["error"]
+    assert error["code"] == -32602
+
+
+def test_unknown_prompt_is_invalid_params():
+    error = rpc(server_with(), "prompts/get", {"name": "nope"})["error"]
+    assert error["code"] == -32602
+
+
+@pytest.mark.parametrize("version,code", [
+    ("2024-11-05", -32002),
+    ("2025-06-18", -32002),
+    ("2025-11-25", -32002),
+])
+def test_missing_resource_uses_the_code_that_revision_defines(version, code):
+    """-32002 through 2025-11-25; 2026-07-28 renumbered it onto -32602."""
+    server = server_with(version)
+    error = rpc(server, "resources/read", {"uri": "config://nope"})["error"]
+    assert error["code"] == code
+    assert error["data"]["uri"] == "config://nope"
+
+
+def test_missing_resource_is_invalid_params_under_2026_07_28():
+    server = server_with(None)
+    error = rpc(server, "resources/read",
+                {"uri": "config://nope", "_meta": dict(MODERN)})["error"]
+    assert error["code"] == -32602
+
+
+# ---------------------------------------------------------------------------
+# resources.subscribe must be backed by the methods it promises
+# ---------------------------------------------------------------------------
+
+def test_advertised_subscribe_capability_has_a_working_method():
+    """Advertising `subscribe: true` obliges `resources/subscribe` to exist.
+
+    It was advertised while the method returned -32601, so every
+    conformant client that acted on the capability failed.
+    """
+    server = server_with()
+    caps = rpc(server, "initialize",
+               {"protocolVersion": "2025-06-18", "capabilities": {}})["result"]
+    assert caps["capabilities"]["resources"]["subscribe"] is True
+
+    assert rpc(server, "resources/subscribe",
+               {"uri": "config://settings"})["result"] == {}
+
+
+def test_subscribed_client_receives_resource_updated():
+    server = server_with()
+    queue = _SSEQueue()
+    server._register_client("S", queue)
+
+    rpc(server, "resources/subscribe", {"uri": "config://settings"})
+    assert server.resource_updated("config://settings") == 1
+
+    import json
+    sent = [json.loads(m) for m in queue]
+    assert [m["method"] for m in sent] == ["notifications/resources/updated"]
+    assert sent[0]["params"]["uri"] == "config://settings"
+    # Handshake revisions have no subscription id to correlate against.
+    assert "_meta" not in sent[0]["params"]
+
+
+def test_unsubscribe_stops_the_notifications():
+    server = server_with()
+    queue = _SSEQueue()
+    server._register_client("S", queue)
+
+    rpc(server, "resources/subscribe", {"uri": "config://settings"})
+    assert rpc(server, "resources/unsubscribe",
+               {"uri": "config://settings"})["result"] == {}
+    queue[:] = []
+    assert server.resource_updated("config://settings") == 0
+    assert list(queue) == []
+
+
+def test_subscribe_to_unknown_resource_is_not_found():
+    error = rpc(server_with(), "resources/subscribe",
+                {"uri": "config://nope"})["error"]
+    assert error["code"] == -32002
+
+
+def test_subscribe_is_gone_under_2026_07_28():
+    """2026-07-28 replaced both methods with `subscriptions/listen`."""
+    error = rpc(server_with(None), "resources/subscribe",
+                {"uri": "config://settings", "_meta": dict(MODERN)})["error"]
+    assert error["code"] == -32601
+    assert "subscriptions/listen" in error["message"]
+
+
+def test_removing_a_resource_drops_its_subscriptions():
+    server = server_with()
+    server._register_client("S", _SSEQueue())
+    rpc(server, "resources/subscribe", {"uri": "config://settings"})
+
+    assert server.remove_resource("config://settings") is True
+    assert server.resource_updated("config://settings") == 0
+
+
+# ---------------------------------------------------------------------------
+# logging: setLevel must actually set a level
+# ---------------------------------------------------------------------------
+
+def test_set_level_is_honoured_and_notifications_arrive():
+    """`logging` was advertised while setLevel discarded its argument.
+
+    The capability, the accepted request and the silence that followed
+    were each individually plausible; together they meant a client could
+    never receive a log line.
+    """
+    import json
+
+    server = MCPServer("logs")
+
+    @server.tool()
+    def noisy(ctx):
+        """Log one line"""
+        ctx.warning("careful")
+        return "done"
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-06-18", "capabilities": {}})
+    queue = _SSEQueue()
+    server._register_client("S", queue)
+
+    assert rpc(server, "logging/setLevel", {"level": "debug"})["result"] == {}
+    queue[:] = []
+    rpc(server, "tools/call", {"name": "noisy", "arguments": {}})
+
+    sent = [json.loads(m) for m in queue]
+    assert [m["method"] for m in sent] == ["notifications/message"]
+    assert sent[0]["params"]["level"] == "warning"
+
+
+def test_set_level_filters_below_the_threshold():
+    import json
+
+    server = MCPServer("logs")
+
+    @server.tool()
+    def quiet(ctx):
+        """Log below the threshold"""
+        ctx.debug("noise")
+        return "done"
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-06-18", "capabilities": {}})
+    queue = _SSEQueue()
+    server._register_client("S", queue)
+    rpc(server, "logging/setLevel", {"level": "error"})
+    queue[:] = []
+    rpc(server, "tools/call", {"name": "quiet", "arguments": {}})
+    assert [json.loads(m) for m in queue] == []
+
+
+@pytest.mark.parametrize("level", ["chatty", "", None, 3, "DEBUG"])
+def test_invalid_log_level_is_rejected(level):
+    """"Invalid log level: -32602"."""
+    error = rpc(server_with(), "logging/setLevel", {"level": level})["error"]
+    assert error["code"] == -32602
+
+
+@pytest.mark.parametrize("level", LOG_LEVELS)
+def test_every_rfc5424_level_is_accepted(level):
+    assert rpc(server_with(), "logging/setLevel",
+               {"level": level})["result"] == {}
+
+
+def test_no_log_notification_without_a_level_under_2026_07_28():
+    """"servers MUST NOT emit notifications/message for requests that did
+    not include this field"."""
+    import json
+
+    server = MCPServer("logs")
+
+    @server.tool()
+    def noisy(ctx):
+        """Log one line"""
+        ctx.error("boom")
+        return "done"
+
+    queue = _SSEQueue()
+    server._register_client("S", queue)
+    # A level set earlier by a handshake client must not leak into a
+    # stateless request that carried none.
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-06-18", "capabilities": {}})
+    rpc(server, "logging/setLevel", {"level": "debug"})
+    queue[:] = []
+
+    rpc(server, "tools/call",
+        {"name": "noisy", "arguments": {}, "_meta": dict(MODERN)})
+    assert [json.loads(m) for m in queue] == []
+
+
+# ---------------------------------------------------------------------------
+# outputSchema is a promise the server has to keep
+# ---------------------------------------------------------------------------
+
+def _schema_server():
+    server = MCPServer("schemas")
+
+    @server.tool(output_schema={"type": "object", "required": ["temp"],
+                                "properties": {"temp": {"type": "number"}}})
+    def good():
+        """Conforms"""
+        return {"temp": 21.5}
+
+    @server.tool(output_schema={"type": "object", "required": ["temp"],
+                                "properties": {"temp": {"type": "number"}}})
+    def wrong_type():
+        """Returns a string"""
+        return "sunny"
+
+    @server.tool(output_schema={"type": "object", "required": ["temp"],
+                                "properties": {"temp": {"type": "number"}}})
+    def missing_field():
+        """Omits a required property"""
+        return {"humidity": 65}
+
+    @server.tool(output_schema={"type": "object",
+                                "properties": {"temp": {"type": "number"}}})
+    def wrong_property_type():
+        """Right key, wrong type"""
+        return {"temp": "warm"}
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-06-18", "capabilities": {}})
+    return server
+
+
+def test_conforming_structured_result_passes_through():
+    result = rpc(_schema_server(), "tools/call",
+                 {"name": "good", "arguments": {}})["result"]
+    assert result["isError"] is False
+    assert result["structuredContent"] == {"temp": 21.5}
+    # "a tool that returns structured content SHOULD also return the
+    # serialized JSON in a TextContent block".
+    assert result["content"][0]["type"] == "text"
+
+
+@pytest.mark.parametrize("tool", ["wrong_type", "missing_field",
+                                  "wrong_property_type"])
+def test_result_violating_output_schema_is_reported_not_shipped(tool):
+    """"Servers MUST provide structured results that conform to this schema."
+
+    The server cannot invent a conforming result, so it reports the tool's
+    broken contract instead of publishing a payload that contradicts what
+    `tools/list` advertised.
+    """
+    result = rpc(_schema_server(), "tools/call",
+                 {"name": tool, "arguments": {}})["result"]
+    assert result["isError"] is True
+    assert "outputSchema" in result["content"][0]["text"]
+
+
+def test_tool_without_output_schema_is_unconstrained():
+    server = MCPServer("free")
+
+    @server.tool()
+    def anything():
+        """No schema declared"""
+        return "whatever"
+
+    result = rpc(server, "tools/call",
+                 {"name": "anything", "arguments": {}})["result"]
+    assert result["isError"] is False
+    assert "structuredContent" not in result
+
+
+def test_tool_result_meta_reaches_the_wire():
+    """`ToolResult(meta=...)` was accepted and then dropped by to_dict()."""
+    server = MCPServer("meta")
+
+    @server.tool()
+    def tagged():
+        """Carries metadata"""
+        return ToolResult(content="ok", meta={"trace": "abc"})
+
+    result = rpc(server, "tools/call",
+                 {"name": "tagged", "arguments": {}})["result"]
+    assert result["_meta"] == {"trace": "abc"}
+
+
+# ---------------------------------------------------------------------------
+# URI templates
+# ---------------------------------------------------------------------------
+
+def _template_server():
+    server = MCPServer("templates")
+
+    @server.resource("weather://{city}/current", mime_type="application/json")
+    def weather(city):
+        """Weather by city"""
+        return {"city": city}
+
+    @server.resource("config://settings")
+    def settings():
+        """Settings"""
+        return {"theme": "dark"}
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-06-18", "capabilities": {}})
+    return server
+
+
+def test_template_is_listed_as_a_template_not_a_resource():
+    server = _template_server()
+    resources = rpc(server, "resources/list")["result"]["resources"]
+    templates = rpc(server, "resources/templates/list")["result"]["resourceTemplates"]
+
+    assert [r["uri"] for r in resources] == ["config://settings"]
+    assert [t["uriTemplate"] for t in templates] == ["weather://{city}/current"]
+
+
+def test_reading_an_instantiated_template_passes_the_variables():
+    result = rpc(_template_server(), "resources/read",
+                 {"uri": "weather://paris/current"})["result"]
+    assert result["contents"][0]["uri"] == "weather://paris/current"
+    assert "paris" in result["contents"][0]["text"]
+
+
+def test_template_placeholder_does_not_span_path_segments():
+    """`{city}` matches one segment, so it cannot swallow a whole path."""
+    error = rpc(_template_server(), "resources/read",
+                {"uri": "weather://a/b/current"})["error"]
+    assert error["code"] == -32002
+
+
+def test_unsupported_rfc6570_operator_is_refused_at_registration():
+    server = MCPServer("templates")
+    with pytest.raises(ValueError) as caught:
+        @server.resource("files://{+path}")
+        def files(path):
+            """Reserved expansion, which this does not implement"""
+            return path
+    assert "RFC 6570" in str(caught.value)
+
+
+def test_repeated_template_variable_is_refused():
+    server = MCPServer("templates")
+    with pytest.raises(ValueError):
+        @server.resource("pair://{x}/{x}")
+        def pair(x):
+            """Same name twice"""
+            return x
+
+
+# ---------------------------------------------------------------------------
+# JSON-RPC batching was removed in 2025-06-18
+# ---------------------------------------------------------------------------
+
+def test_batch_is_accepted_for_a_2024_11_05_session():
+    server = server_with("2024-11-05")
+    responses = server._handle_jsonrpc_payload([
+        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+    ], session_id="S")
+    assert [r["id"] for r in responses] == [1, 2]
+
+
+@pytest.mark.parametrize("version", ["2025-06-18", "2025-11-25"])
+def test_batch_is_refused_from_2025_06_18(version):
+    """"The body of the POST request MUST be a single JSON-RPC request"."""
+    server = server_with(version)
+    response = server._handle_jsonrpc_payload(
+        [{"jsonrpc": "2.0", "id": 1, "method": "ping"}], session_id="S")
+    assert response["error"]["code"] == -32600
+    assert "batching" in response["error"]["message"]
+
+
+def test_batch_is_refused_without_a_session():
+    server = server_with(None)
+    response = server._handle_jsonrpc_payload(
+        [{"jsonrpc": "2.0", "id": 1, "method": "ping"}], session_id=None)
+    assert response["error"]["code"] == -32600
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle
+# ---------------------------------------------------------------------------
+
+def test_terminate_session_forgets_its_state():
+    server = server_with()
+    rpc(server, "resources/subscribe", {"uri": "config://settings"})
+    assert server.session_exists("S") is True
+
+    assert server.terminate_session("S") is True
+    assert server.session_exists("S") is False
+    assert server.terminate_session("S") is False
+    assert server.resource_updated("config://settings") == 0
+
+
+def test_idle_post_only_session_is_collected():
+    """A client that never opens a stream never disconnects one.
+
+    Its negotiated state used to live in `_sessions` for the life of the
+    process, because only an SSE disconnect ever cleaned one up.
+    """
+    server = server_with()
+    assert server.session_exists("S") is True
+
+    server._sessions["S"]["last_seen"] -= SESSION_IDLE_TIMEOUT_SECONDS + 1
+    server._prune_expired_sessions()
+    assert server.session_exists("S") is False
+
+
+def test_session_with_an_open_stream_is_never_collected():
+    server = server_with()
+    server._register_client("S", _SSEQueue())
+    server._sessions["S"]["last_seen"] -= SESSION_IDLE_TIMEOUT_SECONDS * 10
+
+    server._prune_expired_sessions()
+    assert server.session_exists("S") is True
+
+
+def test_activity_defers_expiry():
+    server = server_with()
+    server._sessions["S"]["last_seen"] -= SESSION_IDLE_TIMEOUT_SECONDS + 1
+    # Any request refreshes the stamp before the sweep can reach it.
+    rpc(server, "tools/list")
+    server._prune_expired_sessions()
+    assert server.session_exists("S") is True
+
+
+# ---------------------------------------------------------------------------
+# notifications/initialized
+# ---------------------------------------------------------------------------
+
+def test_notifications_initialized_is_routed():
+    """The name every revision through 2025-11-25 actually sends."""
+    server = server_with()
+    assert "notifications/initialized" in server._RPC_METHODS
+    assert server._handle_request(
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        session_id="S") is None
+
+
+# ---------------------------------------------------------------------------
+# Proxy-prefix normalization must not reach past a path boundary
+# ---------------------------------------------------------------------------
+
+def test_proxy_prefix_match_requires_a_path_boundary():
+    server = server_with()
+    assert server._strip_proxy_prefix(
+        "/weber/proxy/config://settings") == "config://settings"
+    # A bare suffix match resolved anything ending in the URI.
+    assert server._strip_proxy_prefix(
+        "https://elsewhereconfig://settings") == "https://elsewhereconfig://settings"
+
+
+# ---------------------------------------------------------------------------
+# Tool and prompt inputs are validated against what was published
+# ---------------------------------------------------------------------------
+
+def _typed_server():
+    server = MCPServer("typed")
+
+    @server.tool()
+    def add(a, b):
+        """Add two integers"""
+        return a + b
+
+    @server.tool()
+    def typed(a, b=None):
+        """Typed signature"""
+        return "{}/{}".format(a, b)
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-06-18", "capabilities": {}})
+    return server
+
+
+def test_missing_required_argument_is_a_protocol_error():
+    """"Servers MUST validate all tool inputs."
+
+    A call that never reached the handler is not a tool failure. Reporting
+    it as `isError` told the model the tool ran, and the message leaked the
+    handler's Python signature.
+    """
+    server = MCPServer("typed")
+
+    @server.tool()
+    def add(a: int, b: int):
+        """Add two integers"""
+        return a + b
+
+    response = rpc(server, "tools/call", {"name": "add", "arguments": {"a": 1}})
+    assert "result" not in response
+    assert response["error"]["code"] == -32602
+    assert "b" in response["error"]["message"]
+    assert "positional argument" not in response["error"]["message"]
+
+
+def test_wrongly_typed_argument_is_a_protocol_error():
+    server = MCPServer("typed")
+
+    @server.tool()
+    def add(a: int, b: int):
+        """Add two integers"""
+        return a + b
+
+    error = rpc(server, "tools/call",
+                {"name": "add", "arguments": {"a": "x", "b": 2}})["error"]
+    assert error["code"] == -32602
+
+
+def test_valid_arguments_still_reach_the_handler():
+    server = MCPServer("typed")
+
+    @server.tool()
+    def add(a: int, b: int):
+        """Add two integers"""
+        return a + b
+
+    result = rpc(server, "tools/call",
+                 {"name": "add", "arguments": {"a": 1, "b": 2}})["result"]
+    assert result["content"][0]["text"] == "3"
+
+
+def test_null_is_accepted_for_an_optional_parameter():
+    """The published schema admits null, so the server must too."""
+    from typing import Optional
+
+    server = MCPServer("typed")
+
+    @server.tool()
+    def maybe(a: int, b: Optional[str] = None):
+        """Optional second argument"""
+        return "{}/{}".format(a, b)
+
+    tool = rpc(server, "tools/list")["result"]["tools"][0]
+    assert tool["inputSchema"]["properties"]["b"]["type"] == ["string", "null"]
+
+    result = rpc(server, "tools/call",
+                 {"name": "maybe", "arguments": {"a": 1, "b": None}})["result"]
+    assert result["isError"] is False
+
+
+def test_unannotated_parameter_is_unconstrained_not_a_string():
+    """An unannotated parameter used to be published as `"type": "string"`.
+
+    That is a guess stated as fact: a client reading the schema would not
+    send a number, and with inputs now validated it could not.
+    """
+    server = _typed_server()
+    schema = [t for t in rpc(server, "tools/list")["result"]["tools"]
+              if t["name"] == "add"][0]["inputSchema"]
+    assert schema["properties"]["a"] == {}
+
+    result = rpc(server, "tools/call",
+                 {"name": "add", "arguments": {"a": 1, "b": 2}})["result"]
+    assert result["content"][0]["text"] == "3"
+
+
+def test_tool_failure_is_still_reported_as_a_tool_error():
+    """Validation must not turn genuine tool failures into protocol errors."""
+    server = MCPServer("failing")
+
+    @server.tool()
+    def boom(a: int):
+        """Raises"""
+        raise RuntimeError("upstream is down")
+
+    result = rpc(server, "tools/call",
+                 {"name": "boom", "arguments": {"a": 1}})["result"]
+    assert result["isError"] is True
+    assert "upstream is down" in result["content"][0]["text"]
+
+
+def test_missing_required_prompt_argument_is_invalid_params():
+    """It was -32603, which blames the server for the caller's omission."""
+    error = rpc(server_with(), "prompts/get",
+                {"name": "greet", "arguments": {}})["error"]
+    assert error["code"] == -32602
+    assert "name" in error["message"]
+
+
+def test_prompt_with_its_arguments_still_works():
+    result = rpc(server_with(), "prompts/get",
+                 {"name": "greet", "arguments": {"name": "ada"}})["result"]
+    assert "ada" in result["messages"][0]["content"]["text"]
+
+
+@pytest.mark.parametrize("name", [{"a": 1}, ["x"], 7, None])
+def test_unhashable_or_wrong_typed_names_are_invalid_params(name):
+    """`name` is caller-supplied JSON; an unhashable one must not crash."""
+    server = server_with()
+    for method in ("tools/call", "prompts/get"):
+        response = rpc(server, method, {"name": name, "arguments": {}})
+        assert response["error"]["code"] == -32602, (method, response)
+
+
+# ---------------------------------------------------------------------------
+# Optional spec fields must be reachable from the public API
+# ---------------------------------------------------------------------------
+
+def test_title_is_settable_on_tools_prompts_and_resources():
+    """A field the types accept but no decorator passes is a field nobody has.
+
+    `title` is the spec's human-readable display name, distinct from `name`,
+    which is the programmatic identifier.
+    """
+    server = MCPServer("titles")
+
+    @server.tool(title="Add Numbers")
+    def add(a: int, b: int):
+        """Add"""
+        return a + b
+
+    @server.prompt(title="Greeting")
+    def greet(name: str):
+        """Greet"""
+        return "hi"
+
+    @server.resource("config://x", title="Configuration")
+    def config():
+        """Config"""
+        return {}
+
+    @server.resource("t://{v}/x", title="Templated")
+    def templated(v):
+        """Templated"""
+        return {}
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-11-25", "capabilities": {}})
+
+    assert rpc(server, "tools/list")["result"]["tools"][0]["title"] == "Add Numbers"
+    assert rpc(server, "prompts/list")["result"]["prompts"][0]["title"] == "Greeting"
+    assert rpc(server, "resources/list")["result"]["resources"][0][
+        "title"] == "Configuration"
+    assert rpc(server, "resources/templates/list")["result"][
+        "resourceTemplates"][0]["title"] == "Templated"
+
+
+def test_async_tool_carries_title_and_output_schema():
+    server = MCPServer("titles")
+
+    @server.async_tool(title="Slow Job",
+                       output_schema={"type": "object",
+                                      "properties": {"ok": {"type": "boolean"}}})
+    def slow():
+        """Slow"""
+        return {"ok": True}
+
+    tool = [t for t in rpc(server, "tools/list")["result"]["tools"]
+            if t["name"] == "slow"][0]
+    assert tool["title"] == "Slow Job"
+    assert tool["outputSchema"]["properties"]["ok"] == {"type": "boolean"}
+
+
+def test_resource_size_reaches_the_wire():
+    """`size` was serialized by `Resource.to_dict` and settable by nobody."""
+    server = MCPServer("sized")
+
+    @server.resource("config://x", size=42)
+    def config():
+        """Config"""
+        return {}
+
+    assert rpc(server, "resources/list")["result"]["resources"][0]["size"] == 42
+
+
+def test_resource_annotations_reach_the_wire():
+    server = MCPServer("annotated")
+
+    @server.resource("config://x",
+                     annotations={"audience": ["user"], "priority": 0.8})
+    def config():
+        """Config"""
+        return {}
+
+    resource = rpc(server, "resources/list")["result"]["resources"][0]
+    assert resource["annotations"] == {"audience": ["user"], "priority": 0.8}

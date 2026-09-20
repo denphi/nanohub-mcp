@@ -32,6 +32,7 @@ from .context import Context
 from .types import (
     Tool,
     Resource,
+    ResourceTemplate,
     Prompt,
     Skill,
     InputRequired,
@@ -43,6 +44,9 @@ from .types import (
     Message,
     TextContent,
     ImageContent,
+    AudioContent,
+    ResourceLink,
+    EmbeddedResource,
     Image,
     Role,
     # Backwards compatibility aliases
@@ -62,6 +66,7 @@ __all__ = [
     "Context",
     "Tool",
     "Resource",
+    "ResourceTemplate",
     "Prompt",
     "Skill",
     "InputRequired",
@@ -73,6 +78,9 @@ __all__ = [
     "Message",
     "TextContent",
     "ImageContent",
+    "AudioContent",
+    "ResourceLink",
+    "EmbeddedResource",
     "Image",
     "Role",
     # Backwards compatibility aliases

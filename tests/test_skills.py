@@ -228,7 +228,10 @@ def test_resources_read_unknown_skill_uri_is_not_found(tmp_path):
     server = _server_with_skill(tmp_path)
     error = _rpc(server, "resources/read",
                  {"uri": "skill://git-workflow/nope.md"})["error"]
-    assert error["code"] in (-32602, -32601)
+    # The spec's resource-not-found code: -32002 through 2025-11-25, which
+    # `_rpc` speaks, and -32602 once 2026-07-28 renumbered it.
+    assert error["code"] == -32002
+    assert error["data"]["uri"] == "skill://git-workflow/nope.md"
 
 
 # ---------------------------------------------------------------------------

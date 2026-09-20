@@ -156,6 +156,58 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         separator = "&" if "?" in base else "?"
         return "{}{}session_id={}".format(base, separator, session_id)
 
+    # Revisions this server speaks, mirrored from the server module so a
+    # bad `MCP-Protocol-Version` can be rejected before the body is parsed.
+    def _supported_versions(self):
+        from .server import SUPPORTED_PROTOCOL_VERSIONS
+        return SUPPORTED_PROTOCOL_VERSIONS
+
+    def _reject_bad_protocol_header(self):
+        """Refuse an `MCP-Protocol-Version` header naming a revision we lack.
+
+        "If the server receives a request with an invalid or unsupported
+        `MCP-Protocol-Version`, it MUST respond with 400 Bad Request." This
+        was previously only cross-checked against the body's `_meta`, so a
+        header alone — which is all a 2025-06-18 client sends — went
+        unvalidated and the request was answered as if it had matched.
+        """
+        declared = self.headers.get("MCP-Protocol-Version")
+        if declared is None or declared in self._supported_versions():
+            return False
+        self._send_json({
+            "jsonrpc": "2.0", "id": None,
+            "error": {
+                "code": -32602,
+                "message": "Unsupported MCP-Protocol-Version: {}".format(declared),
+                "data": {"supported": list(self._supported_versions())},
+            },
+        }, status=400)
+        return True
+
+    def _reject_unknown_session(self):
+        """Refuse a session id the server no longer holds, with 404.
+
+        "The server MAY terminate the session at any time, after which it
+        MUST respond to requests containing that session ID with HTTP 404
+        Not Found" — which is how a client knows to re-initialize. An id
+        that was silently accepted instead left the client believing in a
+        session whose negotiated state had been dropped.
+
+        Only an id the client actually *sent* is checked. An initialize is
+        exempt: that is the request that creates the session.
+        """
+        session_id = self.headers.get("Mcp-Session-Id")
+        if not session_id:
+            return False
+        if self.server_instance.session_exists(session_id):
+            return False
+        self._send_json({
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": -32600,
+                      "message": "Session not found: re-initialize"},
+        }, status=404)
+        return True
+
     def _reject_forbidden_origin(self):
         """Refuse a browser request from an origin outside the allowlist.
 
@@ -178,6 +230,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self._reject_forbidden_origin():
+            return
+        if self._reject_bad_protocol_header():
             return
         path = self._strip_prefix()
         # Remove query string for path matching
@@ -287,6 +341,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             # rebinding attempt should cost nothing.
             if self._reject_forbidden_origin():
                 return
+            if self._reject_bad_protocol_header():
+                return
 
             path = self._strip_prefix()
             path_only = path.split("?")[0]
@@ -335,6 +391,14 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 }, status=400)
                 return
 
+            # A session id the server no longer holds is a 404, so the
+            # client re-initializes instead of running against state that
+            # was dropped. `initialize` is what creates the session, and
+            # the REST endpoint has none, so both are exempt.
+            if (not is_direct_tool and not self._is_initialize(request)
+                    and self._reject_unknown_session()):
+                return
+
             session_id = self._session_id()
             # Streamable HTTP: a client initializes with a POST and
             # expects the server to mint the session and return it in
@@ -367,78 +431,64 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 print("Received: invalid JSON-RPC payload")
 
             if path_only in ("/mcp", "/mcp/"):
-                # Fast methods (initialize, tools/list, ping, etc.) are
-                # handled synchronously so proxy clients get the
-                # response on the HTTP reply. Async tool calls
-                # (@async_tool) return a job_id wrapper immediately
-                # (HTTP 202 + the job_id broadcast on SSE); the actual
-                # result lands in the job table and the client polls
-                # via get_job_result.
-                method = request.get("method", "") if isinstance(request, dict) else ""
-                request_params = request.get("params", {}) if isinstance(request, dict) else {}
-                tool_name = request_params.get("name", "") if isinstance(request_params, dict) else ""
-                tool_entry = self.server_instance._tools.get(tool_name, {})
-                is_slow = method == "tools/call" and tool_entry.get("is_async", False)
-                returns_task = (
-                    is_slow and
-                    self.server_instance._client_supports_tasks(
-                        session_id=session_id,
-                        params=request_params if isinstance(request_params, dict) else {},
-                    )
+                # `subscriptions/listen` (2026-07-28) is answered by holding
+                # *this* POST open as an SSE stream and delivering the
+                # notifications on it. That revision removed sessions and the
+                # GET endpoint, so requiring a session id — which is what
+                # happened while the listen stream borrowed the GET channel —
+                # made the method unreachable for the only revision that has
+                # it.
+                if (isinstance(request, dict)
+                        and request.get("method") == "subscriptions/listen"):
+                    self._handle_subscription_stream(request, session_id)
+                    return
+
+                # Every method is handled on this thread. An @async_tool is
+                # not an exception: `tools/call` on one *returns immediately*
+                # with the task handle (or the job_id wrapper) and starts the
+                # worker in the background, so there is nothing to wait for.
+                #
+                # This used to hand the same call to a second thread, reply
+                # 202, and push that same immediate handle onto the session's
+                # SSE stream. It bought no concurrency — the work was already
+                # off-thread — and it put a response on a stream the spec
+                # reserves for server-initiated messages.
+                response = self.server_instance._handle_jsonrpc_payload(
+                    request, session_id=session_id, headers=self.headers
                 )
-
-                if is_slow and session_id and not returns_task:
-                    def async_handler():
-                        try:
-                            resp = self.server_instance._handle_request(
-                                request, session_id=session_id
-                            )
-                            if resp:
-                                self.server_instance._broadcast(resp, session_id=session_id)
-                        except Exception as e:
-                            print("Error in async handler: {}".format(e))
-                            traceback.print_exc()
-
-                    t = threading.Thread(target=async_handler)
-                    t.daemon = True
-                    t.start()
-
-                    body = b'{"status":"accepted"}'
-                    self.send_response(202)
-                    self.send_header("Access-Control-Allow-Origin", "*")
+                # Streamable HTTP: the response belongs to *this* HTTP
+                # reply and nowhere else. The transport spec is explicit
+                # on both halves of that — a server "MUST NOT broadcast
+                # the same message across multiple streams", and "MUST
+                # NOT send a JSON-RPC response on the [GET] stream unless
+                # resuming". Echoing it onto the session's SSE queues did
+                # both, and left clients listening on both channels to
+                # dedupe by id.
+                if response:
+                    body = json.dumps(response).encode("utf-8")
+                    self.send_response(
+                        self.server_instance._http_status_for(response))
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
                 else:
-                    response = self.server_instance._handle_jsonrpc_payload(
-                        request, session_id=session_id, headers=self.headers
-                    )
-                    # Streamable HTTP: deliver the response on the HTTP
-                    # reply *and* over the SSE stream so clients can
-                    # subscribe to either channel. Clients listening on
-                    # both should dedupe by JSON-RPC id.
-                    if response:
-                        self.server_instance._broadcast(response, session_id=session_id)
-                        body = json.dumps(response).encode("utf-8")
-                        self.send_response(
-                            self.server_instance._http_status_for(response))
-                    else:
-                        body = b'{"status":"accepted"}'
-                        self.send_response(202)
+                    # A notification or response was accepted. The spec
+                    # asks for 202 *with no body*, so send none.
+                    body = b""
+                    self.send_response(202)
+                    self.send_header("Content-Length", "0")
 
-                    self.send_header("Access-Control-Allow-Origin", "*")
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
-                    self._send_session_headers(minted_session)
-                    self.end_headers()
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self._send_session_headers(minted_session)
+                self.end_headers()
+                if body:
                     self.wfile.write(body)
                 return
 
-            # Legacy HTTP+SSE transport: POST / pairs with GET /sse.
-            # Per the legacy spec, responses are delivered via the SSE
-            # stream; we also echo on the HTTP reply for REST-style
-            # clients that don't open an SSE channel.
+            # Legacy HTTP+SSE transport (2024-11-05): POST / pairs with
+            # GET /sse, and that revision *does* deliver responses on the
+            # SSE stream — unlike Streamable HTTP above, where doing so is
+            # a MUST NOT. The HTTP echo is the extra here, kept for
+            # REST-style clients that never open an SSE channel.
             response = self.server_instance._handle_jsonrpc_payload(
                 request, session_id=session_id, headers=self.headers
             )
@@ -448,16 +498,18 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 body = json.dumps(response).encode("utf-8")
                 self.send_response(
                     self.server_instance._http_status_for(response))
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
             else:
-                body = b'{"status":"accepted"}'
+                body = b""
                 self.send_response(202)
+                self.send_header("Content-Length", "0")
 
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
             self._send_session_headers(minted_session)
             self.end_headers()
-            self.wfile.write(body)
+            if body:
+                self.wfile.write(body)
 
         except Exception as e:
             print("Error handling POST: {}".format(e))
@@ -567,8 +619,103 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(error_body)
 
+    def _is_stateless_request(self, request):
+        """Whether this message declares a revision that has no sessions."""
+        from .server import MCPServer
+        params = request.get("params") if isinstance(request, dict) else None
+        params = params if isinstance(params, dict) else {}
+        return MCPServer._is_stateless(
+            self.server_instance._request_protocol_version(params))
+
+    def _handle_subscription_stream(self, request, session_id):
+        """Answer `subscriptions/listen` with a long-lived SSE response.
+
+        The stream is scoped to this request. When the client already has a
+        session it keeps using it, so a handshake-era client sees the
+        notifications on the channel it knows; otherwise a stream id is
+        minted and torn down with the connection, which is what a stateless
+        2026-07-28 caller needs.
+        """
+        if not self._accepts_event_stream():
+            self.send_error(
+                405, "subscriptions/listen is answered with text/event-stream")
+            return
+
+        owned = not session_id
+        stream_id = session_id or self._new_session_id()
+        client_queue = _SSEQueue()
+        self.server_instance._register_client(stream_id, client_queue)
+
+        try:
+            # Registers the subscription and queues the acknowledgment,
+            # which the pump below writes out as the stream's first event.
+            # A *rejected* listen (bad filter, too many subscriptions)
+            # returns an error envelope instead, and that has to go back as
+            # JSON — opening an empty stream would leave the client waiting
+            # forever for notifications it was never subscribed to.
+            refusal = self.server_instance._handle_request(
+                request, session_id=stream_id, headers=self.headers)
+        except Exception:
+            traceback.print_exc()
+            self.server_instance._unregister_client(stream_id, client_queue)
+            self.send_error(500, "subscriptions/listen failed")
+            return
+
+        if refusal is not None:
+            self.server_instance._unregister_client(stream_id, client_queue)
+            self._send_json(
+                refusal,
+                status=self.server_instance._http_status_for(refusal))
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        # 2026-07-28 removed sessions and this header, and a caller speaking
+        # it correlates by the stream itself. Only a handshake-era client
+        # that arrived without a session is told the id we minted.
+        if owned and not self._is_stateless_request(request):
+            self.send_header("Mcp-Session-Id", stream_id)
+            self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
+        self.end_headers()
+
+        try:
+            self._sse_pump_loop(client_queue)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            traceback.print_exc()
+        finally:
+            self.server_instance._unregister_client(stream_id, client_queue)
+
+    def _accepts_event_stream(self):
+        """Whether the client's Accept header allows an SSE response.
+
+        "The client MUST include an `Accept` header, listing
+        `text/event-stream` as a supported content type", and the server
+        MUST answer such a GET with either that content type or 405. A
+        client that asked only for JSON gets the 405 rather than a stream
+        it said it could not read. A missing header is treated as `*/*`,
+        which is what HTTP says an absent Accept means.
+        """
+        accept = self.headers.get("Accept")
+        if not accept:
+            return True
+        accept = accept.lower()
+        return ("text/event-stream" in accept
+                or "*/*" in accept or "text/*" in accept)
+
     def _handle_streamable_http_get(self):
         """Handle Streamable HTTP GET - returns SSE stream for async responses."""
+        if not self._accepts_event_stream():
+            self.send_error(
+                405, "This endpoint answers GET with text/event-stream only")
+            return
+        if self._reject_unknown_session():
+            return
         session_id = self._session_id() or self._new_session_id()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -587,10 +734,12 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         ))
 
         try:
-            # Send endpoint event per MCP Streamable HTTP spec
-            self.wfile.write(b"event: open\ndata: {}\n\n")
-            endpoint = self._endpoint_path("/mcp", session_id)
-            self.wfile.write("event: endpoint\ndata: {}\n\n".format(endpoint).encode("utf-8"))
+            # No `open`/`endpoint` events here. Those belong to the
+            # 2024-11-05 HTTP+SSE transport, where the client learns its
+            # POST target from the stream; Streamable HTTP has a single
+            # known endpoint and defines neither event. A comment line
+            # keeps proxies from buffering the empty stream.
+            self.wfile.write(b": stream open\n\n")
             self.wfile.flush()
 
             self._sse_pump_loop(client_queue)
@@ -679,13 +828,18 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
     def _handle_mcp_discovery(self):
         """Return MCP discovery document."""
+        from .server import DEFAULT_NEGOTIATED_VERSION, SUPPORTED_PROTOCOL_VERSIONS
         discovery = {
-            "mcpVersion": "2024-11-05",
+            # Was pinned at "2024-11-05" — the oldest revision this server
+            # speaks, advertised as if it were the only one.
+            "mcpVersion": DEFAULT_NEGOTIATED_VERSION,
+            "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
             "serverInfo": {
                 "name": self.server_instance.name,
                 "version": self.server_instance.version
             },
-            "capabilities": self.server_instance._get_capabilities().to_dict(),
+            "capabilities": self.server_instance._get_capabilities().to_dict(
+                DEFAULT_NEGOTIATED_VERSION),
             "transports": [
                 {"type": "sse", "endpoint": "/sse"},
                 {"type": "streamable-http", "endpoint": "/mcp"}
@@ -700,11 +854,51 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_DELETE(self):
+        """Terminate a session, per the Streamable HTTP session lifecycle.
+
+        "Clients that no longer need a particular session SHOULD send an
+        HTTP DELETE to the MCP endpoint with the `Mcp-Session-Id` header."
+        Without a handler, BaseHTTPRequestHandler answered 501 and the
+        session was never released — a POST-only client had no way at all
+        to tell the server it was done.
+        """
+        if self._reject_forbidden_origin():
+            return
+        path_only = self._strip_prefix().split("?")[0]
+        if path_only.rstrip("/") not in ("/mcp", "/sse", ""):
+            self.send_error(404, "No endpoint at {}".format(path_only))
+            return
+
+        session_id = self._session_id()
+        if not session_id:
+            self._send_json({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600,
+                          "message": "DELETE requires an Mcp-Session-Id header"},
+            }, status=400)
+            return
+        if not self.server_instance.terminate_session(session_id):
+            # Already gone — the same 404 any later request with this id gets.
+            self._send_json({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "Session not found"},
+            }, status=404)
+            return
+
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
+        self.send_header("Access-Control-Allow-Methods",
+                         "GET, POST, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Content-Type, Authorization, Mcp-Session-Id, "
+                         "MCP-Protocol-Version, Mcp-Method, Mcp-Name")
         self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
         self.send_header("Content-Length", "0")
         self.end_headers()

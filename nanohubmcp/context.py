@@ -263,6 +263,9 @@ class Context(object):
         """Log an error message."""
         self._log("error", message, kwargs)
 
+    # RFC 5424 severities, lowest first. Deliberately a copy of
+    # `server.LOG_LEVELS` rather than an import: `server` imports this
+    # module, so taking it the other way would close the cycle.
     _LEVEL_ORDER = ("debug", "info", "notice", "warning", "error",
                     "critical", "alert", "emergency")
 
@@ -307,10 +310,29 @@ class Context(object):
 
     def _requested_log_level(self):
         # type: () -> Optional[str]
-        """The level this request asked for, or None if it asked for nothing."""
+        """The level to filter against, or None to send nothing.
+
+        Two revisions, two places to look. 2026-07-28 puts the level in this
+        request's `_meta` and forbids emitting `notifications/message` without
+        it. Every earlier revision sets it once with `logging/setLevel`, which
+        the server records on the session — so a handshake-era client that
+        asked for logs actually gets them, which it did not while only `_meta`
+        was consulted.
+        """
         meta = self._meta if isinstance(self._meta, dict) else {}
         level = meta.get("io.modelcontextprotocol/logLevel")
-        return level if isinstance(level, str) and level else None
+        if isinstance(level, str) and level:
+            return level
+        server = self._server
+        if server is None or self._uses_mrtr():
+            # Under 2026-07-28 the absent `_meta` key *is* the answer: the
+            # server MUST NOT emit anything for a request that omitted it.
+            return None
+        getter = getattr(server, "_session_log_level", None)
+        if getter is None:
+            return None
+        stored = getter(self._session_id)
+        return stored if isinstance(stored, str) and stored else None
 
     def get_log_messages(self):
         # type: () -> List[Dict[str, Any]]

@@ -46,7 +46,10 @@ MODERN_META = {
 def validate(schema, definition, instance):
     """Assert `instance` matches `definition` in `schema`, with a readable diff."""
     root = dict(schema)
-    root["$ref"] = "#/$defs/" + definition
+    # 2024-11-05 and 2025-06-18 were generated against draft-07 and keep
+    # their types under `definitions`; the later revisions use `$defs`.
+    key = "$defs" if "$defs" in schema else "definitions"
+    root["$ref"] = "#/{}/{}".format(key, definition)
     errors = sorted(Draft202012Validator(root).iter_errors(instance),
                     key=lambda e: list(e.path))
     if errors:
@@ -1245,3 +1248,117 @@ def test_subscriptions_per_session_are_capped():
         "params": {"notifications": {"toolsListChanged": True},
                    "_meta": dict(MODERN_META)}}, session_id="S")
     assert again is None
+
+
+# ---------------------------------------------------------------------------
+# Every advertised revision, validated against its own published schema.
+#
+# The checks above cover 2026-07-28. These cover the other three entries of
+# SUPPORTED_PROTOCOL_VERSIONS: a revision the server accepts at `initialize`
+# but never validates is a revision it only claims to speak.
+# ---------------------------------------------------------------------------
+
+from nanohubmcp import ResourceLink, ToolResult  # noqa: E402
+from nanohubmcp.server import SUPPORTED_PROTOCOL_VERSIONS  # noqa: E402
+
+_HANDSHAKE_VERSIONS = [v for v in SUPPORTED_PROTOCOL_VERSIONS
+                       if v != "2026-07-28"]
+
+
+def _schema_for(version):
+    return _load("mcp-{}.schema.json".format(version))
+
+
+def _conformance_server():
+    server = MCPServer("schema-probe", version="9.9.9")
+
+    @server.tool(annotations={"title": "Add", "readOnlyHint": True},
+                 output_schema={"type": "object", "required": ["sum"],
+                                "properties": {"sum": {"type": "integer"}}})
+    def add(a, b):
+        """Add two integers"""
+        return {"sum": a + b}
+
+    @server.tool()
+    def rich():
+        """Structured content plus _meta"""
+        return ToolResult(content="ok", meta={"trace": "1"},
+                          structured_content={"ok": True})
+
+    @server.resource("config://settings", mime_type="application/json",
+                     title="Settings",
+                     annotations={"audience": ["user"], "priority": 0.5})
+    def settings():
+        """App settings"""
+        return {"theme": "dark"}
+
+    @server.resource("weather://{city}/current", mime_type="application/json")
+    def weather(city):
+        """Weather for a city"""
+        return {"city": city}
+
+    @server.prompt()
+    def greet(name):
+        """Greeting prompt"""
+        return "Hello {}".format(name)
+
+    return server
+
+
+def _rpc(server, method, params, session_id):
+    return server._handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
+        session_id=session_id)
+
+
+@pytest.mark.parametrize("version", _HANDSHAKE_VERSIONS)
+@pytest.mark.parametrize("method,definition,params", [
+    ("tools/list", "ListToolsResult", {}),
+    ("resources/list", "ListResourcesResult", {}),
+    ("resources/templates/list", "ListResourceTemplatesResult", {}),
+    ("prompts/list", "ListPromptsResult", {}),
+    ("resources/read", "ReadResourceResult", {"uri": "config://settings"}),
+    ("resources/read", "ReadResourceResult", {"uri": "weather://paris/current"}),
+    ("prompts/get", "GetPromptResult", {"name": "greet",
+                                        "arguments": {"name": "x"}}),
+    ("tools/call", "CallToolResult", {"name": "add", "arguments": {"a": 1, "b": 2}}),
+    ("tools/call", "CallToolResult", {"name": "rich", "arguments": {}}),
+])
+def test_handshake_revision_results_match_published_schema(
+        version, method, definition, params):
+    server = _conformance_server()
+    session = "S-{}".format(version)
+    _rpc(server, "initialize",
+         {"protocolVersion": version, "capabilities": {}}, session)
+
+    response = _rpc(server, method, params, session)
+    assert "error" not in response, response
+    validate(_schema_for(version), definition, response["result"])
+
+
+@pytest.mark.parametrize("version", _HANDSHAKE_VERSIONS)
+def test_handshake_initialize_result_matches_published_schema(version):
+    server = _conformance_server()
+    response = _rpc(server, "initialize",
+                    {"protocolVersion": version, "capabilities": {}},
+                    "S-{}".format(version))
+    validate(_schema_for(version), "InitializeResult", response["result"])
+    assert response["result"]["protocolVersion"] == version
+
+
+@pytest.mark.parametrize("version", ["2025-06-18", "2025-11-25"])
+def test_resource_link_matches_schema_where_the_revision_defines_it(version):
+    """`resource_link` exists from 2025-06-18; 2024-11-05 has no such type."""
+    server = _conformance_server()
+
+    @server.tool()
+    def linker():
+        """Return a resource link"""
+        return ToolResult(content=[ResourceLink("config://settings", name="cfg")])
+
+    session = "S-link-{}".format(version)
+    _rpc(server, "initialize",
+         {"protocolVersion": version, "capabilities": {}}, session)
+    response = _rpc(server, "tools/call",
+                    {"name": "linker", "arguments": {}}, session)
+    validate(_schema_for(version), "CallToolResult", response["result"])

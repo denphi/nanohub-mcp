@@ -18,8 +18,10 @@ from __future__ import print_function
 import base64
 import inspect
 import json
+import re
 import sys
 import threading
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -32,7 +34,8 @@ except ImportError:  # pragma: no cover - Python 2 fallback
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from .types import (
-    Tool, Resource, Prompt, TextContent, ImageContent, InputRequired,
+    Tool, Resource, ResourceTemplate, Prompt, TextContent, ImageContent,
+    InputRequired,
     ToolResult, ResourceResult, ResourceContent,
     PromptResult, Message, Role,
     ServerCapabilities, ServerInfo
@@ -96,6 +99,26 @@ ERROR_CODE_REMAP_2026_07_28 = {
     -32004: -32022,   # UnsupportedProtocolVersion
 }
 ERR_UNSUPPORTED_PROTOCOL_VERSION = -32004   # remapped to -32022 for modern clients
+
+# "The thing you named does not exist" is Invalid Params, not Method Not Found:
+# `tools/call` exists, it is the `name` inside it that does not. The spec says
+# so outright for tools ("Unknown tool: ..." with -32602) and, since
+# 2026-07-28, for resources too.
+ERR_NOT_FOUND = -32602
+# Resources kept their own code until 2026-07-28 renumbered them onto -32602.
+# Pre-2026 clients match on -32002, so each revision gets the one it knows.
+ERR_RESOURCE_NOT_FOUND_LEGACY = -32002
+
+# RFC 5424 severities, lowest first. `logging/setLevel` rejects anything else,
+# and the order is the threshold comparison.
+LOG_LEVELS = ("debug", "info", "notice", "warning", "error",
+              "critical", "alert", "emergency")
+
+# How long a session with no open stream survives before it is collected.
+# A client that only ever POSTs never disconnects anything, so without this
+# its negotiated capabilities would sit in `_sessions` for the life of the
+# process. Refreshed on every request the session makes.
+SESSION_IDLE_TIMEOUT_SECONDS = 60 * 60
 
 # Freshness hints for CacheableResult (tools/list, prompts/list, resources/*).
 CACHEABLE_TTL_MS = 60 * 1000
@@ -244,6 +267,11 @@ class MCPServer(object):
 
         self._tools = {}  # type: Dict[str, Dict[str, Any]]
         self._resources = {}  # type: Dict[str, Dict[str, Any]]
+        # Resources whose URI carries {placeholders}. Kept apart from
+        # `_resources` because a template names no single resource: it
+        # belongs in resources/templates/list, and resources/read has to
+        # match against it rather than look it up.
+        self._resource_templates = {}  # type: Dict[str, Dict[str, Any]]
         self._prompts = {}  # type: Dict[str, Dict[str, Any]]
         # SEP-2640 skills. Keyed by the skill's SKILL.md URI.
         self._skills = {}  # type: Dict[str, Dict[str, Any]]
@@ -274,6 +302,11 @@ class MCPServer(object):
         # subscriptions/listen. Task status notifications are opt-in: the spec
         # forbids sending a notification type the client did not request.
         self._subscriptions = {}  # type: Dict[str, Dict[Any, Dict[str, Any]]]
+        # session_id -> {uri} for the handshake-era `resources/subscribe`.
+        # Kept apart from `_subscriptions` because it carries no subscription
+        # id: those revisions send `notifications/resources/updated` bare,
+        # with nothing in `_meta` to correlate it against.
+        self._resource_subs = {}  # type: Dict[str, Set[str]]
         self._subs_lock = threading.Lock()
         # Multi Round-Trip Requests: answers accumulated across retries of one
         # logical request, keyed by the opaque requestState handed to the client.
@@ -307,6 +340,7 @@ class MCPServer(object):
         """
         with self._subs_lock:
             self._subscriptions.pop(session_id, None)
+            self._resource_subs.pop(session_id, None)
 
     def _fire_cancel_callbacks(self, job_id, callbacks):
         # type: (str, List[Callable]) -> None
@@ -360,16 +394,31 @@ class MCPServer(object):
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-    def _tool_result_payload(self, value):
-        # type: (Any) -> Dict[str, Any]
-        """Wrap a stored async-tool value as a CallToolResult payload."""
-        if isinstance(value, ToolResult):
-            return value.to_dict()
-        if self._is_tool_result_payload(value):
-            return value
-        if isinstance(value, dict):
+    def _shape_tool_result(self, tool_name, value):
+        # type: (Optional[str], Any) -> Dict[str, Any]
+        """Turn a handler's return value into a CallToolResult payload.
+
+        A dict becomes `structuredContent` plus the serialized JSON the spec
+        asks for as a backwards-compatibility text block. Anything else is
+        text — *unless* the tool published an `outputSchema`, in which case
+        the spec requires structured content whatever its JSON type, and
+        withholding it would leave the result unable to satisfy the schema.
+        """
+        declares_schema = False
+        if tool_name:
+            definition = (self._tools.get(tool_name) or {}).get("definition")
+            declares_schema = bool(getattr(definition, "outputSchema", None))
+
+        if isinstance(value, dict) or declares_schema:
+            try:
+                text = json.dumps(value)
+            except (TypeError, ValueError):
+                # Not JSON at all: fall through to the text form, where
+                # `_apply_output_schema` will report the contract breach.
+                return {"content": [{"type": "text", "text": str(value)}],
+                        "isError": False}
             return {
-                "content": [{"type": "text", "text": json.dumps(value)}],
+                "content": [{"type": "text", "text": text}],
                 "structuredContent": value,
                 "isError": False,
             }
@@ -377,6 +426,182 @@ class MCPServer(object):
             "content": [{"type": "text", "text": str(value)}],
             "isError": False,
         }
+
+    def _tool_result_payload(self, value, tool_name=None):
+        # type: (Any, Optional[str]) -> Dict[str, Any]
+        """Wrap a stored async-tool value as a CallToolResult payload."""
+        if isinstance(value, ToolResult):
+            return self._apply_output_schema(tool_name, value.to_dict())
+        if self._is_tool_result_payload(value):
+            return self._apply_output_schema(tool_name, value)
+        return self._apply_output_schema(
+            tool_name, self._shape_tool_result(tool_name, value))
+
+    # The JSON Schema keywords `_schema_violation` understands. Anything else
+    # in an outputSchema is ignored rather than guessed at — see below.
+    _JSON_TYPES = {
+        "object": dict, "array": list, "string": str,
+        "boolean": bool, "null": type(None),
+    }
+
+    @classmethod
+    def _schema_violation(cls, schema, value, path="$"):
+        # type: (Any, Any, str) -> Optional[str]
+        """Describe how `value` fails `schema`, or None if it passes.
+
+        A deliberately small subset of JSON Schema: `type`, `required`,
+        `properties`, `items`, and `enum`. That is what tool output schemas
+        are made of in practice, and it is enough to catch the failure this
+        exists for — a handler whose return value does not match the shape
+        the server published in `tools/list`.
+
+        Unknown keywords are *ignored*, never guessed at. A validator that
+        invents semantics for `allOf` would reject conforming results, which
+        is worse than letting an exotic schema through unchecked. Servers
+        wanting full 2020-12 validation should validate inside the handler.
+        """
+        if not isinstance(schema, dict):
+            return None
+
+        expected = schema.get("type")
+        if isinstance(expected, str):
+            expected = [expected]
+        if isinstance(expected, list) and expected:
+            if not any(cls._matches_type(name, value) for name in expected):
+                return "{} should be {}, got {}".format(
+                    path, "/".join(expected), type(value).__name__)
+
+        if isinstance(value, dict):
+            for key in schema.get("required") or ():
+                if isinstance(key, str) and key not in value:
+                    return "{} is missing required property {!r}".format(path, key)
+            properties = schema.get("properties")
+            if isinstance(properties, dict):
+                for key, subschema in properties.items():
+                    if key in value:
+                        found = cls._schema_violation(
+                            subschema, value[key], "{}.{}".format(path, key))
+                        if found:
+                            return found
+
+        if isinstance(value, list):
+            items = schema.get("items")
+            # A list-form `items` is the 2019-09 tuple syntax; skip it rather
+            # than apply the first subschema to every element.
+            if isinstance(items, dict):
+                for index, item in enumerate(value):
+                    found = cls._schema_violation(
+                        items, item, "{}[{}]".format(path, index))
+                    if found:
+                        return found
+
+        allowed = schema.get("enum")
+        if isinstance(allowed, list) and allowed:
+            if not any(cls._json_equal(item, value) for item in allowed):
+                return "{} is not one of the permitted values".format(path)
+
+        return None
+
+    @staticmethod
+    def _json_equal(a, b):
+        # type: (Any, Any) -> bool
+        """JSON equality, which is not Python's.
+
+        `True == 1` in Python and not in JSON, so booleans only ever equal
+        booleans. Numbers otherwise compare by value, so `1` matches `1.0`
+        the way an `enum` says it should.
+        """
+        if isinstance(a, bool) != isinstance(b, bool):
+            return False
+        return bool(a == b)
+
+    @staticmethod
+    def _matches_type(name, value):
+        # type: (str, Any) -> bool
+        """Whether `value` is of the named JSON Schema type."""
+        if name == "integer":
+            # `True` is an int in Python and is not an integer in JSON.
+            return isinstance(value, int) and not isinstance(value, bool)
+        if name == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        expected = MCPServer._JSON_TYPES.get(name)
+        if expected is None:
+            # An unrecognized type name constrains nothing we can check.
+            return True
+        if expected is not bool and isinstance(value, bool):
+            # Same asymmetry the other way: a bool is not a "string",
+            # and `isinstance(True, int)` would have said otherwise.
+            return False
+        return isinstance(value, expected)
+
+    def _missing_prompt_arguments(self, prompt_name, arguments):
+        # type: (Any, Dict[str, Any]) -> List[str]
+        """Required prompt arguments the caller left out."""
+        entry = self._prompts.get(prompt_name) or {}
+        definition = entry.get("definition")
+        declared = getattr(definition, "arguments", None) or []
+        return [spec["name"] for spec in declared
+                if isinstance(spec, dict) and spec.get("required")
+                and spec.get("name") not in arguments]
+
+    def _input_schema_violation(self, tool_name, arguments):
+        # type: (Any, Dict[str, Any]) -> Optional[str]
+        """Check a call's arguments against the tool's published inputSchema.
+
+        "Servers MUST validate all tool inputs." Without this the arguments
+        went straight to the handler, and a missing or mistyped one came back
+        as a Python ``TypeError`` wrapped in ``isError`` — which tells the
+        model the tool *ran and failed*, when in fact the call never happened.
+        That is a protocol error (-32602), and the message it used to carry
+        leaked the handler's signature.
+
+        Deliberately narrow: only the keywords `_schema_violation` handles,
+        which are the ones the schema generator emits. A hand-written schema
+        using richer JSON Schema is checked for what can be checked and
+        otherwise left to the handler.
+        """
+        entry = self._tools.get(tool_name) or {}
+        definition = entry.get("definition")
+        schema = getattr(definition, "inputSchema", None)
+        if not isinstance(schema, dict) or not schema:
+            return None
+        return self._schema_violation(schema, arguments, path="arguments")
+
+    def _apply_output_schema(self, tool_name, result):
+        # type: (Optional[str], Dict[str, Any]) -> Dict[str, Any]
+        """Hold a tool's result to the `outputSchema` it published.
+
+        The spec is a MUST: "Servers MUST provide structured results that
+        conform to this schema." The server cannot invent a conforming result,
+        so a handler that breaks its own contract is reported the way any
+        other tool failure is — `isError`, with the reason — rather than
+        shipping a payload that contradicts what `tools/list` promised.
+        """
+        entry = self._tools.get(tool_name) if tool_name else None
+        definition = (entry or {}).get("definition")
+        schema = getattr(definition, "outputSchema", None)
+        if not schema or not isinstance(result, dict) or result.get("isError"):
+            return result
+
+        if "structuredContent" not in result:
+            return self._output_schema_error(
+                tool_name,
+                "returned no structured content, but declares an outputSchema")
+
+        violation = self._schema_violation(schema, result["structuredContent"])
+        if violation:
+            return self._output_schema_error(
+                tool_name, "returned structured content that violates its "
+                           "outputSchema: {}".format(violation))
+        return result
+
+    @staticmethod
+    def _output_schema_error(tool_name, detail):
+        # type: (Optional[str], str) -> Dict[str, Any]
+        """The CallToolResult for a tool that broke its own output contract."""
+        message = "Tool '{}' {}".format(tool_name, detail)
+        print("[ERROR] {}".format(message))
+        return {"content": [{"type": "text", "text": message}], "isError": True}
 
     @staticmethod
     def _is_tool_result_payload(value):
@@ -831,12 +1056,14 @@ class MCPServer(object):
             if candidate in self._resources:
                 return candidate
 
-        # Fallback: match by registered URI suffix (prefer longest match).
+        # Fallback: match by registered URI suffix (prefer longest match),
+        # but only at a path boundary. A bare `endswith` also resolved
+        # `https://elsewhere/config://settings` — and any other string
+        # ending in a registered URI — to that resource, which is a wider
+        # door than a proxy prefix needs.
         resource_uris = sorted(self._resources.keys(), key=len, reverse=True)
         for candidate in normalized_candidates:
             for resource_uri in resource_uris:
-                if candidate.endswith(resource_uri):
-                    return resource_uri
                 if candidate.endswith("/" + resource_uri):
                     return resource_uri
 
@@ -865,6 +1092,7 @@ class MCPServer(object):
                     meta=getattr(func, "_mcp_tool_meta", None) or {},
                     outputSchema=getattr(func, "_mcp_tool_output_schema", None),
                     annotations=getattr(func, "_mcp_tool_annotations", None),
+                    title=getattr(func, "_mcp_tool_title", None),
                 ),
                 "handler": func,
                 "is_async": is_async,
@@ -884,20 +1112,95 @@ class MCPServer(object):
             if not already_registered:
                 self._register_get_job_result()
 
+    # A `{name}` placeholder in a registered URI. RFC 6570 has richer
+    # operators ({+var}, {?a,b}, …); this implementation handles the simple
+    # string expansion the MCP examples use, and `_compile_uri_template`
+    # refuses anything else rather than mis-expanding it.
+    _TEMPLATE_VAR = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+    @classmethod
+    def _compile_uri_template(cls, template):
+        # type: (str) -> Any
+        """Build the regex that matches URIs against `template`.
+
+        Placeholders match one path segment each — a `{path}` that swallowed
+        slashes would make `file:///{path}` shadow every other file:// URI.
+        """
+        pattern = []
+        index = 0
+        seen = set()
+        for match in cls._TEMPLATE_VAR.finditer(template):
+            name = match.group(1)
+            if name in seen:
+                raise ValueError(
+                    "Resource template {!r} repeats the variable {!r}".format(
+                        template, name))
+            seen.add(name)
+            pattern.append(re.escape(template[index:match.start()]))
+            pattern.append("(?P<{}>[^/]+)".format(name))
+            index = match.end()
+        pattern.append(re.escape(template[index:]))
+
+        # Anything brace-shaped that was not a plain {name} is an operator
+        # this does not implement. Failing loudly beats silently treating
+        # `{+path}` as a literal and never matching anything.
+        if "{" in cls._TEMPLATE_VAR.sub("", template):
+            raise ValueError(
+                "Resource template {!r} uses an unsupported RFC 6570 "
+                "operator; only simple {{name}} expansion is handled".format(
+                    template))
+        return re.compile("^" + "".join(pattern) + "$")
+
+    def _match_resource_template(self, uri):
+        # type: (str) -> Optional[tuple]
+        """Find the template `uri` instantiates, or None.
+
+        Longest template first, so a more specific pattern wins over a
+        catch-all that would also match it.
+        """
+        with self._registry_lock:
+            candidates = sorted(self._resource_templates.items(),
+                                key=lambda item: len(item[0]), reverse=True)
+        for template, entry in candidates:
+            found = entry["pattern"].match(uri)
+            if found:
+                return entry, found.groupdict()
+        return None
+
     def _register_resource_function(self, func):
         # type: (Callable) -> None
         """Register a decorated resource function, at import or while serving."""
         uri = func._mcp_resource_uri
+        common = dict(
+            name=func._mcp_resource_name,
+            description=func._mcp_resource_description,
+            mimeType=func._mcp_resource_mime_type,
+            title=getattr(func, "_mcp_resource_title", None),
+            meta=getattr(func, "_mcp_resource_meta", None) or {},
+            annotations=getattr(func, "_mcp_resource_annotations", None),
+        )
+        # Only a plain resource has a size; a template names no single one.
+        resource_size = getattr(func, "_mcp_resource_size", None)
+
+        if getattr(func, "_mcp_resource_is_template", False):
+            # The decorator has documented template URIs since it was
+            # written, but the server only ever stored them as literal
+            # resources — listed under a URI no read could match, and
+            # never offered from resources/templates/list.
+            pattern = self._compile_uri_template(uri)
+            with self._registry_lock:
+                self._resource_templates[uri] = {
+                    "definition": ResourceTemplate(uriTemplate=uri, **common),
+                    "pattern": pattern,
+                    "handler": func,
+                }
+            self._mark_dynamic("resources")
+            return
+
         with self._registry_lock:
             replaced = uri in self._resources
             self._resources[uri] = {
-                "definition": Resource(
-                    uri=uri,
-                    name=func._mcp_resource_name,
-                    description=func._mcp_resource_description,
-                    mimeType=func._mcp_resource_mime_type,
-                    meta=getattr(func, "_mcp_resource_meta", None) or {},
-                ),
+                "definition": Resource(uri=uri, size=resource_size, **common),
                 "handler": func
             }
         self._mark_dynamic("resources")
@@ -915,7 +1218,8 @@ class MCPServer(object):
                 "definition": Prompt(
                     name=name,
                     description=func._mcp_prompt_description,
-                    arguments=func._mcp_prompt_arguments
+                    arguments=func._mcp_prompt_arguments,
+                    title=getattr(func, "_mcp_prompt_title", None),
                 ),
                 "handler": func
             }
@@ -976,7 +1280,8 @@ class MCPServer(object):
         meta=None,  # type: Optional[Dict[str, Any]]
         input_schema=None,  # type: Optional[Dict[str, Any]]
         output_schema=None,  # type: Optional[Dict[str, Any]]
-        annotations=None  # type: Optional[Dict[str, Any]]
+        annotations=None,  # type: Optional[Dict[str, Any]]
+        title=None  # type: Optional[str]
     ):
         # type: (...) -> Callable
         """
@@ -1002,7 +1307,7 @@ class MCPServer(object):
         def decorator(func):
             # type: (Callable) -> Callable
             decorated = tool(name, description, tags, meta, input_schema, output_schema,
-                             annotations=annotations)(func)
+                             annotations=annotations, title=title)(func)
             self._register_tool_function(decorated)
             return decorated
 
@@ -1033,12 +1338,13 @@ class MCPServer(object):
 
     def _start_async_tool_job(
         self, handler, msg_id, arguments, session_id=None,
-        progress_token=None, meta=None, prepare=None, protocol_version=None
+        progress_token=None, meta=None, prepare=None, protocol_version=None,
+        tool_name=None
     ):
         """Spawn a background thread for an async tool; return a job_id immediately."""
         return _tasks.start_async_tool_job(
             self, handler, msg_id, arguments, session_id, progress_token, meta,
-            prepare, protocol_version)
+            prepare, protocol_version, tool_name)
 
     def _job_to_task(self, task_id, job, include_terminal_payload=True):
         """Convert an internal async-job record into an MCP Task object."""
@@ -1107,7 +1413,8 @@ class MCPServer(object):
         input_schema=None,  # type: Optional[Dict[str, Any]]
         output_schema=None,  # type: Optional[Dict[str, Any]]
         annotations=None,  # type: Optional[Dict[str, Any]]
-        prepare=None  # type: Optional[Callable]
+        prepare=None,  # type: Optional[Callable]
+        title=None  # type: Optional[str]
     ):
         # type: (...) -> Callable
         """
@@ -1128,7 +1435,7 @@ class MCPServer(object):
             # type: (Callable) -> Callable
             decorated = async_tool(name, description, tags, meta, input_schema,
                                    output_schema=output_schema, annotations=annotations,
-                                   prepare=prepare)(func)
+                                   prepare=prepare, title=title)(func)
             self._register_tool_function(decorated)
             return decorated
 
@@ -1146,7 +1453,10 @@ class MCPServer(object):
         description=None,  # type: Optional[str]
         mime_type=None,  # type: Optional[str]
         tags=None,  # type: Optional[Set[str]]
-        meta=None  # type: Optional[Dict[str, Any]]
+        meta=None,  # type: Optional[Dict[str, Any]]
+        title=None,  # type: Optional[str]
+        annotations=None,  # type: Optional[Dict[str, Any]]
+        size=None  # type: Optional[int]
     ):
         # type: (...) -> Callable
         """
@@ -1154,16 +1464,27 @@ class MCPServer(object):
         Aligned with FastMCP @mcp.resource decorator.
 
         Args:
-            uri: Resource URI (e.g., "file:///path" or "config://settings")
+            uri: Resource URI (e.g., "file:///path" or "config://settings").
+                A URI containing ``{placeholders}`` registers a *template*:
+                it is served from ``resources/templates/list`` rather than
+                ``resources/list``, and a ``resources/read`` whose uri
+                matches the pattern calls the handler with the extracted
+                values as keyword arguments. Each placeholder matches one
+                path segment.
             name: Resource name (defaults to function name)
             description: Resource description (defaults to docstring)
             mime_type: MIME type of the resource content
             tags: Optional set of tags for categorization
             meta: Optional metadata dictionary
+            title: Optional human-readable display name
+            annotations: Optional audience / priority / lastModified hints
+            size: Optional size in bytes, for a resource whose length is
+                known ahead of the read. Ignored for a template.
         """
         def decorator(func):
             # type: (Callable) -> Callable
-            decorated = resource(uri, name, description, mime_type, tags, meta)(func)
+            decorated = resource(uri, name, description, mime_type, tags, meta,
+                                 title, annotations, size)(func)
             self._register_resource_function(decorated)
             return decorated
         return decorator
@@ -1173,7 +1494,8 @@ class MCPServer(object):
         name=None,  # type: Optional[str]
         description=None,  # type: Optional[str]
         tags=None,  # type: Optional[Set[str]]
-        meta=None  # type: Optional[Dict[str, Any]]
+        meta=None,  # type: Optional[Dict[str, Any]]
+        title=None  # type: Optional[str]
     ):
         # type: (...) -> Callable
         """
@@ -1185,10 +1507,11 @@ class MCPServer(object):
             description: Prompt description (defaults to docstring)
             tags: Optional set of tags for categorization
             meta: Optional metadata dictionary
+            title: Optional human-readable display name
         """
         def decorator(func):
             # type: (Callable) -> Callable
-            decorated = prompt(name, description, tags, meta)(func)
+            decorated = prompt(name, description, tags, meta, title)(func)
             self._register_prompt_function(decorated)
             return decorated
 
@@ -1272,7 +1595,11 @@ class MCPServer(object):
         # type: (str) -> int
         """Tell subscribers a resource's content changed; returns how many.
 
-        The counterpart to `subscriptions/listen` with `resourceSubscriptions`.
+        The counterpart to `subscriptions/listen` with `resourceSubscriptions`
+        (2026-07-28) and to `resources/subscribe` (every revision before it).
+        Both kinds of subscriber are served here, so a server calls this once
+        and does not care which revision anyone is speaking.
+
         Nothing infers this — a resource handler is just a function, and the
         server cannot know when whatever it reads from has moved underneath.
         Call this when you know it has.
@@ -1285,12 +1612,24 @@ class MCPServer(object):
                 for sub_id, sub in (subs or {}).items()
                 if uri in (sub.get("resource_uris") or ())
             ]
+            legacy = [session_id
+                      for session_id, uris in self._resource_subs.items()
+                      if uri in uris]
         for session_id, sub_id in targets:
             self._broadcast({
                 "jsonrpc": "2.0",
                 "method": "notifications/resources/updated",
                 "params": {"uri": uri,
                            "_meta": {MCP_SUBSCRIPTION_ID_KEY: sub_id}},
+            }, session_id=session_id)
+            sent += 1
+        for session_id in legacy:
+            # No subscriptionId: these revisions have no such concept, and a
+            # `_meta` key they never defined would be noise on the wire.
+            self._broadcast({
+                "jsonrpc": "2.0",
+                "method": "notifications/resources/updated",
+                "params": {"uri": uri},
             }, session_id=session_id)
             sent += 1
         return sent
@@ -1310,10 +1649,24 @@ class MCPServer(object):
 
     def remove_resource(self, uri):
         # type: (str) -> bool
-        """Unregister a resource by URI. Returns True if one was removed."""
+        """Unregister a resource, or a template by its URI template.
+
+        Returns True if one was removed.
+        """
         with self._registry_lock:
-            removed = self._resources.pop(uri, None) is not None
+            removed = (self._resources.pop(uri, None) is not None
+                       or self._resource_templates.pop(uri, None) is not None)
         if removed:
+            # Any subscription to it is now a promise about something that
+            # no longer exists, so drop it rather than keep watching a name.
+            with self._subs_lock:
+                for uris in list(self._resource_subs.values()):
+                    uris.discard(uri)
+                for subs in self._subscriptions.values():
+                    for sub in (subs or {}).values():
+                        watched = sub.get("resource_uris")
+                        if watched:
+                            watched.discard(uri)
             self._mark_dynamic("resources")
         return removed
 
@@ -1347,19 +1700,25 @@ class MCPServer(object):
             # A server declaring the skills extension MUST also declare the
             # base resources capability (SEP-2640), even if no plain
             # @server.resource() was ever registered.
-            resources=len(self._resources) > 0 or len(self._skills) > 0,
+            resources=(len(self._resources) > 0
+                       or len(self._resource_templates) > 0
+                       or len(self._skills) > 0),
             prompts=len(self._prompts) > 0,
             logging=True,
             extensions=extensions,
             list_changed=self._dynamic_registry,
-            subscribe=len(self._resources) > 0,
+            # Both mechanisms are implemented: `resources/subscribe` for the
+            # handshake revisions and `subscriptions/listen` with
+            # `resourceSubscriptions` for 2026-07-28.
+            subscribe=len(self._resources) > 0 or len(self._skill_resources) > 0,
         )
 
     def _has_mcp_app_resources(self):
         # type: () -> bool
         """True if any registered resource is an MCP App (ui:// HTML template)."""
         with self._registry_lock:
-            entries = list(self._resources.values())
+            entries = (list(self._resources.values())
+                       + list(self._resource_templates.values()))
         for entry in entries:
             definition = entry["definition"]
             mime = getattr(definition, "mimeType", None) or ""
@@ -1445,6 +1804,7 @@ class MCPServer(object):
         with self._sessions_lock:
             session = self._sessions.setdefault(session_id, {})
             session["capabilities"] = capabilities or {}
+            session["last_seen"] = time.time()
 
     def _set_session_protocol_version(self, session_id, version):
         # type: (Optional[str], str) -> None
@@ -1454,6 +1814,7 @@ class MCPServer(object):
         with self._sessions_lock:
             session = self._sessions.setdefault(session_id, {})
             session["protocol_version"] = version
+            session["last_seen"] = time.time()
 
     def _client_capabilities(self, session_id):
         # type: (Optional[str]) -> Dict[str, Any]
@@ -1824,12 +2185,34 @@ class MCPServer(object):
             return self._invalid_request(None, "JSON-RPC message must be an object")
         return self._handle_request(message, session_id=session_id, headers=headers)
 
+    def _batch_allowed(self, session_id):
+        # type: (Optional[str]) -> bool
+        """Whether this caller may send a JSON-RPC batch.
+
+        2025-06-18 removed batching: from that revision on the POST body
+        "MUST be a single JSON-RPC request, notification, or response". Only
+        a session that negotiated 2024-11-05 still gets an array, and a
+        caller with no session at all is assumed to be speaking something
+        current — accepting a batch there and answering with an array would
+        hand a modern client a shape its schema rejects.
+        """
+        if not session_id:
+            return False
+        with self._sessions_lock:
+            session = self._sessions.get(session_id) or {}
+        return session.get("protocol_version") == "2024-11-05"
+
     def _handle_jsonrpc_payload(self, payload, session_id=None, headers=None):
         # type: (Any, Optional[str], Optional[Any]) -> Optional[Any]
         """Handle a JSON-RPC message or batch payload."""
         if isinstance(payload, list):
             if not payload:
                 return self._invalid_request(None, "JSON-RPC batch must not be empty")
+            if not self._batch_allowed(session_id):
+                return self._invalid_request(
+                    None,
+                    "JSON-RPC batching was removed in 2025-06-18; send one "
+                    "message per request")
             responses = []
             for message in payload:
                 response = self._handle_jsonrpc_message(
@@ -1885,6 +2268,11 @@ class MCPServer(object):
         meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else None
         self._prune_expired_jobs()
         self._prune_expired_mrtr_states()
+        # Stamp *before* sweeping: a session making a request right now is
+        # by definition not idle, and pruning first collected the caller's
+        # own session whenever it had been quiet up to this moment.
+        self._touch_session(session_id)
+        self._prune_expired_sessions()
 
         # Which revision is this single request speaking? 2026-07-28 declares
         # it per request; older revisions inherit the session's negotiation.
@@ -1964,6 +2352,10 @@ class MCPServer(object):
     # above the handlers it points at.
     _RPC_METHODS = {
         "initialize": "_rpc_initialize",
+        # `notifications/initialized` is the name every revision through
+        # 2025-11-25 actually puts on the wire. The bare "initialized" is
+        # kept because clients in the wild send it.
+        "notifications/initialized": "_rpc_initialized",
         "initialized": "_rpc_initialized",
         "notifications/cancelled": "_rpc_notifications_cancelled",
         "server/discover": "_rpc_server_discover",
@@ -1977,6 +2369,8 @@ class MCPServer(object):
         "resources/list": "_rpc_resources_list",
         "resources/templates/list": "_rpc_resources_templates_list",
         "resources/read": "_rpc_resources_read",
+        "resources/subscribe": "_rpc_resources_subscribe",
+        "resources/unsubscribe": "_rpc_resources_unsubscribe",
         "prompts/list": "_rpc_prompts_list",
         "prompts/get": "_rpc_prompts_get",
         "skills/list": "_rpc_skills_list",
@@ -1999,7 +2393,7 @@ class MCPServer(object):
         result = {
             "protocolVersion": negotiated,
             "serverInfo": ServerInfo(self.name, self.version).to_dict(),
-            "capabilities": self._get_capabilities().to_dict()
+            "capabilities": self._get_capabilities().to_dict(negotiated)
         }
         return result, None
 
@@ -2023,7 +2417,8 @@ class MCPServer(object):
 
         result = self._cacheable({
             "supportedVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
-            "capabilities": self._get_capabilities().to_dict(),
+            "capabilities": self._get_capabilities().to_dict(
+                PROTOCOL_2026_07_28),
         }, PROTOCOL_2026_07_28)
         if self.instructions:
             result["instructions"] = self.instructions
@@ -2168,14 +2563,26 @@ class MCPServer(object):
 
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
+        # `isinstance(tool_name, str)` first: a caller can send any JSON
+        # value as `name`, and an unhashable one raises TypeError on the
+        # `in` test before the validation below ever runs.
+        tool_entry = (self._tools.get(tool_name)
+                      if isinstance(tool_name, str) else None)
+        bad_arguments = (
+            self._input_schema_violation(tool_name, arguments)
+            if tool_entry is not None and isinstance(arguments, dict) else None)
 
         if not isinstance(arguments, dict):
             error = {"code": -32602,
                      "message": "tools/call arguments must be a JSON object"}
-        elif tool_name not in self._tools:
-            error = {"code": -32601, "message": "Tool not found: {}".format(tool_name)}
+        elif tool_entry is None:
+            error = {"code": ERR_NOT_FOUND,
+                     "message": "Unknown tool: {}".format(tool_name)}
+        elif bad_arguments:
+            error = {"code": -32602,
+                     "message": "Invalid arguments for tool {}: {}".format(
+                         tool_name, bad_arguments)}
         else:
-            tool_entry = self._tools[tool_name]
             handler = tool_entry["handler"]
 
             if tool_entry.get("is_async"):
@@ -2198,6 +2605,7 @@ class MCPServer(object):
                         meta=meta,
                         prepare=tool_entry.get("prepare"),
                         protocol_version=version,
+                        tool_name=tool_name,
                     )
                 if supports_tasks and not error:
                     with self._jobs_lock:
@@ -2248,20 +2656,9 @@ class MCPServer(object):
                     # Wrap result in proper format
                     if isinstance(call_result, ToolResult):
                         result = call_result.to_dict()
-                    elif isinstance(call_result, dict):
-                        # structuredContent (MCP spec): required when the
-                        # tool declares outputSchema, and lets mcp-apps
-                        # widgets consume data without re-parsing text.
-                        result = {
-                            "content": [{"type": "text", "text": json.dumps(call_result)}],
-                            "structuredContent": call_result,
-                            "isError": False
-                        }
                     else:
-                        result = {
-                            "content": [{"type": "text", "text": str(call_result)}],
-                            "isError": False
-                        }
+                        result = self._shape_tool_result(tool_name, call_result)
+                    result = self._apply_output_schema(tool_name, result)
                 except InputRequired as needed:
                     # Not an error: the handler is telling the client
                     # what it needs. The client answers by retrying this
@@ -2305,10 +2702,15 @@ class MCPServer(object):
     def _rpc_resources_templates_list(self, ctx):
         # type: (_RequestContext) -> tuple
         """Handle the JSON-RPC `resources/templates/list` method."""
-        version = ctx.version
-        result = None
+        params, version = ctx.params, ctx.version
 
-        result = self._cacheable({"resourceTemplates": []}, version)
+        with self._registry_lock:
+            templates = [self._resource_templates[uri]["definition"].to_dict()
+                         for uri in sorted(self._resource_templates)]
+        result = self._cacheable(
+            self._paginate(templates, params, "resourceTemplates", {},
+                           "uriTemplate"),
+            version)
         return result, None
 
     def _rpc_resources_read(self, ctx):
@@ -2354,15 +2756,27 @@ class MCPServer(object):
                 except Exception as e:
                     traceback.print_exc()
                     error = {"code": -32603, "message": str(e)}
-            elif lookup_uri not in self._resources:
-                # 2026-07-28 aligns resource-not-found with JSON-RPC's
-                # Invalid Params; older clients keep the code they know.
-                error = {
-                    "code": -32602 if modern else -32601,
-                    "message": "Resource not found: {}".format(uri),
-                }
             else:
-                entry = self._resources[lookup_uri]
+                entry = self._resources.get(lookup_uri)
+                template_args = {}
+                if entry is None:
+                    # Not a literal resource — it may still instantiate a
+                    # registered template, which is the only way a
+                    # `{placeholder}` URI is ever readable.
+                    matched = self._match_resource_template(lookup_uri)
+                    if matched is not None:
+                        entry, template_args = matched
+
+                if entry is None:
+                    # 2026-07-28 aligns resource-not-found with JSON-RPC's
+                    # Invalid Params; older clients keep the code they know.
+                    return None, {
+                        "code": (ERR_NOT_FOUND if modern
+                                 else ERR_RESOURCE_NOT_FOUND_LEGACY),
+                        "message": "Resource not found",
+                        "data": {"uri": uri},
+                    }
+
                 handler = entry["handler"]
                 definition = entry["definition"]
                 res_mime = getattr(definition, "mimeType", None)
@@ -2370,6 +2784,7 @@ class MCPServer(object):
                 try:
                     content = self._call_handler(
                         handler, msg_id,
+                        arguments=template_args or None,
                         session_id=session_id,
                         progress_token=progress_token,
                         meta=meta,
@@ -2415,6 +2830,73 @@ class MCPServer(object):
                     error = {"code": -32603, "message": str(e)}
         return result, error
 
+    def _subscribable_uri(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Resolve params.uri for resources/(un)subscribe, or an error.
+
+        Returns ``(uri, None)`` or ``(None, error)``.
+        """
+        if ctx.modern:
+            # 2026-07-28 replaced both methods with `subscriptions/listen`.
+            return None, {
+                "code": -32601,
+                "message": "Method not found: {} (removed in {}; use "
+                           "subscriptions/listen)".format(ctx.method, ctx.version),
+            }
+        uri = ctx.params.get("uri")
+        if not isinstance(uri, str) or not uri:
+            return None, {"code": -32602,
+                          "message": "{} requires a string uri".format(ctx.method)}
+        if not ctx.session_id:
+            # Without a session there is no stream to deliver updates on, so
+            # accepting the subscription would promise something undeliverable.
+            return None, {"code": -32602,
+                          "message": "{} requires an MCP session".format(ctx.method)}
+        return self._strip_proxy_prefix(uri), None
+
+    def _rpc_resources_subscribe(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `resources/subscribe` method."""
+        uri, error = self._subscribable_uri(ctx)
+        if error is not None:
+            return None, error
+
+        with self._registry_lock:
+            known = uri in self._resources or uri in self._skill_resources
+        if not known:
+            return None, {"code": ERR_RESOURCE_NOT_FOUND_LEGACY,
+                          "message": "Resource not found",
+                          "data": {"uri": ctx.params.get("uri")}}
+
+        with self._subs_lock:
+            uris = self._resource_subs.setdefault(ctx.session_id, set())
+            if uri not in uris and len(uris) >= MAX_SUBSCRIPTIONS_PER_SESSION:
+                return None, {
+                    "code": -32602,
+                    "message": "Too many resource subscriptions for this "
+                               "session (max {})".format(
+                                   MAX_SUBSCRIPTIONS_PER_SESSION),
+                }
+            uris.add(uri)
+        return {}, None
+
+    def _rpc_resources_unsubscribe(self, ctx):
+        # type: (_RequestContext) -> tuple
+        """Handle the JSON-RPC `resources/unsubscribe` method."""
+        uri, error = self._subscribable_uri(ctx)
+        if error is not None:
+            return None, error
+
+        # Unsubscribing from something not subscribed is not an error: the
+        # client's intent — "stop sending me this" — already holds.
+        with self._subs_lock:
+            uris = self._resource_subs.get(ctx.session_id)
+            if uris:
+                uris.discard(uri)
+                if not uris:
+                    del self._resource_subs[ctx.session_id]
+        return {}, None
+
     def _rpc_prompts_list(self, ctx):
         # type: (_RequestContext) -> tuple
         """Handle the JSON-RPC `prompts/list` method."""
@@ -2439,6 +2921,10 @@ class MCPServer(object):
 
         prompt_name = params.get("name")
         arguments = params.get("arguments", {})
+        missing_arguments = (
+            self._missing_prompt_arguments(prompt_name, arguments)
+            if (isinstance(prompt_name, str) and prompt_name in self._prompts
+                and isinstance(arguments, dict)) else [])
 
         if not isinstance(prompt_name, str) or not prompt_name:
             error = {"code": -32602,
@@ -2447,7 +2933,18 @@ class MCPServer(object):
             error = {"code": -32602,
                      "message": "prompts/get arguments must be a JSON object"}
         elif prompt_name not in self._prompts:
-            error = {"code": -32601, "message": "Prompt not found: {}".format(prompt_name)}
+            error = {"code": ERR_NOT_FOUND,
+                     "message": "Unknown prompt: {}".format(prompt_name)}
+        elif missing_arguments:
+            # Omitting a required argument reached the handler and raised a
+            # Python TypeError, reported as -32603 — blaming the server for
+            # the caller's incomplete request, and leaking the signature.
+            missing = missing_arguments
+            error = {
+                "code": -32602,
+                "message": "prompts/get is missing required argument(s) for "
+                           "{}: {}".format(prompt_name, ", ".join(missing)),
+            }
         else:
             handler = self._prompts[prompt_name]["handler"]
             try:
@@ -2503,8 +3000,35 @@ class MCPServer(object):
                                 "(removed in {}; use _meta {})".format(
                                     version, META_LOG_LEVEL)}
         else:
-            result = {}
+            level = ctx.params.get("level")
+            if level not in LOG_LEVELS:
+                # The spec names -32602 for this, and accepting an unknown
+                # level would silently set a threshold nothing compares to.
+                error = {"code": -32602,
+                         "message": "Invalid log level {!r}; expected one of: "
+                                    "{}".format(level, ", ".join(LOG_LEVELS))}
+            elif not ctx.session_id:
+                # The level is session state; with no session there is
+                # nowhere to keep it and nowhere to send the logs.
+                error = {"code": -32602,
+                         "message": "logging/setLevel requires an MCP session"}
+            else:
+                with self._sessions_lock:
+                    session = self._sessions.setdefault(ctx.session_id, {})
+                    session["log_level"] = level
+                    session["last_seen"] = time.time()
+                result = {}
         return result, error
+
+    def _session_log_level(self, session_id):
+        # type: (Optional[str]) -> Optional[str]
+        """The level this session last asked for via `logging/setLevel`."""
+        if not session_id:
+            return None
+        with self._sessions_lock:
+            session = self._sessions.get(session_id) or {}
+        level = session.get("log_level")
+        return level if level in LOG_LEVELS else None
 
 
 
@@ -2518,9 +3042,16 @@ class MCPServer(object):
         # type: (str, _SSEQueue) -> None
         """Remove an SSE queue for a client session.
 
-        When the last queue for a session disconnects, drop the session's
-        negotiated capabilities and any pending server-to-client requests so
-        long-lived processes don't leak memory across reconnects.
+        When the last queue goes, everything that *needed* that stream goes
+        with it: subscriptions, and any server-to-client request still
+        waiting for an answer that can no longer arrive.
+
+        What survives is the session itself. Closing the notification stream
+        is not the same as ending the session — a client may keep POSTing
+        without one — and dropping its negotiated capabilities here would
+        make the next request 404 and force a pointless re-initialize.
+        Idle sessions are collected by `_prune_expired_sessions` instead,
+        and a client that really is finished says so with `DELETE`.
         """
         session_empty = False
         with self._clients_lock:
@@ -2534,11 +3065,6 @@ class MCPServer(object):
         if not session_empty:
             return
 
-        with self._sessions_lock:
-            self._sessions.pop(session_id, None)
-        # Outside the sessions lock on purpose. Everywhere else acquires
-        # subscriptions *before* sessions; nesting them the other way here
-        # would make one future edit that spans both a deadlock.
         self._drop_subscriptions(session_id)
 
         prefix = "{}:".format(session_id)
@@ -2549,6 +3075,86 @@ class MCPServer(object):
                 if pending and "event" in pending:
                     # Wake any waiter so it raises instead of timing out
                     pending["event"].set()
+
+    def _touch_session(self, session_id):
+        # type: (Optional[str]) -> None
+        """Mark a session as used now, deferring its idle expiry."""
+        if not session_id:
+            return
+        with self._sessions_lock:
+            session = self._sessions.get(session_id)
+            if session is not None:
+                session["last_seen"] = time.time()
+
+    def session_exists(self, session_id):
+        # type: (Optional[str]) -> bool
+        """Whether this id names a session the server is still holding.
+
+        A session exists while it has negotiated state or an open stream.
+        The transport asks so it can answer 404 for one that has since been
+        terminated or expired, which is how a client learns to re-initialize.
+        """
+        if not session_id:
+            return False
+        with self._sessions_lock:
+            if session_id in self._sessions:
+                return True
+        with self._clients_lock:
+            return bool(self._clients.get(session_id))
+
+    def terminate_session(self, session_id):
+        # type: (Optional[str]) -> bool
+        """Forget a session and everything scoped to it. True if one existed.
+
+        The explicit counterpart to an SSE disconnect, reached by `DELETE`
+        on the MCP endpoint. Open streams are left to notice on their own —
+        closing a socket from another thread is not something this transport
+        can do safely — but they are unregistered, so nothing further is
+        queued for them.
+        """
+        if not session_id:
+            return False
+        existed = self.session_exists(session_id)
+        if not existed:
+            return False
+
+        with self._clients_lock:
+            self._clients.pop(session_id, None)
+        with self._sessions_lock:
+            self._sessions.pop(session_id, None)
+        self._drop_subscriptions(session_id)
+
+        prefix = "{}:".format(session_id)
+        with self._pending_lock:
+            for key in [k for k in self._pending_client_requests
+                        if k.startswith(prefix)]:
+                pending = self._pending_client_requests.pop(key, None)
+                if pending and "event" in pending:
+                    pending["event"].set()
+        return True
+
+    def _prune_expired_sessions(self):
+        # type: () -> None
+        """Collect sessions that have gone quiet and hold no stream.
+
+        `_unregister_client` only fires when an SSE stream drops, so a
+        client that exclusively POSTs never triggered it: its negotiated
+        capabilities sat in `_sessions` for the life of the process. This
+        is the sweep that bounds that, and it runs off the request path
+        like the job and MRTR sweeps beside it.
+        """
+        cutoff = time.time() - SESSION_IDLE_TIMEOUT_SECONDS
+        with self._sessions_lock:
+            stale = [sid for sid, session in self._sessions.items()
+                     if session.get("last_seen", 0) < cutoff]
+        if not stale:
+            return
+        with self._clients_lock:
+            # A session with a live stream is not idle, whatever its
+            # last request looked like.
+            stale = [sid for sid in stale if not self._clients.get(sid)]
+        for session_id in stale:
+            self.terminate_session(session_id)
 
     def _client_count(self):
         # type: () -> int
@@ -2632,6 +3238,16 @@ class MCPServer(object):
         self._allowed_origins = (
             None if allowed_origins is None
             else {str(o).rstrip("/").lower() for o in allowed_origins})
+
+        if allowed_origins is None and host not in ("127.0.0.1", "localhost", "::1"):
+            # The transport spec makes Origin validation a MUST, precisely
+            # to block DNS rebinding — and a wildcard bind is the exposure
+            # that attack needs. A library cannot guess the legitimate
+            # origins, so it says so loudly instead of failing silently.
+            print("WARNING: no allowed_origins set while bound to {}. Any web "
+                  "page can reach this server from a victim's browser. Pass "
+                  "allowed_origins=[...] to run(), or bind to 127.0.0.1."
+                  .format(host), file=sys.stderr)
 
         server = ThreadingHTTPServer((host, port), MCPRequestHandler)
         # Set before serve_forever(), so no handler can be constructed without it.

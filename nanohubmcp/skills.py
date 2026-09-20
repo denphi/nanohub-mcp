@@ -496,10 +496,13 @@ def rpc_skills_get(server, ctx):
         with server._registry_lock:
             entry = server._skills.get(skill_uri)
         if entry is None:
-            # Same code resources/read uses for an unknown URI,
-            # per SEP-2640.
+            # -32602 unconditionally, not the -32002/-32602 split
+            # `resources/read` makes: this extension postdates the
+            # revision that renumbered resource-not-found, so there is no
+            # older code for it to have to speak.
             error = {"code": -32602,
-                     "message": "Skill not found: {}".format(skill_uri)}
+                     "message": "Skill not found",
+                     "data": {"uri": skill_uri}}
         else:
             result = server._cacheable(
                 {"skill": entry["definition"].to_dict()}, version)
@@ -523,7 +526,8 @@ def rpc_resources_directory_read(server, ctx):
             children = list(children) if children is not None else None
         if children is None:
             error = {"code": -32602,
-                     "message": "Not a directory resource: {}".format(dir_uri)}
+                     "message": "Not a directory resource",
+                     "data": {"uri": dir_uri}}
         else:
             result = server._cacheable(
                 server._paginate(children, params, "resources", {}, "uri"),

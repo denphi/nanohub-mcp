@@ -43,14 +43,23 @@ def test_none_maps_to_null():
         assert _type_expr_to_json_schema(expr) == {"type": "null"}
 
 
-def test_optional_unwraps_to_the_inner_type():
-    assert _type_expr_to_json_schema("Optional[int]") == {"type": "integer"}
-    assert _type_expr_to_json_schema("Optional[List[str]]") == {"type": "array"}
+def test_optional_unwraps_to_the_inner_type_and_admits_null():
+    """`Optional[X]` is X *or* null, and the schema has to say both.
+
+    Publishing a bare `{"type": "integer"}` told clients the parameter
+    never accepts null — so a schema-following client would not send one,
+    and a validating client would reject it if the model did.
+    """
+    assert _type_expr_to_json_schema("Optional[int]") == {
+        "type": ["integer", "null"]}
+    assert _type_expr_to_json_schema("Optional[List[str]]") == {
+        "type": ["array", "null"]}
 
 
 def test_union_collapses_when_one_real_type_remains():
     # Union[int, None] is Optional[int] spelled the long way.
-    assert _type_expr_to_json_schema("Union[int, None]") == {"type": "integer"}
+    assert _type_expr_to_json_schema("Union[int, None]") == {
+        "type": ["integer", "null"]}
 
 
 def test_mixed_union_falls_back_to_string():
@@ -131,7 +140,9 @@ def test_generated_schema_reads_annotations():
     schema = _generate_input_schema(handler)
     assert schema["properties"]["count"]["type"] == "integer"
     assert schema["properties"]["ratio"]["type"] == "number"
-    assert schema["properties"]["tags"]["type"] == "array"
+    # `tags: list = None` is implicitly Optional — the default *is* null —
+    # so the published type admits it.
+    assert schema["properties"]["tags"]["type"] == ["array", "null"]
 
 
 # ---------------------------------------------------------------------------

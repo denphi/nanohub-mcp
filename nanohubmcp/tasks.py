@@ -21,7 +21,7 @@ import time
 import traceback
 import uuid
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .decorators import tool
 from .protocol import MCP_SUBSCRIPTION_ID_KEY
@@ -173,8 +173,8 @@ def notify_task_status(server, job_id):
 
 def start_async_tool_job(server, handler, msg_id, arguments, session_id=None,
                           progress_token=None, meta=None, prepare=None,
-                          protocol_version=None):
-    # type: (Any, Any, Dict[str, Any], Optional[str], Optional[Any], Optional[Dict[str, Any]], Optional[Callable]) -> str
+                          protocol_version=None, tool_name=None):
+    # type: (Any, Any, Any, Dict[str, Any], Optional[str], Optional[Any], Optional[Dict[str, Any]], Optional[Callable], Optional[str], Optional[str]) -> str
     """Spawn a background thread for an async tool; return a job_id immediately.
 
     ``prepare`` runs synchronously on the request thread *before* the
@@ -200,6 +200,9 @@ def start_async_tool_job(server, handler, msg_id, arguments, session_id=None,
             "pollIntervalMs": MCP_TASK_POLL_INTERVAL_MS,
             "session_id": session_id,
             "request_id": msg_id,
+            # Kept so the terminal payload can be held to the tool's
+            # published outputSchema, exactly as a sync call is.
+            "tool_name": tool_name,
             "expires_at": time.time() + (MCP_TASK_TTL_MS / 1000.0),
             "cancel_event": threading.Event(),
             "cancel_callbacks": [],
@@ -328,7 +331,8 @@ def job_to_task(server, task_id, job, include_terminal_payload=True):
     elif status == "cancelled":
         task["statusMessage"] = "Cancellation was requested."
     elif include_terminal_payload and status == "completed":
-        task["result"] = server._tool_result_payload(job.get("result"))
+        task["result"] = server._tool_result_payload(
+            job.get("result"), job.get("tool_name"))
     elif include_terminal_payload and status == "failed":
         task["error"] = {
             "code": -32603,

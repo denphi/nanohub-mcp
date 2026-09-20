@@ -371,6 +371,27 @@ def my_func(a, b):
 | `tags` | set | `None` | Tags for categorization |
 | `meta` | dict | `None` | Metadata dictionary |
 | `input_schema` | dict | auto-generated | JSON Schema for inputs |
+| `output_schema` | dict | `None` | JSON Schema the result must satisfy |
+| `annotations` | dict | `None` | `title` / `readOnlyHint` / `destructiveHint` / `idempotentHint` / `openWorldHint` |
+
+**Argument validation.** Calls are checked against `input_schema` before the
+handler runs. A missing or wrongly typed argument is a JSON-RPC `-32602`, not a
+tool failure — the call never happened, so reporting it as `isError` would tell
+the model the tool ran. Exceptions raised *inside* the handler are still
+returned as `isError`.
+
+**`output_schema`.** Declaring one obliges the server to return conforming
+structured content, so the result is validated against it and a breach is
+reported rather than published. Type, `required`, `properties`, `items` and
+`enum` are checked; richer JSON Schema keywords are left to the handler.
+
+```python
+@server.tool(output_schema={"type": "object", "required": ["sum"],
+                            "properties": {"sum": {"type": "integer"}}})
+def add(a: int, b: int) -> dict:
+    """Add two integers."""
+    return {"sum": a + b}   # also emitted as structuredContent
+```
 
 ### @server.async_tool()
 
@@ -444,14 +465,34 @@ def temperature_data():
     return {"data": [2.1, 3.5, 7.2, 12.1]}
 ```
 
+**URI templates.** A URI containing `{placeholders}` registers a family of
+resources rather than one. It is served from `resources/templates/list`, and a
+`resources/read` whose URI matches the pattern calls the handler with the
+extracted values. Each placeholder matches a single path segment.
+
+```python
+@server.resource("weather://{city}/current", mime_type="application/json")
+def weather(city):
+    """Current weather for a city."""
+    return {"city": city, "temp": 21}
+
+# resources/read {"uri": "weather://paris/current"} -> weather(city="paris")
+```
+
+**Change notifications.** Call `server.resource_updated(uri)` when a resource's
+content changes; subscribers reached through either `resources/subscribe` or
+`subscriptions/listen` are notified.
+
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `uri` | str | required | Resource URI |
+| `uri` | str | required | Resource URI, or a `{templated}` one |
 | `name` | str | function name | Resource name |
 | `description` | str | docstring | Resource description |
 | `mime_type` | str | `None` | MIME type of content |
 | `tags` | set | `None` | Tags for categorization |
 | `meta` | dict | `None` | Metadata dictionary |
+| `title` | str | `None` | Human-readable display name |
+| `annotations` | dict | `None` | `audience` / `priority` / `lastModified` hints |
 
 ### @server.prompt()
 
@@ -898,22 +939,34 @@ tests/test_mcp_server.py ...................... [100%]
 | `tools/list` | List all registered tools with schemas |
 | `tools/call` | Call a tool by name with arguments |
 | `resources/list` | List all registered resources |
-| `resources/read` | Read a resource by URI |
+| `resources/templates/list` | List registered URI templates |
+| `resources/read` | Read a resource by URI, or one a template matches |
+| `resources/subscribe` | Watch one resource for changes (≤ 2025-11-25) |
+| `resources/unsubscribe` | Stop watching it (≤ 2025-11-25) |
+| `subscriptions/listen` | Long-lived notification stream (2026-07-28) |
 | `prompts/list` | List all registered prompts |
 | `prompts/get` | Get a prompt by name with arguments |
+| `logging/setLevel` | Set the minimum level for `notifications/message` |
+| `server/discover` | Versions, capabilities and identity (2026-07-28) |
+
+Session management (Streamable HTTP): `initialize` mints an `Mcp-Session-Id`,
+`DELETE /mcp` with that header ends the session, and a request carrying an id
+the server no longer holds gets `404` so the client knows to re-initialize.
 
 ### Notifications
 
-JSON-RPC requests without an `id` field are treated as notifications and receive a `202 Accepted` response:
+JSON-RPC requests without an `id` field are treated as notifications and receive a
+`202 Accepted` with an empty body, as the transport spec requires:
 
 ```bash
-curl -X POST http://localhost:8000/ \
+curl -i -X POST http://localhost:8000/ \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","method":"initialized","params":{}}'
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
 ```
 
-```json
-{"status": "accepted"}
+```
+HTTP/1.0 202 Accepted
+Content-Length: 0
 ```
 
 ### Error Handling

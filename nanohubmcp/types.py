@@ -24,10 +24,15 @@ class Tool(object):
         tags=None,  # type: Optional[set]
         meta=None,  # type: Optional[Dict[str, Any]]
         outputSchema=None,  # type: Optional[Dict[str, Any]]
-        annotations=None  # type: Optional[Dict[str, Any]]
+        annotations=None,  # type: Optional[Dict[str, Any]]
+        title=None  # type: Optional[str]
     ):
         # type: (...) -> None
         self.name = name
+        # Human-readable display name. `annotations.title` is the older
+        # place for this; a top-level `title` has precedence since
+        # 2025-06-18, and clients fall back to the annotation.
+        self.title = title
         self.description = description
         self.inputSchema = inputSchema if inputSchema is not None else {
             "type": "object",
@@ -48,6 +53,8 @@ class Tool(object):
             "description": self.description,
             "inputSchema": self.inputSchema
         }
+        if self.title:
+            result["title"] = self.title
         if self.outputSchema:
             result["outputSchema"] = self.outputSchema
         if self.annotations:
@@ -84,6 +91,113 @@ class ImageContent(object):
         return {"type": self.type, "data": self.data, "mimeType": self.mimeType}
 
 
+class AudioContent(object):
+    """Audio content for tool results and prompt messages.
+
+    Introduced in 2025-03-26. A client that negotiated 2024-11-05 has no
+    schema for it and will reject the result, so only return one when the
+    server's clients speak a later revision.
+    """
+
+    def __init__(self, data="", mimeType="audio/wav", type="audio"):
+        # type: (str, str, str) -> None
+        self.type = type
+        self.data = data  # base64 encoded
+        self.mimeType = mimeType
+
+    def to_dict(self):
+        # type: () -> Dict[str, Any]
+        return {"type": self.type, "data": self.data, "mimeType": self.mimeType}
+
+
+class ResourceLink(object):
+    """A pointer to a resource, returned in place of its contents.
+
+    "A tool MAY return links to Resources, to provide additional context or
+    data." The client fetches or subscribes to the URI itself, which keeps a
+    large payload out of the tool result.
+
+    Introduced in 2025-06-18; see the note on :class:`AudioContent` about
+    returning one to a 2024-11-05 client.
+    """
+
+    def __init__(
+        self,
+        uri,  # type: str
+        name="",  # type: str
+        description=None,  # type: Optional[str]
+        mimeType=None,  # type: Optional[str]
+        title=None,  # type: Optional[str]
+        annotations=None  # type: Optional[Dict[str, Any]]
+    ):
+        # type: (...) -> None
+        self.type = "resource_link"
+        self.uri = uri
+        self.name = name or uri
+        self.title = title
+        self.description = description
+        self.mimeType = mimeType
+        self.annotations = annotations
+
+    def to_dict(self):
+        # type: () -> Dict[str, Any]
+        result = {"type": self.type, "uri": self.uri,
+                  "name": self.name}  # type: Dict[str, Any]
+        if self.title:
+            result["title"] = self.title
+        if self.description:
+            result["description"] = self.description
+        if self.mimeType:
+            result["mimeType"] = self.mimeType
+        if self.annotations:
+            result["annotations"] = self.annotations
+        return result
+
+
+class EmbeddedResource(object):
+    """A resource's contents carried inline in a result.
+
+    The counterpart to :class:`ResourceLink`: the bytes travel with the
+    result instead of the client fetching them.
+    """
+
+    def __init__(
+        self,
+        uri,  # type: str
+        text=None,  # type: Optional[str]
+        blob=None,  # type: Optional[str]
+        mimeType=None,  # type: Optional[str]
+        annotations=None  # type: Optional[Dict[str, Any]]
+    ):
+        # type: (...) -> None
+        self.type = "resource"
+        self.uri = uri
+        self.text = text
+        self.blob = blob
+        self.mimeType = mimeType
+        self.annotations = annotations
+
+    def to_dict(self):
+        # type: () -> Dict[str, Any]
+        # The spec splits these into TextResourceContents (requires text)
+        # and BlobResourceContents (requires blob); emitting both, or
+        # neither, matches neither variant.
+        resource = {"uri": self.uri}  # type: Dict[str, Any]
+        if self.text is not None:
+            resource["text"] = self.text
+        elif self.blob is not None:
+            resource["blob"] = self.blob
+        else:
+            resource["text"] = ""
+        if self.mimeType:
+            resource["mimeType"] = self.mimeType
+        result = {"type": self.type,
+                  "resource": resource}  # type: Dict[str, Any]
+        if self.annotations:
+            result["annotations"] = self.annotations
+        return result
+
+
 class ToolResult(object):
     """
     Result of calling a tool. Aligned with FastMCP ToolResult.
@@ -91,14 +205,21 @@ class ToolResult(object):
     Args:
         content: Text content or list of content items
         is_error: Whether the result represents an error
-        meta: Optional metadata dictionary
+        meta: Optional metadata dictionary, emitted as `_meta`
+        structured_content: Optional JSON value emitted as `structuredContent`.
+            Required by the spec whenever the tool declares an `outputSchema`;
+            for backwards compatibility the serialized JSON SHOULD also appear
+            as a text content block, which this adds when `content` is empty.
     """
+
+    _UNSET = object()
 
     def __init__(
         self,
         content=None,  # type: Optional[Union[str, List[Union[TextContent, ImageContent]]]]
         is_error=False,  # type: bool
-        meta=None  # type: Optional[Dict[str, Any]]
+        meta=None,  # type: Optional[Dict[str, Any]]
+        structured_content=_UNSET  # type: Any
     ):
         # type: (...) -> None
         if content is None:
@@ -112,6 +233,18 @@ class ToolResult(object):
 
         self.is_error = is_error
         self.meta = meta or {}
+        self.structured_content = structured_content
+        if structured_content is not ToolResult._UNSET and not self._content:
+            # The spec's backwards-compatibility SHOULD: a client that does
+            # not read `structuredContent` still has something to show.
+            import json as _json
+            self._content = [TextContent(text=_json.dumps(structured_content))]
+
+    @property
+    def has_structured_content(self):
+        # type: () -> bool
+        """Whether `structuredContent` was supplied (``None`` is a value)."""
+        return self.structured_content is not ToolResult._UNSET
 
     @property
     def content(self):
@@ -120,10 +253,17 @@ class ToolResult(object):
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
-        return {
+        result = {
             "content": [c.to_dict() for c in self._content],
             "isError": self.is_error
         }
+        if self.has_structured_content:
+            result["structuredContent"] = self.structured_content
+        if self.meta:
+            # Was accepted by __init__ and then dropped here, so every
+            # `ToolResult(meta=...)` silently lost its metadata on the wire.
+            result["_meta"] = self.meta
+        return result
 
 
 # Backwards compatibility alias
@@ -140,23 +280,84 @@ class Resource(object):
         description=None,  # type: Optional[str]
         mimeType=None,  # type: Optional[str]
         tags=None,  # type: Optional[set]
-        meta=None  # type: Optional[Dict[str, Any]]
+        meta=None,  # type: Optional[Dict[str, Any]]
+        title=None,  # type: Optional[str]
+        annotations=None,  # type: Optional[Dict[str, Any]]
+        size=None  # type: Optional[int]
     ):
         # type: (...) -> None
         self.uri = uri
         self.name = name or uri
+        # Display name, distinct from `name`, which is the programmatic id.
+        self.title = title
         self.description = description
         self.mimeType = mimeType
+        # audience / priority / lastModified hints for the client.
+        self.annotations = annotations
+        self.size = size
         self.tags = tags or set()
         self.meta = meta or {}
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
-        result = {"uri": self.uri, "name": self.name}
+        result = {"uri": self.uri, "name": self.name}  # type: Dict[str, Any]
+        if self.title:
+            result["title"] = self.title
         if self.description:
             result["description"] = self.description
         if self.mimeType:
             result["mimeType"] = self.mimeType
+        if self.annotations:
+            result["annotations"] = self.annotations
+        if isinstance(self.size, int):
+            result["size"] = self.size
+        if self.meta:
+            result["_meta"] = self.meta
+        return result
+
+
+class ResourceTemplate(object):
+    """MCP resource template: a parameterized family of resources.
+
+    The wire shape differs from :class:`Resource` in exactly one field —
+    `uriTemplate` in place of `uri` — because a template names no single
+    resource and so belongs in `resources/templates/list`, not
+    `resources/list`.
+    """
+
+    def __init__(
+        self,
+        uriTemplate,  # type: str
+        name="",  # type: str
+        title=None,  # type: Optional[str]
+        description=None,  # type: Optional[str]
+        mimeType=None,  # type: Optional[str]
+        annotations=None,  # type: Optional[Dict[str, Any]]
+        tags=None,  # type: Optional[set]
+        meta=None  # type: Optional[Dict[str, Any]]
+    ):
+        # type: (...) -> None
+        self.uriTemplate = uriTemplate
+        self.name = name or uriTemplate
+        self.title = title
+        self.description = description
+        self.mimeType = mimeType
+        self.annotations = annotations
+        self.tags = tags or set()
+        self.meta = meta or {}
+
+    def to_dict(self):
+        # type: () -> Dict[str, Any]
+        result = {"uriTemplate": self.uriTemplate,
+                  "name": self.name}  # type: Dict[str, Any]
+        if self.title:
+            result["title"] = self.title
+        if self.description:
+            result["description"] = self.description
+        if self.mimeType:
+            result["mimeType"] = self.mimeType
+        if self.annotations:
+            result["annotations"] = self.annotations
         if self.meta:
             result["_meta"] = self.meta
         return result
@@ -319,10 +520,12 @@ class Prompt(object):
         description=None,  # type: Optional[str]
         arguments=None,  # type: Optional[List[Dict[str, Any]]]
         tags=None,  # type: Optional[set]
-        meta=None  # type: Optional[Dict[str, Any]]
+        meta=None,  # type: Optional[Dict[str, Any]]
+        title=None  # type: Optional[str]
     ):
         # type: (...) -> None
         self.name = name
+        self.title = title
         self.description = description
         self.arguments = arguments if arguments is not None else []
         self.tags = tags or set()
@@ -331,10 +534,14 @@ class Prompt(object):
     def to_dict(self):
         # type: () -> Dict[str, Any]
         result = {"name": self.name}
+        if self.title:
+            result["title"] = self.title
         if self.description:
             result["description"] = self.description
         if self.arguments:
             result["arguments"] = self.arguments
+        if self.meta:
+            result["_meta"] = self.meta
         return result
 
 
@@ -407,8 +614,8 @@ class ServerCapabilities(object):
         # True when the server can emit notifications/resources/updated.
         self.subscribe = subscribe
 
-    def to_dict(self):
-        # type: () -> Dict[str, Any]
+    def to_dict(self, protocol_version=None):
+        # type: (Optional[str]) -> Dict[str, Any]
         caps = {}
         # Only claim listChanged when the server will actually send one.
         changed = bool(self.list_changed)
@@ -424,7 +631,14 @@ class ServerCapabilities(object):
             # declaration. `listChanged` belongs to tools/resources/prompts.
             caps["logging"] = {}
         if self.extensions:
+            # `extensions` is where 2026-07-28 put these. Earlier revisions
+            # define `experimental` for exactly this purpose and know
+            # nothing of `extensions`, so they are told in both places:
+            # the spec's, and the one this server's own clients already
+            # read. Both are additive — neither schema forbids the other.
             caps["extensions"] = self.extensions
+            if protocol_version and protocol_version < "2026-07-28":
+                caps["experimental"] = self.extensions
         return caps
 
 

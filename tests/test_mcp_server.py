@@ -135,7 +135,8 @@ def _post(path, body):
     resp = conn.getresponse()
     raw = resp.read().decode("utf-8")
     conn.close()
-    return resp.status, json.loads(raw)
+    # A 202 carries no body at all, per the transport spec.
+    return resp.status, (json.loads(raw) if raw else None)
 
 
 def _read_sse(path="/sse", lines_to_read=4, timeout=3):
@@ -164,11 +165,9 @@ def _open_mcp_session():
     resp_sse = conn_sse.getresponse()
     session_id = resp_sse.getheader("Mcp-Session-Id")
     assert session_id
-    resp_sse.readline()  # event: open
-    resp_sse.readline()  # data: {}
-    resp_sse.readline()  # empty
-    resp_sse.readline()  # event: endpoint
-    resp_sse.readline()  # data: /mcp?session_id=...
+    # Streamable HTTP opens with a comment line only: the `open` and
+    # `endpoint` events belong to the legacy HTTP+SSE transport.
+    resp_sse.readline()  # ": stream open"
     resp_sse.readline()  # empty
     return conn_sse, resp_sse, session_id
 
@@ -211,14 +210,15 @@ def test_sse_connection():
 
 
 def test_streamable_http_get():
-    """GET /mcp returns an SSE stream with open + endpoint events."""
-    status, content_type, lines = _read_sse("/mcp", lines_to_read=6)
+    """GET /mcp returns an SSE stream carrying no legacy handshake events."""
+    status, content_type, lines = _read_sse("/mcp", lines_to_read=2)
     assert status == 200
     assert "text/event-stream" in content_type
-    assert "event: open" in lines[0]
-    # After "event: open", "data: {}", blank line, "event: endpoint", "data: ..."
-    endpoint_idx = next(i for i, line in enumerate(lines) if "event: endpoint" in line)
-    assert lines[endpoint_idx + 1].startswith("data: /mcp?session_id=")
+    # `event: open` / `event: endpoint` are the 2024-11-05 HTTP+SSE
+    # handshake. Streamable HTTP defines neither, so the stream starts
+    # with nothing but a keep-the-proxy-awake comment.
+    assert lines[0].startswith(":")
+    assert not any("event: endpoint" in line for line in lines)
 
 
 # ---------------------------------------------------------------------------
@@ -249,11 +249,14 @@ def test_optional_dict_schema_generation():
     from typing import Optional, Dict, List, Any
     from nanohubmcp import decorators as D
 
+    # Optional widens the type to admit null; it does not flatten to a
+    # bare string, which is the bug this regression test was written for.
     assert D._python_type_to_json_schema(Optional[Dict[str, str]]) == {
-        "type": "object", "additionalProperties": {"type": "string"}}
+        "type": ["object", "null"], "additionalProperties": {"type": "string"}}
     assert D._python_type_to_json_schema(Dict[str, str]) == {
         "type": "object", "additionalProperties": {"type": "string"}}
-    assert D._python_type_to_json_schema(Optional[str]) == {"type": "string"}
+    assert D._python_type_to_json_schema(Optional[str]) == {
+        "type": ["string", "null"]}
     assert D._python_type_to_json_schema(List[str]) == {
         "type": "array", "items": {"type": "string"}}
     assert D._python_type_to_json_schema(Any) == {}
@@ -262,7 +265,7 @@ def test_optional_dict_schema_generation():
         return None
 
     props = D._generate_input_schema(sample)["properties"]
-    assert props["sources"]["type"] == "object"
+    assert props["sources"]["type"] == ["object", "null"]
     assert props["sources"]["additionalProperties"] == {"type": "string"}
     assert props["name"]["type"] == "string"
 
@@ -392,10 +395,12 @@ def test_method_not_found():
 
 
 def test_notification_returns_accepted():
-    """POST notification (no id) returns 202 accepted."""
-    status, body = _post("/", {"jsonrpc": "2.0", "method": "initialized", "params": {}})
+    """POST notification (no id) returns 202 with an empty body."""
+    status, body = _post("/", {"jsonrpc": "2.0", "method": "notifications/initialized",
+                               "params": {}})
     assert status == 202
-    assert body["status"] == "accepted"
+    # "the server MUST return HTTP status code 202 Accepted with no body".
+    assert body is None
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +751,11 @@ def test_mcp_discovery():
     """GET /.well-known/mcp.json returns MCP discovery document."""
     status, body = _get("/.well-known/mcp.json")
     assert status == 200
-    assert body["mcpVersion"] == "2024-11-05"
+    # Reports the default negotiated revision and the full supported set,
+    # rather than pinning the oldest revision the server happens to accept.
+    assert body["mcpVersion"] == "2025-11-25"
+    assert "2026-07-28" in body["supportedVersions"]
+    assert "2024-11-05" in body["supportedVersions"]
     assert body["serverInfo"]["name"] == "test-calculator"
     transport_types = [t["type"] for t in body["transports"]]
     assert "sse" in transport_types
@@ -812,11 +821,7 @@ def test_tool_can_request_elicitation_from_client():
     resp_sse = conn_sse.getresponse()
     session_id = resp_sse.getheader("Mcp-Session-Id")
     assert session_id
-    resp_sse.readline()  # event: open
-    resp_sse.readline()  # data: {}
-    resp_sse.readline()  # empty line
-    resp_sse.readline()  # event: endpoint
-    resp_sse.readline()  # data: /mcp?session_id=...
+    resp_sse.readline()  # ": stream open"
     resp_sse.readline()  # empty line
 
     status, body = _post(
@@ -834,9 +839,8 @@ def test_tool_can_request_elicitation_from_client():
     )
     assert status == 200
     assert body["result"]["protocolVersion"] == "2025-11-25"
-    resp_sse.readline()  # event: message
-    resp_sse.readline()  # data: initialize response
-    resp_sse.readline()  # empty line
+    # Nothing to drain here: on Streamable HTTP the initialize response
+    # comes back on the POST and MUST NOT be echoed onto this stream.
 
     tool_result = []
 
@@ -875,7 +879,8 @@ def test_tool_can_request_elicitation_from_client():
         },
     )
     assert status == 202
-    assert body["status"] == "accepted"
+    # 202 Accepted "with no body", per the transport spec.
+    assert body is None
 
     thread.join(5)
     conn_sse.close()
@@ -900,11 +905,7 @@ def test_report_progress_broadcasts_to_session_sse():
     resp_sse = conn_sse.getresponse()
     session_id = resp_sse.getheader("Mcp-Session-Id")
     assert session_id
-    resp_sse.readline()  # event: open
-    resp_sse.readline()  # data: {}
-    resp_sse.readline()  # empty
-    resp_sse.readline()  # event: endpoint
-    resp_sse.readline()  # data: /mcp?session_id=...
+    resp_sse.readline()  # ": stream open"
     resp_sse.readline()  # empty
 
     tool_result = []
@@ -999,11 +1000,24 @@ def test_notification_invalid_params_gets_no_reply():
     assert b"error" not in raw
 
 
+def _legacy_batch_session(session_id):
+    """Negotiate 2024-11-05, the last revision that permits batching."""
+    status, body = _post(
+        "/?session_id={}".format(session_id),
+        {"jsonrpc": "2.0", "id": 900, "method": "initialize",
+         "params": {"protocolVersion": "2024-11-05", "capabilities": {}}},
+    )
+    assert status == 200
+    assert body["result"]["protocolVersion"] == "2024-11-05"
+    return "/?session_id={}".format(session_id)
+
+
 def test_jsonrpc_batch_returns_responses_for_requests_only():
     """JSON-RPC batches return an array, omitting notification responses."""
-    status, body = _post("/", [
+    path = _legacy_batch_session("batch-legacy-1")
+    status, body = _post(path, [
         {"jsonrpc": "2.0", "id": 901, "method": "ping", "params": {}},
-        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
         {
             "jsonrpc": "2.0",
             "id": 902,
@@ -1018,14 +1032,25 @@ def test_jsonrpc_batch_returns_responses_for_requests_only():
     assert body[1]["result"]["isError"] is False
 
 
+def test_jsonrpc_batch_is_rejected_after_2024_11_05():
+    """Batching was removed in 2025-06-18; the body must be one message."""
+    status, body = _post("/", [
+        {"jsonrpc": "2.0", "id": 903, "method": "ping", "params": {}},
+    ])
+    assert status == 200
+    assert body["error"]["code"] == -32600
+    assert "batching" in body["error"]["message"]
+
+
 def test_jsonrpc_batch_all_notifications_returns_accepted():
     """A batch with only notifications gets no JSON-RPC response."""
-    status, body = _post("/", [
-        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
-        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+    path = _legacy_batch_session("batch-legacy-2")
+    status, body = _post(path, [
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
     ])
     assert status == 202
-    assert body == {"status": "accepted"}
+    assert body is None
 
 
 def test_jsonrpc_invalid_top_level_payload_returns_minus_32600():
@@ -1061,12 +1086,19 @@ def test_request_client_fails_fast_without_stream():
     assert "No active client stream" in str(excinfo.value)
 
 
-def test_session_state_cleared_on_disconnect():
-    """When the last SSE queue closes, _sessions and pending entries are dropped."""
+def test_stream_state_cleared_on_disconnect_but_session_survives():
+    """Closing the stream releases what needed it — and nothing more.
+
+    Pending server-to-client requests and subscriptions cannot be served
+    without a stream, so they go. The session does not: a client may keep
+    POSTing without a notification stream, and dropping its negotiated
+    capabilities here would 404 its very next request.
+    """
     from nanohubmcp.server import MCPServer, _SSEQueue
 
     s = MCPServer("cleanup")
     s._sessions["sess-y"] = {"capabilities": {"sampling": {}}}
+    s._resource_subs["sess-y"] = {"config://settings"}
     s._pending_client_requests["sess-y:server-1"] = {
         "event": threading.Event(),
         "response": None,
@@ -1077,8 +1109,13 @@ def test_session_state_cleared_on_disconnect():
     s._unregister_client("sess-y", q)
 
     assert "sess-y" not in s._clients
-    assert "sess-y" not in s._sessions
+    assert "sess-y" not in s._resource_subs
     assert "sess-y:server-1" not in s._pending_client_requests
+    assert s._sessions["sess-y"]["capabilities"] == {"sampling": {}}
+
+    # It is `DELETE` (or the idle sweep) that ends a session.
+    assert s.terminate_session("sess-y") is True
+    assert "sess-y" not in s._sessions
 
 
 def test_direct_tool_call_rejects_context_tool():
@@ -1938,3 +1975,181 @@ def test_registry_survives_concurrent_registration_and_listing():
     for t in threads:
         t.join(timeout=30)
     assert not errors, errors
+
+
+# ---------------------------------------------------------------------------
+# Streamable HTTP transport requirements
+# ---------------------------------------------------------------------------
+
+def _request_raw(method, path, body=None, headers=None):
+    """Issue any HTTP method and return (status, headers, parsed-or-raw body)."""
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.request(method, path, body=body, headers=headers or {})
+    resp = conn.getresponse()
+    raw = resp.read().decode("utf-8")
+    conn.close()
+    try:
+        parsed = json.loads(raw) if raw else None
+    except ValueError:
+        parsed = raw
+    return resp.status, dict(resp.getheaders()), parsed
+
+
+def _initialized_session():
+    """POST initialize and return the minted session id."""
+    status, headers, body = _post_raw("/mcp", json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"protocolVersion": "2025-06-18", "capabilities": {}}}).encode())
+    assert status == 200, body
+    session_id = headers.get("Mcp-Session-Id")
+    assert session_id
+    return session_id
+
+
+def test_delete_terminates_the_session():
+    """"Clients ... SHOULD send an HTTP DELETE to the MCP endpoint."
+
+    Without a handler this was a 501 and the session was never released.
+    """
+    session_id = _initialized_session()
+    status, _headers, _body = _request_raw(
+        "DELETE", "/mcp", headers={"Mcp-Session-Id": session_id})
+    assert status == 204
+
+
+def test_requests_after_delete_get_404():
+    """"MUST respond to requests containing that session ID with 404"."""
+    session_id = _initialized_session()
+    _request_raw("DELETE", "/mcp", headers={"Mcp-Session-Id": session_id})
+
+    status, _headers, body = _post_raw(
+        "/mcp",
+        json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list",
+                    "params": {}}).encode(),
+        headers={"Mcp-Session-Id": session_id})
+    assert status == 404
+    assert "re-initialize" in body["error"]["message"]
+
+
+def test_delete_without_a_session_header_is_a_400():
+    status, _headers, body = _request_raw("DELETE", "/mcp")
+    assert status == 400
+    assert "Mcp-Session-Id" in body["error"]["message"]
+
+
+def test_delete_of_an_unknown_session_is_a_404():
+    status, _headers, _body = _request_raw(
+        "DELETE", "/mcp", headers={"Mcp-Session-Id": "never-existed"})
+    assert status == 404
+
+
+def test_options_advertises_delete():
+    status, headers, _body = _request_raw("OPTIONS", "/mcp")
+    assert status == 200
+    assert "DELETE" in headers["Access-Control-Allow-Methods"]
+
+
+def test_unsupported_protocol_version_header_is_a_400():
+    """"MUST respond with 400 Bad Request" for an unsupported revision.
+
+    Previously the header was only cross-checked against the body's
+    `_meta`, so a header on its own was never validated at all.
+    """
+    status, _headers, body = _post_raw(
+        "/mcp",
+        json.dumps({"jsonrpc": "2.0", "id": 3, "method": "tools/list",
+                    "params": {}}).encode(),
+        headers={"MCP-Protocol-Version": "1999-01-01"})
+    assert status == 400
+    assert body["error"]["code"] == -32602
+    assert "2026-07-28" in body["error"]["data"]["supported"]
+
+
+def test_supported_protocol_version_header_passes():
+    status, _headers, body = _post_raw(
+        "/mcp",
+        json.dumps({"jsonrpc": "2.0", "id": 4, "method": "tools/list",
+                    "params": {}}).encode(),
+        headers={"MCP-Protocol-Version": "2025-06-18"})
+    assert status == 200
+    assert "tools" in body["result"]
+
+
+def test_get_without_event_stream_accept_is_405():
+    """"MUST either return Content-Type: text/event-stream ... or 405"."""
+    status, _headers, _body = _request_raw(
+        "GET", "/mcp", headers={"Accept": "application/json"})
+    assert status == 405
+
+
+def test_response_is_not_echoed_onto_the_sse_stream():
+    """"MUST NOT send a JSON-RPC response on the stream unless resuming".
+
+    The response used to be delivered on the HTTP reply *and* broadcast
+    to every SSE queue for the session.
+    """
+    conn_sse, resp_sse, session_id = _open_mcp_session()
+    try:
+        status, body = _post(
+            "/mcp?session_id={}".format(session_id),
+            {"jsonrpc": "2.0", "id": 500, "method": "tools/list", "params": {}})
+        assert status == 200
+        assert "tools" in body["result"]
+
+        # Nothing but the heartbeat should arrive on the stream. The pump
+        # emits one every SSE_HEARTBEAT_INTERVAL seconds and nothing sooner,
+        # so a short read either times out or returns a comment line.
+        resp_sse.fp.raw._sock.settimeout(0.75)
+        try:
+            line = resp_sse.readline().decode("utf-8")
+        except Exception:
+            line = ""
+        assert not line.startswith("event:"), line
+    finally:
+        conn_sse.close()
+
+
+def test_subscriptions_listen_streams_on_its_own_post():
+    """2026-07-28 answers `subscriptions/listen` on the POST response.
+
+    That revision removed sessions and the GET endpoint, so borrowing the
+    session-keyed GET stream made the method unreachable for the only
+    revision that defines it.
+    """
+    conn = HTTPConnection("127.0.0.1", PORT, timeout=5)
+    conn.request("POST", "/mcp", body=json.dumps({
+        "jsonrpc": "2.0", "id": 700, "method": "subscriptions/listen",
+        "params": {"notifications": {"toolsListChanged": True},
+                   "_meta": {"io.modelcontextprotocol/protocolVersion":
+                             "2026-07-28"}}}).encode(),
+        headers={"Content-Type": "application/json",
+                 "Mcp-Method": "subscriptions/listen"})
+    resp = conn.getresponse()
+    try:
+        assert resp.status == 200
+        assert "text/event-stream" in resp.getheader("Content-Type")
+        # The header that revision removed must not come back.
+        assert resp.getheader("Mcp-Session-Id") is None
+
+        assert resp.readline().decode("utf-8").strip() == "event: message"
+        ack = json.loads(resp.readline().decode("utf-8")[len("data: "):])
+        assert ack["method"] == "notifications/subscriptions/acknowledged"
+        assert ack["params"]["_meta"][
+            "io.modelcontextprotocol/subscriptionId"] == 700
+    finally:
+        conn.close()
+
+
+def test_rejected_subscriptions_listen_returns_json_not_a_stream():
+    """A refused listen must say so, not open a stream carrying nothing."""
+    status, headers, body = _post_raw(
+        "/mcp",
+        json.dumps({"jsonrpc": "2.0", "id": 701,
+                    "method": "subscriptions/listen",
+                    "params": {"_meta": {
+                        "io.modelcontextprotocol/protocolVersion":
+                            "2026-07-28"}}}).encode(),
+        headers={"Mcp-Method": "subscriptions/listen"})
+    assert "application/json" in headers["Content-Type"]
+    assert body["error"]["code"] == -32602
+    assert status == 200

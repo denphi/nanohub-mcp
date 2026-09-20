@@ -16,6 +16,24 @@ except ImportError:
     get_type_hints = None
 
 
+def _allow_null(schema):
+    # type: (Dict[str, Any]) -> Dict[str, Any]
+    """Widen a schema so it also accepts ``null``.
+
+    A schema with no ``type`` already accepts anything, so it is left alone
+    rather than being narrowed to ``["null"]``.
+    """
+    declared = schema.get("type")
+    if declared is None:
+        return schema
+    names = declared if isinstance(declared, list) else [declared]
+    if "null" in names:
+        return schema
+    widened = dict(schema)
+    widened["type"] = list(names) + ["null"]
+    return widened
+
+
 def _python_type_to_json_schema(py_type):
     # type: (Any) -> Dict[str, Any]
     """Convert Python type hints to JSON Schema types.
@@ -23,8 +41,9 @@ def _python_type_to_json_schema(py_type):
     Handles Optional[X]/Union[X, None] by unwrapping to X (so, for example,
     ``Optional[Dict[str, str]]`` becomes an object schema rather than falling
     back to ``string`` — which previously made strict MCP clients refuse to send
-    a map argument). Also emits ``items``/``additionalProperties`` for typed
-    containers and treats ``typing.Any`` as "accept any JSON value".
+    a map argument), and widening the result to admit ``null``. Also emits
+    ``items``/``additionalProperties`` for typed containers and treats
+    ``typing.Any`` as "accept any JSON value".
     """
     if py_type is None or py_type is type(None):
         return {"type": "null"}
@@ -38,9 +57,16 @@ def _python_type_to_json_schema(py_type):
     except Exception:
         is_union = False
     if is_union:
-        non_none = [a for a in getattr(py_type, "__args__", ()) if a is not type(None)]
+        args = getattr(py_type, "__args__", ())
+        non_none = [a for a in args if a is not type(None)]
+        optional = len(non_none) != len(args)
         if len(non_none) == 1:
-            return _python_type_to_json_schema(non_none[0])
+            inner = _python_type_to_json_schema(non_none[0])
+            # `Optional[str]` published `{"type": "string"}`, which says the
+            # parameter never accepts null — so a client following the schema
+            # would not send one, and a schema validator would reject it if
+            # it did. The signature says otherwise.
+            return _allow_null(inner) if optional else inner
         # Union of several concrete types (or a bare Union) -> accept anything.
         return {}
 
@@ -130,21 +156,29 @@ def _type_expr_to_json_schema(type_expr):
 
     if normalized.startswith("Optional[") and normalized.endswith("]"):
         inner = normalized[len("Optional["):-1]
-        return _type_expr_to_json_schema(inner)
+        # Same widening as the resolved-type path: an `Optional[X]` written
+        # as a string annotation accepts null just as much as one that
+        # `get_type_hints` managed to evaluate.
+        return _allow_null(_type_expr_to_json_schema(inner))
 
     if normalized.startswith("Union[") and normalized.endswith("]"):
         inner = normalized[len("Union["):-1]
         options = _split_top_level_commas(inner)
         option_types = []
+        optional = False
         for opt in options:
             if opt in ("None", "NoneType", "type(None)"):
+                # `Union[X, None]` *is* `Optional[X]`, so it has to widen
+                # the same way — the branch above only catches the spelling.
+                optional = True
                 continue
             schema = _type_expr_to_json_schema(opt)
             if "type" in schema:
                 option_types.append(schema["type"])
         option_types = sorted(set(option_types))
         if len(option_types) == 1:
-            return {"type": option_types[0]}
+            single = {"type": option_types[0]}
+            return _allow_null(single) if optional else single
         return {"type": "string"}
 
     array_prefixes = (
@@ -249,7 +283,15 @@ def _generate_input_schema(func, exclude_params=None):
         elif param.default is not inspect.Parameter.empty and param.default is not None:
             prop = _python_value_to_json_schema(param.default)
         else:
-            prop = {"type": "string"}
+            # Nothing said what this is — no annotation, no type comment, no
+            # informative default. An empty schema says exactly that.
+            #
+            # This used to publish `{"type": "string"}`, which is a guess
+            # stated as fact: a client reading the schema would refuse to
+            # send `count=3` to an unannotated parameter, and a validating
+            # one would reject it. Declaring nothing is honest and lets any
+            # JSON value through, which is what the handler actually accepts.
+            prop = {}
 
         properties[name] = prop
 
@@ -272,7 +314,8 @@ def async_tool(
     input_schema=None,  # type: Optional[Dict[str, Any]]
     output_schema=None,  # type: Optional[Dict[str, Any]]
     annotations=None,  # type: Optional[Dict[str, Any]]
-    prepare=None  # type: Optional[Callable]
+    prepare=None,  # type: Optional[Callable]
+    title=None  # type: Optional[str]
 ):
     # type: (...) -> Callable
     """
@@ -308,7 +351,7 @@ def async_tool(
     def decorator(func):
         # type: (Callable) -> Callable
         decorated = tool(name, description, tags, meta, input_schema, output_schema,
-                         annotations=annotations)(func)
+                         annotations=annotations, title=title)(func)
         decorated._mcp_async_tool = True
         decorated._mcp_async_prepare = prepare
         return decorated
@@ -361,7 +404,8 @@ def tool(
     meta=None,  # type: Optional[Dict[str, Any]]
     input_schema=None,  # type: Optional[Dict[str, Any]]
     output_schema=None,  # type: Optional[Dict[str, Any]]
-    annotations=None  # type: Optional[Dict[str, Any]]
+    annotations=None,  # type: Optional[Dict[str, Any]]
+    title=None  # type: Optional[str]
 ):
     # type: (...) -> Callable
     """
@@ -400,6 +444,7 @@ def tool(
         func._mcp_tool_input_schema = input_schema or _generate_input_schema(func)
         func._mcp_tool_output_schema = output_schema
         func._mcp_tool_annotations = _validate_annotations(annotations)
+        func._mcp_tool_title = title
         func._mcp_tool_tags = tags or set()
         func._mcp_tool_meta = meta or {}
 
@@ -414,6 +459,7 @@ def tool(
         wrapper._mcp_tool_input_schema = func._mcp_tool_input_schema
         wrapper._mcp_tool_output_schema = func._mcp_tool_output_schema
         wrapper._mcp_tool_annotations = func._mcp_tool_annotations
+        wrapper._mcp_tool_title = func._mcp_tool_title
         wrapper._mcp_tool_tags = func._mcp_tool_tags
         wrapper._mcp_tool_meta = func._mcp_tool_meta
 
@@ -434,7 +480,10 @@ def resource(
     description=None,  # type: Optional[str]
     mime_type=None,  # type: Optional[str]
     tags=None,  # type: Optional[Set[str]]
-    meta=None  # type: Optional[Dict[str, Any]]
+    meta=None,  # type: Optional[Dict[str, Any]]
+    title=None,  # type: Optional[str]
+    annotations=None,  # type: Optional[Dict[str, Any]]
+    size=None  # type: Optional[int]
 ):
     # type: (...) -> Callable
     """
@@ -469,6 +518,9 @@ def resource(
         func._mcp_resource_mime_type = mime_type
         func._mcp_resource_tags = tags or set()
         func._mcp_resource_meta = meta or {}
+        func._mcp_resource_title = title
+        func._mcp_resource_annotations = annotations
+        func._mcp_resource_size = size
 
         # Check if URI has template parameters
         func._mcp_resource_is_template = "{" in uri
@@ -484,6 +536,9 @@ def resource(
         wrapper._mcp_resource_mime_type = func._mcp_resource_mime_type
         wrapper._mcp_resource_tags = func._mcp_resource_tags
         wrapper._mcp_resource_meta = func._mcp_resource_meta
+        wrapper._mcp_resource_title = func._mcp_resource_title
+        wrapper._mcp_resource_annotations = func._mcp_resource_annotations
+        wrapper._mcp_resource_size = func._mcp_resource_size
         wrapper._mcp_resource_is_template = func._mcp_resource_is_template
 
         return wrapper
@@ -495,7 +550,8 @@ def prompt(
     name=None,  # type: Optional[str]
     description=None,  # type: Optional[str]
     tags=None,  # type: Optional[Set[str]]
-    meta=None  # type: Optional[Dict[str, Any]]
+    meta=None,  # type: Optional[Dict[str, Any]]
+    title=None  # type: Optional[str]
 ):
     # type: (...) -> Callable
     """
@@ -528,6 +584,7 @@ def prompt(
         func._mcp_prompt_name = name or func.__name__
         func._mcp_prompt_description = description or (func.__doc__ or "").strip()
         func._mcp_prompt_tags = tags or set()
+        func._mcp_prompt_title = title
         func._mcp_prompt_meta = meta or {}
         func._mcp_prompt_arguments = []
 
@@ -551,6 +608,7 @@ def prompt(
         wrapper._mcp_prompt_description = func._mcp_prompt_description
         wrapper._mcp_prompt_arguments = func._mcp_prompt_arguments
         wrapper._mcp_prompt_tags = func._mcp_prompt_tags
+        wrapper._mcp_prompt_title = func._mcp_prompt_title
         wrapper._mcp_prompt_meta = func._mcp_prompt_meta
 
         return wrapper
