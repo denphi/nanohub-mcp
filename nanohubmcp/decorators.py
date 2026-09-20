@@ -90,14 +90,15 @@ def _python_type_to_json_schema(py_type):
                     "additionalProperties": _python_type_to_json_schema(args[1])}
         return {"type": "object"}
 
-    # typing.Any -> permissive (accept any JSON value); truly unknown -> string.
-    try:
-        import typing as _typing2
-        if py_type is _typing2.Any:
-            return {}
-    except Exception:
-        pass
-    return {"type": "string"}
+    # `typing.Any` and anything unrecognized are both "no constraint known".
+    #
+    # The unrecognized case used to answer `{"type": "string"}`. That was a
+    # guess, and while nothing read the schema it was harmless; once
+    # tools/call validates against it, a handler annotated with a dataclass
+    # or any other unmodelled class rejects every object a client sends.
+    # An empty schema states what is actually known, and `required` still
+    # catches a genuinely missing argument.
+    return {}
 
 
 def _split_top_level_commas(value):
@@ -134,7 +135,7 @@ def _type_expr_to_json_schema(type_expr):
     """Convert a type-comment expression string to JSON Schema."""
     normalized = (type_expr or "").replace("typing.", "").replace(" ", "")
     if not normalized:
-        return {"type": "string"}
+        return {}
 
     primitive_types = {
         "str": "string",
@@ -146,8 +147,12 @@ def _type_expr_to_json_schema(type_expr):
         "dict": "object",
         "tuple": "array",
         "set": "array",
-        "Any": "string",
     }
+    if normalized == "Any":
+        # `Any` means any JSON value. Mapping it to "string" — which this
+        # did, while the resolved-type path above correctly returned {} —
+        # rejects every non-string once the schema is enforced.
+        return {}
     if normalized in primitive_types:
         return {"type": primitive_types[normalized]}
 
@@ -179,7 +184,10 @@ def _type_expr_to_json_schema(type_expr):
         if len(option_types) == 1:
             single = {"type": option_types[0]}
             return _allow_null(single) if optional else single
-        return {"type": "string"}
+        # Several concrete types: no single `type` describes them, and
+        # naming one rejects the others. Matches the resolved-type path,
+        # which has always returned {} for a mixed Union.
+        return {}
 
     array_prefixes = (
         "List[", "list[", "Tuple[", "tuple[", "Set[", "set[", "Sequence[", "Iterable["
@@ -193,7 +201,9 @@ def _type_expr_to_json_schema(type_expr):
         if normalized.startswith(prefix) and normalized.endswith("]"):
             return {"type": "object"}
 
-    return {"type": "string"}
+    # An expression this parser does not model. See the note in
+    # `_python_type_to_json_schema` on why that is {} and not "string".
+    return {}
 
 
 def _python_value_to_json_schema(value):
@@ -292,7 +302,13 @@ def _generate_input_schema(func, exclude_params=None):
         elif name in comment_schemas:
             prop = comment_schemas[name]
         elif param.default is not inspect.Parameter.empty and param.default is not None:
-            prop = _python_value_to_json_schema(param.default)
+            # Publish the default itself, not a type inferred from it.
+            # `def scale(factor=1)` used to advertise `"type": "integer"`
+            # purely because the default happened to be an int, which
+            # enforcement then used to reject `factor=2.5`. `default` is
+            # the JSON Schema keyword for this, it is true, and an LLM
+            # reading it infers the same shape without the false bound.
+            prop = {"default": param.default}
         else:
             # Nothing said what this is — no annotation, no type comment, no
             # informative default. An empty schema says exactly that.

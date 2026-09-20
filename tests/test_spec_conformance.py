@@ -15,6 +15,8 @@ import time
 
 import pytest
 
+from typing import Any, Union  # noqa: F401  (used by a type comment below)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nanohubmcp import MCPServer, ToolResult  # noqa: E402
@@ -972,3 +974,121 @@ def test_sweep_releases_the_state_a_collected_session_owned():
     assert server.session_exists("S") is False
     assert "S" not in server._resource_subs
     assert server.resource_updated("config://settings") == 0
+
+
+# ---------------------------------------------------------------------------
+# Inference must not assert a type it only guessed
+#
+# Validating tools/call against inputSchema turned every guess in the schema
+# generator into a hard constraint. These pin the rule that survived: a type
+# the generator actually knows is enforced, a type it invented is not
+# published at all.
+# ---------------------------------------------------------------------------
+
+class _Widget(object):
+    """A class the schema generator has no model for."""
+
+
+def _guessy_server():
+    server = MCPServer("guesses")
+
+    @server.tool()
+    def scale(factor=1):
+        """Type is only inferable from the default"""
+        return {"factor": factor}
+
+    @server.tool()
+    def flags(opts={"a": 1}):
+        """Dict default"""
+        return {"opts": opts}
+
+    @server.tool()
+    def custom(w: _Widget):
+        """Annotated with an unmodelled class"""
+        return {"w": repr(w)}
+
+    @server.tool()
+    def commented(a, b):
+        # type: (Union[int, str], Any) -> dict
+        """Type comment with a mixed union and Any"""
+        return {"a": a, "b": b}
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-06-18", "capabilities": {}})
+    return server
+
+
+def _schema_of(server, name):
+    return [t for t in rpc(server, "tools/list")["result"]["tools"]
+            if t["name"] == name][0]["inputSchema"]
+
+
+def test_default_value_publishes_default_not_a_guessed_type():
+    """`def scale(factor=1)` must not advertise `"type": "integer"`.
+
+    The default is evidence of the default, not of what the parameter
+    accepts. Publishing a type inferred from it made `factor=2.5` a -32602,
+    where published 0.4.3 ran the tool.
+    """
+    server = _guessy_server()
+    assert _schema_of(server, "scale")["properties"]["factor"] == {"default": 1}
+
+    for value in (2.5, "x", None, [1]):
+        result = rpc(server, "tools/call",
+                     {"name": "scale", "arguments": {"factor": value}})
+        assert "error" not in result, (value, result)
+
+
+def test_dict_default_does_not_constrain_the_argument():
+    server = _guessy_server()
+    assert _schema_of(server, "flags")["properties"]["opts"] == {"default": {"a": 1}}
+    assert "error" not in rpc(server, "tools/call",
+                              {"name": "flags", "arguments": {"opts": [1]}})
+
+
+def test_unmodelled_class_annotation_constrains_nothing():
+    """The "unknown -> string" fallback rejected every object sent."""
+    server = _guessy_server()
+    assert _schema_of(server, "custom")["properties"]["w"] == {}
+    # Still required — presence is structural, and known.
+    assert _schema_of(server, "custom")["required"] == ["w"]
+
+    assert "error" not in rpc(server, "tools/call",
+                              {"name": "custom", "arguments": {"w": {"k": 1}}})
+    missing = rpc(server, "tools/call", {"name": "custom", "arguments": {}})
+    assert missing["error"]["code"] == -32602
+
+
+def test_type_comment_union_and_any_constrain_nothing():
+    """The comment path mapped `Any` and mixed unions to "string".
+
+    The resolved-annotation path returns `{}` for both; the two disagreed,
+    and only the comment path rejected valid calls.
+    """
+    server = _guessy_server()
+    props = _schema_of(server, "commented")["properties"]
+    assert props["a"] == {}
+    assert props["b"] == {}
+
+    for args in ({"a": 1, "b": 2}, {"a": "s", "b": [1]}, {"a": 1, "b": None}):
+        assert "error" not in rpc(server, "tools/call",
+                                  {"name": "commented", "arguments": args}), args
+
+
+def test_real_annotations_are_still_enforced():
+    """The fixes must not disarm validation where the type is actually known."""
+    server = MCPServer("typed")
+
+    @server.tool()
+    def typed(a: int, b: str = "x"):
+        """Properly annotated"""
+        return {"a": a, "b": b}
+
+    assert rpc(server, "tools/call",
+               {"name": "typed", "arguments": {"a": "no"}})["error"]["code"] == -32602
+    assert rpc(server, "tools/call",
+               {"name": "typed", "arguments": {"a": 1, "b": 2}})["error"]["code"] == -32602
+    assert rpc(server, "tools/call",
+               {"name": "typed", "arguments": {}})["error"]["code"] == -32602
+    assert "error" not in rpc(server, "tools/call",
+                              {"name": "typed", "arguments": {"a": 1}})

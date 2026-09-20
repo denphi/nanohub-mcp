@@ -62,15 +62,18 @@ def test_union_collapses_when_one_real_type_remains():
         "type": ["integer", "null"]}
 
 
-def test_mixed_union_falls_back_to_string():
+def test_mixed_union_constrains_nothing():
     """A genuinely ambiguous union degrades rather than guessing wrong.
 
-    Worth pinning: the fallback is permissive, so a mixed union publishes a
-    looser schema than the handler accepts. That is deliberate — a wrong
-    narrow type would reject valid calls — but it means unions are a poor way
-    to describe a tool argument.
+    This used to answer `{"type": "string"}` and call that permissive. It was
+    not: naming one member of the union excludes the others, and once
+    tools/call began validating against inputSchema it rejected an int for a
+    `Union[int, str]` parameter. An empty schema is the permissive answer the
+    original rationale was reaching for, and it matches what the resolved-type
+    path has always returned for a mixed Union.
     """
-    assert _type_expr_to_json_schema("Union[int, str]") == {"type": "string"}
+    assert _type_expr_to_json_schema("Union[int, str]") == {}
+    assert _type_expr_to_json_schema("Any") == {}
 
 
 def test_container_expressions():
@@ -82,8 +85,14 @@ def test_container_expressions():
         assert _type_expr_to_json_schema(expr) == {"type": "object"}, expr
 
 
-def test_unknown_type_falls_back_to_string():
-    assert _type_expr_to_json_schema("numpy.ndarray") == {"type": "string"}
+def test_unknown_type_constrains_nothing():
+    """An expression this parser does not model asserts no type at all.
+
+    `{"type": "string"}` was a guess that enforcement turned into a rejection
+    of every non-string argument.
+    """
+    assert _type_expr_to_json_schema("numpy.ndarray") == {}
+    assert _type_expr_to_json_schema("") == {}
 
 
 def test_split_top_level_commas_respects_nesting():
@@ -118,8 +127,11 @@ def test_generated_schema_marks_only_argument_less_params_required():
     schema = _generate_input_schema(handler)
     assert schema["type"] == "object"
     assert schema["required"] == ["mesh_points"]
-    assert schema["properties"]["time_steps"]["type"] == "integer"
-    assert schema["properties"]["label"]["type"] == "string"
+    # An unannotated parameter's default is published as `default`, not as a
+    # `type` inferred from it: `time_steps=1000` says nothing about whether
+    # the handler also accepts 1000.5.
+    assert schema["properties"]["time_steps"] == {"default": 1000}
+    assert schema["properties"]["label"] == {"default": "run"}
 
 
 def test_generated_schema_excludes_the_context_parameter():

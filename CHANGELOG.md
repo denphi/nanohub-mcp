@@ -155,6 +155,22 @@ never published — but they were on `main`.
   refreshed `last_seen` and the session was dropped regardless, 404-ing a
   client that had just been served. Selection and removal now happen in one
   acquisition.
+- **Types the generator only guessed were enforced as constraints.** Turning
+  on input validation gave teeth to every fallback in the schema generator,
+  including the ones that were admitted guesses. Three sites answered "I do
+  not recognise this" with `{"type": "string"}` — an unmodelled class
+  annotation, an unparsed type-comment expression, and `Any` (which the
+  resolved-annotation path correctly returned `{}` for, so the two disagreed)
+  — and a mixed `Union[int, str]` in a type comment resolved to `"string"`
+  too, rejecting the int half of its own union. Separately, a parameter with
+  no annotation took its type from its default, so `def scale(factor=1)`
+  advertised `"type": "integer"` and refused `factor=2.5`. All of these ran
+  fine on published 0.4.3. Every guess is now `{}`, which is what "nothing is
+  known" should have said all along, and a default publishes `default`
+  instead of a type inferred from it. Types that come from a real annotation
+  are still enforced, and `required` — which is structural, not guessed — is
+  unchanged.
+
 - **`subscriptions/listen` answered an unacceptable `Accept` with 405.** POST
   is supported at that endpoint, so 405 asserts the wrong thing and owes an
   `Allow` header; a client running the spec's backwards-compatibility probe
