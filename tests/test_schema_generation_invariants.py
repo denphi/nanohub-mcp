@@ -423,3 +423,68 @@ def test_the_coverage_check_can_fail():
     assert unreached - covered, (
         "tracing a single expression should leave branches uncovered; if it "
         "does not, the tracer is not observing this function")
+
+
+# ---------------------------------------------------------------------------
+# The validator's type rules, checked against the reference implementation
+# rather than against my reading of the spec.
+# ---------------------------------------------------------------------------
+
+TYPE_PROBES = [
+    5, 5.0, 5.5, -0.0, 0, -1, 1e100, float("nan"), float("inf"),
+    True, False, "5", "", "text", None, [], [1], {}, {"k": 1},
+]
+
+JSON_TYPE_NAMES = ["integer", "number", "string", "boolean",
+                   "object", "array", "null"]
+
+
+@pytest.mark.parametrize("type_name", JSON_TYPE_NAMES)
+def test_type_rules_match_the_reference_implementation(type_name):
+    """`_matches_type` must agree with jsonschema on every JSON shape.
+
+    Hand-reasoning about this got `integer` wrong: JSON Schema defines it as
+    "a JSON number with a zero fractional part", so `5.0` is an integer, and
+    rejecting it refused the commonest shape an LLM emits for an integer
+    argument. Comparing against the reference removes the reasoning step.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+    validator = jsonschema.Draft202012Validator({"type": type_name})
+
+    from nanohubmcp.server import MCPServer
+
+    mismatches = []
+    for value in TYPE_PROBES:
+        expected = validator.is_valid(value)
+        actual = MCPServer._matches_type(type_name, value)
+        if expected != actual:
+            mismatches.append(
+                "{!r}: jsonschema={} nanohubmcp={}".format(
+                    value, expected, actual))
+    assert not mismatches, "type {!r}: {}".format(type_name, mismatches)
+
+
+def test_integer_accepts_a_whole_float():
+    """The specific regression, pinned without needing jsonschema installed."""
+    from nanohubmcp.server import MCPServer
+
+    assert MCPServer._matches_type("integer", 5.0) is True
+    assert MCPServer._matches_type("integer", -0.0) is True
+    assert MCPServer._matches_type("integer", 5.5) is False
+    assert MCPServer._matches_type("integer", "5") is False
+    assert MCPServer._matches_type("integer", True) is False
+
+
+def test_a_whole_float_reaches_an_integer_parameter():
+    """End to end: the argument a client actually sends must be accepted."""
+    server = MCPServer("integers")
+
+    @server.tool()
+    def repeat(times: int):
+        """Integer argument"""
+        return {"times": times}
+
+    assert server._input_schema_violation("repeat", {"times": 5.0}) is None
+    assert server._input_schema_violation("repeat", {"times": 5}) is None
+    assert server._input_schema_violation("repeat", {"times": 5.5}) is not None
+    assert server._input_schema_violation("repeat", {"times": "5"}) is not None

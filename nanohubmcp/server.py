@@ -571,7 +571,16 @@ class MCPServer(object):
         """Whether `value` is of the named JSON Schema type."""
         if name == "integer":
             # `True` is an int in Python and is not an integer in JSON.
-            return isinstance(value, int) and not isinstance(value, bool)
+            if isinstance(value, bool):
+                return False
+            if isinstance(value, int):
+                return True
+            # JSON Schema: an integer is "a JSON number with a zero
+            # fractional part", so 5.0 is one. JSON draws no int/float
+            # distinction, and a client or serializer that emits 5.0 for an
+            # integer field is conforming — refusing it rejected the single
+            # most common shape an LLM sends for such an argument.
+            return isinstance(value, float) and value.is_integer()
         if name == "number":
             return isinstance(value, (int, float)) and not isinstance(value, bool)
         expected = MCPServer._JSON_TYPES.get(name)

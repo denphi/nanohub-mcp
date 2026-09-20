@@ -380,6 +380,14 @@ tool failure — the call never happened, so reporting it as `isError` would tel
 the model the tool ran. Exceptions raised *inside* the handler are still
 returned as `isError`.
 
+The checks cover `type`, `required`, `properties`, `items` and `enum`. **Other
+JSON Schema keywords are published to clients but not enforced** — `pattern`,
+`minimum`/`maximum`, `maxLength`, `minItems`/`maxItems`, `additionalProperties`
+and `$ref` among them. If you rely on one of those to bound untrusted input,
+check it inside the handler as well; the server advertises it, it does not
+apply it. `type` follows JSON Schema exactly, so an `integer` parameter accepts
+`5.0` (a number with a zero fractional part) and refuses `"5"`.
+
 **`output_schema`.** Declaring one obliges the server to return conforming
 structured content, so the result is validated against it and a breach is
 reported rather than published. Type, `required`, `properties`, `items` and

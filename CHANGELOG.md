@@ -31,7 +31,12 @@ Streamable HTTP requirement the transport did not meet.
   schema and a breach is reported as a tool error instead of contradicting
   what `tools/list` advertised.
 - **Tool arguments were not validated.** "Servers MUST validate all tool
-  inputs." A missing or mistyped argument reached the handler, raised a Python
+  inputs." (Scope, stated plainly because the first version of this entry did
+  not: `type`, `required`, `properties`, `items` and `enum` are enforced.
+  Other keywords — `pattern`, `minimum`/`maximum`, `maxLength`,
+  `minItems`/`maxItems`, `additionalProperties`, `$ref` — are published and
+  **not** enforced, so a bound written for untrusted input still needs
+  checking inside the handler.) A missing or mistyped argument reached the handler, raised a Python
   `TypeError`, and came back as `isError` — telling the model the tool ran and
   failed when the call never happened, in a message that leaked the handler's
   signature. Malformed calls are now `-32602`. Genuine tool failures are still
@@ -189,6 +194,14 @@ never published — but they were on `main`.
   is supported at that endpoint, so 405 asserts the wrong thing and owes an
   `Allow` header; a client running the spec's backwards-compatibility probe
   reads a 4xx on POST as "legacy HTTP+SSE server" and downgrades. Now 406.
+
+- **`integer` rejected a whole float.** JSON Schema defines an integer as "a
+  JSON number with a zero fractional part", so `5.0` is one; the check used
+  `isinstance(value, int)` and refused it. That is the commonest shape an LLM
+  client or a JSON serializer emits for an integer argument, and it affected
+  91 integer-typed properties across the 266 tools in the nanoHUB
+  implementations. The type rules are now tested against `jsonschema` rather
+  than against a reading of the spec.
 
 ### Changed
 
