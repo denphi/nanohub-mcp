@@ -2153,3 +2153,24 @@ def test_rejected_subscriptions_listen_returns_json_not_a_stream():
     assert "application/json" in headers["Content-Type"]
     assert body["error"]["code"] == -32602
     assert status == 200
+
+
+def test_listen_with_a_json_only_accept_is_406_not_405():
+    """POST is supported here, so 405 would assert the wrong thing.
+
+    A client running the transport spec's backwards-compatibility probe
+    reads a 4xx on POST as "this is the legacy HTTP+SSE server" and
+    downgrades, instead of correcting its Accept header.
+    """
+    status, _headers, _body = _request_raw(
+        "POST", "/mcp",
+        body=json.dumps({"jsonrpc": "2.0", "id": 702,
+                         "method": "subscriptions/listen",
+                         "params": {"notifications": {"toolsListChanged": True},
+                                    "_meta": {
+                                        "io.modelcontextprotocol/protocolVersion":
+                                            "2026-07-28"}}}).encode(),
+        headers={"Content-Type": "application/json",
+                 "Mcp-Method": "subscriptions/listen",
+                 "Accept": "application/json"})
+    assert status == 406

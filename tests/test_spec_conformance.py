@@ -8,8 +8,10 @@ and that a session can be ended.
 
 from __future__ import print_function
 
+import json
 import os
 import sys
+import time
 
 import pytest
 
@@ -742,3 +744,231 @@ def test_resource_annotations_reach_the_wire():
 
     resource = rpc(server, "resources/list")["result"]["resources"][0]
     assert resource["annotations"] == {"audience": ["user"], "priority": 0.8}
+
+
+# ---------------------------------------------------------------------------
+# Regressions found reviewing the conformance work itself
+# ---------------------------------------------------------------------------
+
+def test_var_keyword_tool_stays_callable():
+    """`**kwargs` is not a named argument and must not be a required property.
+
+    The generated schema listed it as one (it has no default), which was
+    inert until tools/call began validating against the schema — at which
+    point every call was rejected and no argument name could satisfy it.
+    """
+    server = MCPServer("varkw")
+
+    @server.tool()
+    def kw(a, **extra):
+        """Takes arbitrary extra keywords"""
+        return {"a": a, "extra": extra}
+
+    schema = rpc(server, "tools/list")["result"]["tools"][0]["inputSchema"]
+    assert "extra" not in schema["properties"]
+    assert schema["required"] == ["a"]
+
+    result = rpc(server, "tools/call",
+                 {"name": "kw", "arguments": {"a": 1, "b": 2}})["result"]
+    assert result["isError"] is False
+    assert json.loads(result["content"][0]["text"]) == {"a": 1, "extra": {"b": 2}}
+
+
+def test_var_positional_tool_stays_callable():
+    server = MCPServer("varpos")
+
+    @server.tool()
+    def va(*items):
+        """Takes varargs"""
+        return {"count": len(items)}
+
+    schema = rpc(server, "tools/list")["result"]["tools"][0]["inputSchema"]
+    assert schema["properties"] == {}
+    assert schema["required"] == []
+    assert rpc(server, "tools/call",
+               {"name": "va", "arguments": {}})["result"]["isError"] is False
+
+
+def _array_output_server():
+    server = MCPServer("arrays")
+
+    @server.tool(output_schema={"type": "array", "items": {"type": "integer"}})
+    def listy():
+        """Returns a JSON array"""
+        return [1, 2, 3]
+
+    @server.tool(output_schema={"type": "array", "items": {"type": "integer"}})
+    def bad():
+        """Violates its own array schema"""
+        return ["x"]
+
+    return server
+
+
+@pytest.mark.parametrize("version", ["2024-11-05", "2025-06-18", "2025-11-25"])
+def test_non_object_structured_content_is_withheld_pre_2026(version):
+    """Through 2025-11-25 `structuredContent` is typed as an object.
+
+    Emitting an array produced a CallToolResult that the revision's own
+    schema rejects. The data still travels, as the serialized-JSON text
+    block the spec asks for.
+    """
+    server = _array_output_server()
+    session = "S-arr-{}".format(version)
+    rpc(server, "initialize",
+        {"protocolVersion": version, "capabilities": {}}, session)
+
+    result = rpc(server, "tools/call",
+                 {"name": "listy", "arguments": {}}, session)["result"]
+    assert "structuredContent" not in result
+    assert result["isError"] is False
+    assert json.loads(result["content"][0]["text"]) == [1, 2, 3]
+
+
+def test_non_object_structured_content_is_sent_under_2026_07_28():
+    """SEP-2106 loosened the field to any JSON value."""
+    server = _array_output_server()
+    result = rpc(server, "tools/call",
+                 {"name": "listy", "arguments": {},
+                  "_meta": dict(MODERN)}, "S-arr-modern")["result"]
+    assert result["structuredContent"] == [1, 2, 3]
+
+
+@pytest.mark.parametrize("version", ["2025-11-25", None])
+def test_output_schema_still_enforced_when_content_is_withheld(version):
+    """Withholding the field must not let a tool escape its own contract.
+
+    Validation reads the handler's value, not the shaped result, so the
+    breach is caught on a revision that could not have carried it either.
+    """
+    server = _array_output_server()
+    params = {"name": "bad", "arguments": {}}
+    session = "S-bad"
+    if version:
+        rpc(server, "initialize",
+            {"protocolVersion": version, "capabilities": {}}, session)
+    else:
+        params["_meta"] = dict(MODERN)
+
+    result = rpc(server, "tools/call", params, session)["result"]
+    assert result["isError"] is True
+    assert "outputSchema" in result["content"][0]["text"]
+
+
+def test_tool_result_structured_content_is_also_fitted():
+    """The same rule applies to a hand-built ToolResult."""
+    server = MCPServer("arrays")
+
+    @server.tool()
+    def listy():
+        """Array via ToolResult"""
+        return ToolResult(content="[1, 2]", structured_content=[1, 2])
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-11-25", "capabilities": {}}, "S-tr")
+    legacy = rpc(server, "tools/call",
+                 {"name": "listy", "arguments": {}}, "S-tr")["result"]
+    assert "structuredContent" not in legacy
+
+    modern = rpc(server, "tools/call",
+                 {"name": "listy", "arguments": {}, "_meta": dict(MODERN)},
+                 "S-tr2")["result"]
+    assert modern["structuredContent"] == [1, 2]
+
+
+def test_subscribe_accepts_a_uri_that_read_serves():
+    """Subscribe and read must agree about whether a URI exists.
+
+    A template instance was readable but not subscribable, so a client that
+    had just read a resource could not watch it.
+    """
+    server = MCPServer("templates")
+
+    @server.resource("weather://{city}/current")
+    def weather(city):
+        """Weather by city"""
+        return {"city": city}
+
+    rpc(server, "initialize",
+        {"protocolVersion": "2025-06-18", "capabilities": {}})
+    assert "result" in rpc(server, "resources/read",
+                           {"uri": "weather://paris/current"})
+    assert rpc(server, "resources/subscribe",
+               {"uri": "weather://paris/current"})["result"] == {}
+    assert server.resource_updated("weather://paris/current") == 1
+
+    # A URI no template matches is still not found.
+    assert rpc(server, "resources/subscribe",
+               {"uri": "weather://a/b/current"})["error"]["code"] == -32002
+
+
+def test_template_only_server_advertises_subscribe():
+    server = MCPServer("templates")
+
+    @server.resource("weather://{city}/current")
+    def weather(city):
+        """Weather by city"""
+        return {"city": city}
+
+    caps = rpc(server, "initialize",
+               {"protocolVersion": "2025-06-18",
+                "capabilities": {}})["result"]["capabilities"]
+    assert caps["resources"]["subscribe"] is True
+
+
+def test_sweep_decides_and_removes_under_one_lock():
+    """Staleness is evaluated and acted on without releasing `_sessions_lock`.
+
+    The sweep used to select stale ids, release the lock, and only then call
+    `terminate_session` (which re-takes it twice). A request arriving in that
+    window refreshed `last_seen`, the sweep collected the session anyway, and
+    the client got a 404 immediately after being served. Counting the
+    acquisitions pins the absence of that window: three meant three chances
+    for state to change underneath, one means none.
+    """
+    server = server_with()
+    server._sessions["S"]["last_seen"] -= SESSION_IDLE_TIMEOUT_SECONDS + 1
+
+    real_lock = server._sessions_lock
+    acquisitions = []
+
+    class _CountingLock(object):
+        def __enter__(self):
+            acquisitions.append(1)
+            real_lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            real_lock.release()
+
+    server._sessions_lock = _CountingLock()
+    try:
+        server._prune_expired_sessions()
+    finally:
+        server._sessions_lock = real_lock
+
+    assert server.session_exists("S") is False, "the stale session was not collected"
+    assert len(acquisitions) == 1, (
+        "expected one atomic decide-and-remove, saw {}".format(len(acquisitions)))
+
+
+def test_sweep_spares_a_session_that_is_not_yet_idle():
+    """The boundary the sweep is deciding: just under the timeout survives."""
+    server = server_with()
+    server._sessions["S"]["last_seen"] -= SESSION_IDLE_TIMEOUT_SECONDS - 5
+    server._prune_expired_sessions()
+    assert server.session_exists("S") is True
+
+
+def test_sweep_releases_the_state_a_collected_session_owned():
+    """Subscriptions and waiters must go with the session, as DELETE does."""
+    server = server_with()
+    rpc(server, "resources/subscribe", {"uri": "config://settings"})
+    assert server._resource_subs.get("S")
+
+    server._sessions["S"]["last_seen"] -= SESSION_IDLE_TIMEOUT_SECONDS + 1
+    server._prune_expired_sessions()
+
+    assert server.session_exists("S") is False
+    assert "S" not in server._resource_subs
+    assert server.resource_updated("config://settings") == 0

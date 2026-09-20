@@ -270,6 +270,17 @@ def _generate_input_schema(func, exclude_params=None):
     for name, param in sig.parameters.items():
         if name in exclude:
             continue
+        if param.kind in (inspect.Parameter.VAR_POSITIONAL,
+                          inspect.Parameter.VAR_KEYWORD):
+            # `*args` / `**kwargs` are not named arguments, so they are not
+            # properties — and marking them `required` (which having no
+            # default did) demanded an argument literally called "kwargs".
+            # Harmless while nothing read the schema; once tools/call
+            # validates against it, every call to such a tool is rejected
+            # and no argument name can satisfy it. A `**kwargs` handler
+            # takes arbitrary extra properties, which is already what an
+            # object schema permits by default.
+            continue
 
         prop = {}
 

@@ -121,6 +121,45 @@ Streamable HTTP requirement the transport did not meet.
   the revision that produced it. A revision the server accepts but never
   checks is one it only claims to speak.
 
+### Fixed (defects in the above, found reviewing it)
+
+The conformance work introduced two regressions against published 0.4.3 and
+left three flaws in the functionality it added. None reached PyPI — 0.4.4 was
+never published — but they were on `main`.
+
+- **`**kwargs` and `*args` tools became uncallable.** `_generate_input_schema`
+  emitted them as named properties and, having no default, marked them
+  `required` — so a call had to carry an argument literally named "kwargs".
+  That was inert while nothing read the schema; once `tools/call` validated
+  against it, every call to such a tool was rejected and no argument could
+  satisfy it. They are not named arguments and are no longer emitted. 0.4.3
+  had the same wrong schema and called these tools fine, so this was a
+  regression, not a pre-existing bug.
+- **A non-object `structuredContent` was sent to clients whose schema forbids
+  it.** Through 2025-11-25 the field is typed as an object; only SEP-2106
+  (2026-07-28) loosened it to any JSON value. A tool declaring
+  `output_schema={"type": "array"}` produced a `CallToolResult` that the
+  negotiated revision's own schema rejects. The field is now attached only
+  where the revision can carry it, and the data still travels as the
+  serialized-JSON text block. `outputSchema` is still enforced there:
+  validation reads the handler's value rather than the shaped result, so a
+  tool cannot escape its contract on an older client.
+- **`resources/subscribe` rejected a URI that `resources/read` serves.** The
+  existence check consulted only the literal registries, so an instance of a
+  registered template was readable but not subscribable — two methods
+  disagreeing about whether the same URI exists. Templates now count, for the
+  check and for the advertised `subscribe` capability.
+- **The idle sweep could collect a session that had just been used.** Stale
+  ids were selected under `_sessions_lock`, the lock released, and
+  `terminate_session` called after; a request arriving in that window
+  refreshed `last_seen` and the session was dropped regardless, 404-ing a
+  client that had just been served. Selection and removal now happen in one
+  acquisition.
+- **`subscriptions/listen` answered an unacceptable `Accept` with 405.** POST
+  is supported at that endpoint, so 405 asserts the wrong thing and owes an
+  `Allow` header; a client running the spec's backwards-compatibility probe
+  reads a 4xx on POST as "legacy HTTP+SSE server" and downgrades. Now 406.
+
 ### Changed
 
 - `skills/get` and `resources/directory/read` carry the offending `uri` in

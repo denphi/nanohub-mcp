@@ -148,6 +148,9 @@ _NO_RESPONSE = _Sentinel("_NO_RESPONSE")
 # Returned by a handler that has already built the whole JSON-RPC envelope and
 # must not have the usual result/error finalization applied on top of it.
 _RAW_RESPONSE = _Sentinel("_RAW_RESPONSE")
+# Distinguishes "this tool produced no structured result" from one that
+# produced `null`, which a 2026-07-28 outputSchema may well permit.
+_NO_STRUCTURED = _Sentinel("_NO_STRUCTURED")
 
 
 class _RequestContext(object):
@@ -394,20 +397,55 @@ class MCPServer(object):
         return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
 
 
-    def _shape_tool_result(self, tool_name, value):
-        # type: (Optional[str], Any) -> Dict[str, Any]
+    def _declared_output_schema(self, tool_name):
+        # type: (Any) -> Optional[Dict[str, Any]]
+        """The `outputSchema` a tool published, or None."""
+        entry = self._tools.get(tool_name) if isinstance(tool_name, str) else None
+        schema = getattr((entry or {}).get("definition"), "outputSchema", None)
+        return schema if isinstance(schema, dict) and schema else None
+
+    @staticmethod
+    def _structured_content_fits(value, version):
+        # type: (Any, str) -> bool
+        """Whether this revision's `structuredContent` can carry `value`.
+
+        Through 2025-11-25 the field is typed as an object; SEP-2106
+        (2026-07-28) loosened it to any JSON value. Sending an array to an
+        older client produces a `CallToolResult` that revision's own schema
+        rejects, so the data rides in the serialized-JSON text block instead.
+        """
+        return isinstance(value, dict) or MCPServer._is_stateless(version)
+
+    def _structured_candidate(self, value):
+        # type: (Any) -> Any
+        """The value a tool's `outputSchema` describes, or `_NO_STRUCTURED`.
+
+        Read from the handler's return value *before* shaping, so a tool is
+        held to its contract even where the negotiated revision cannot carry
+        the result in `structuredContent`.
+        """
+        if isinstance(value, ToolResult):
+            return (value.structured_content if value.has_structured_content
+                    else _NO_STRUCTURED)
+        if self._is_tool_result_payload(value):
+            return value.get("structuredContent", _NO_STRUCTURED)
+        # A plain return value *is* the structured result.
+        return value
+
+    def _shape_tool_result(self, tool_name, value, version):
+        # type: (Optional[str], Any, str) -> Dict[str, Any]
         """Turn a handler's return value into a CallToolResult payload.
 
         A dict becomes `structuredContent` plus the serialized JSON the spec
         asks for as a backwards-compatibility text block. Anything else is
         text — *unless* the tool published an `outputSchema`, in which case
-        the spec requires structured content whatever its JSON type, and
-        withholding it would leave the result unable to satisfy the schema.
+        the spec requires structured content, and withholding it would leave
+        the result unable to satisfy the schema.
+
+        `structuredContent` is attached only where the revision can carry it;
+        see :meth:`_structured_content_fits`.
         """
-        declares_schema = False
-        if tool_name:
-            definition = (self._tools.get(tool_name) or {}).get("definition")
-            declares_schema = bool(getattr(definition, "outputSchema", None))
+        declares_schema = self._declared_output_schema(tool_name) is not None
 
         if isinstance(value, dict) or declares_schema:
             try:
@@ -417,25 +455,37 @@ class MCPServer(object):
                 # `_apply_output_schema` will report the contract breach.
                 return {"content": [{"type": "text", "text": str(value)}],
                         "isError": False}
-            return {
-                "content": [{"type": "text", "text": text}],
-                "structuredContent": value,
-                "isError": False,
-            }
+            shaped = {"content": [{"type": "text", "text": text}],
+                      "isError": False}
+            if self._structured_content_fits(value, version):
+                shaped["structuredContent"] = value
+            return shaped
         return {
             "content": [{"type": "text", "text": str(value)}],
             "isError": False,
         }
 
-    def _tool_result_payload(self, value, tool_name=None):
-        # type: (Any, Optional[str]) -> Dict[str, Any]
+    def _fit_structured_content(self, payload, version):
+        # type: (Dict[str, Any], str) -> Dict[str, Any]
+        """Drop a `structuredContent` this revision cannot represent."""
+        if ("structuredContent" in payload
+                and not self._structured_content_fits(
+                    payload["structuredContent"], version)):
+            payload = dict(payload)
+            payload.pop("structuredContent", None)
+        return payload
+
+    def _tool_result_payload(self, value, tool_name=None, version=None):
+        # type: (Any, Optional[str], Optional[str]) -> Dict[str, Any]
         """Wrap a stored async-tool value as a CallToolResult payload."""
+        version = version or DEFAULT_NEGOTIATED_VERSION
         if isinstance(value, ToolResult):
-            return self._apply_output_schema(tool_name, value.to_dict())
-        if self._is_tool_result_payload(value):
-            return self._apply_output_schema(tool_name, value)
-        return self._apply_output_schema(
-            tool_name, self._shape_tool_result(tool_name, value))
+            payload = self._fit_structured_content(value.to_dict(), version)
+        elif self._is_tool_result_payload(value):
+            payload = self._fit_structured_content(value, version)
+        else:
+            payload = self._shape_tool_result(tool_name, value, version)
+        return self._apply_output_schema(tool_name, payload, value)
 
     # The JSON Schema keywords `_schema_violation` understands. Anything else
     # in an outputSchema is ignored rather than guessed at — see below.
@@ -567,8 +617,8 @@ class MCPServer(object):
             return None
         return self._schema_violation(schema, arguments, path="arguments")
 
-    def _apply_output_schema(self, tool_name, result):
-        # type: (Optional[str], Dict[str, Any]) -> Dict[str, Any]
+    def _apply_output_schema(self, tool_name, result, call_result):
+        # type: (Optional[str], Dict[str, Any], Any) -> Dict[str, Any]
         """Hold a tool's result to the `outputSchema` it published.
 
         The spec is a MUST: "Servers MUST provide structured results that
@@ -576,19 +626,24 @@ class MCPServer(object):
         so a handler that breaks its own contract is reported the way any
         other tool failure is — `isError`, with the reason — rather than
         shipping a payload that contradicts what `tools/list` promised.
+
+        Validation reads the handler's own value rather than the shaped
+        `structuredContent`, because that field is dropped when the
+        negotiated revision cannot represent it. The tool is still held to
+        its contract there; the result just carries the data as serialized
+        JSON instead of as a field the client would reject.
         """
-        entry = self._tools.get(tool_name) if tool_name else None
-        definition = (entry or {}).get("definition")
-        schema = getattr(definition, "outputSchema", None)
-        if not schema or not isinstance(result, dict) or result.get("isError"):
+        schema = self._declared_output_schema(tool_name)
+        if schema is None or not isinstance(result, dict) or result.get("isError"):
             return result
 
-        if "structuredContent" not in result:
+        structured = self._structured_candidate(call_result)
+        if structured is _NO_STRUCTURED:
             return self._output_schema_error(
                 tool_name,
                 "returned no structured content, but declares an outputSchema")
 
-        violation = self._schema_violation(schema, result["structuredContent"])
+        violation = self._schema_violation(schema, structured)
         if violation:
             return self._output_schema_error(
                 tool_name, "returned structured content that violates its "
@@ -1709,8 +1764,11 @@ class MCPServer(object):
             list_changed=self._dynamic_registry,
             # Both mechanisms are implemented: `resources/subscribe` for the
             # handshake revisions and `subscriptions/listen` with
-            # `resourceSubscriptions` for 2026-07-28.
-            subscribe=len(self._resources) > 0 or len(self._skill_resources) > 0,
+            # `resourceSubscriptions` for 2026-07-28. Templates count: their
+            # instances are readable, and so subscribable.
+            subscribe=(len(self._resources) > 0
+                       or len(self._resource_templates) > 0
+                       or len(self._skill_resources) > 0),
         )
 
     def _has_mcp_app_resources(self):
@@ -2655,10 +2713,13 @@ class MCPServer(object):
 
                     # Wrap result in proper format
                     if isinstance(call_result, ToolResult):
-                        result = call_result.to_dict()
+                        result = self._fit_structured_content(
+                            call_result.to_dict(), version)
                     else:
-                        result = self._shape_tool_result(tool_name, call_result)
-                    result = self._apply_output_schema(tool_name, result)
+                        result = self._shape_tool_result(
+                            tool_name, call_result, version)
+                    result = self._apply_output_schema(
+                        tool_name, result, call_result)
                 except InputRequired as needed:
                     # Not an error: the handler is telling the client
                     # what it needs. The client answers by retrying this
@@ -2854,6 +2915,20 @@ class MCPServer(object):
                           "message": "{} requires an MCP session".format(ctx.method)}
         return self._strip_proxy_prefix(uri), None
 
+    def _resource_exists(self, uri):
+        # type: (str) -> bool
+        """Whether `resources/read` would serve this URI.
+
+        Templates are consulted, not just the literal registries: a URI that
+        instantiates a registered template is readable, and subscribe and
+        read disagreeing about whether the same URI exists is a worse answer
+        than either one alone.
+        """
+        with self._registry_lock:
+            if uri in self._resources or uri in self._skill_resources:
+                return True
+        return self._match_resource_template(uri) is not None
+
     def _rpc_resources_subscribe(self, ctx):
         # type: (_RequestContext) -> tuple
         """Handle the JSON-RPC `resources/subscribe` method."""
@@ -2861,9 +2936,7 @@ class MCPServer(object):
         if error is not None:
             return None, error
 
-        with self._registry_lock:
-            known = uri in self._resources or uri in self._skill_resources
-        if not known:
+        if not self._resource_exists(uri):
             return None, {"code": ERR_RESOURCE_NOT_FOUND_LEGACY,
                           "message": "Resource not found",
                           "data": {"uri": ctx.params.get("uri")}}
@@ -3122,16 +3195,21 @@ class MCPServer(object):
             self._clients.pop(session_id, None)
         with self._sessions_lock:
             self._sessions.pop(session_id, None)
-        self._drop_subscriptions(session_id)
+        self._release_session_scoped_state(session_id)
+        return True
 
+    def _release_session_scoped_state(self, session_id):
+        # type: (str) -> None
+        """Drop the subscriptions and waiters that a session owned."""
+        self._drop_subscriptions(session_id)
         prefix = "{}:".format(session_id)
         with self._pending_lock:
             for key in [k for k in self._pending_client_requests
                         if k.startswith(prefix)]:
                 pending = self._pending_client_requests.pop(key, None)
                 if pending and "event" in pending:
+                    # Wake any waiter so it raises instead of timing out.
                     pending["event"].set()
-        return True
 
     def _prune_expired_sessions(self):
         # type: () -> None
@@ -3144,17 +3222,25 @@ class MCPServer(object):
         like the job and MRTR sweeps beside it.
         """
         cutoff = time.time() - SESSION_IDLE_TIMEOUT_SECONDS
-        with self._sessions_lock:
-            stale = [sid for sid, session in self._sessions.items()
-                     if session.get("last_seen", 0) < cutoff]
-        if not stale:
-            return
         with self._clients_lock:
-            # A session with a live stream is not idle, whatever its
-            # last request looked like.
-            stale = [sid for sid in stale if not self._clients.get(sid)]
+            # A session with a live stream is not idle, whatever its last
+            # request looked like.
+            streaming = {sid for sid, queues in self._clients.items() if queues}
+
+        with self._sessions_lock:
+            # Selected *and removed* under the one lock that owns
+            # `last_seen`. Scanning here and deleting after releasing it
+            # let a concurrent request refresh a session in between, and
+            # the sweep collected it anyway — the client's next request
+            # then 404'd although it had just been served.
+            stale = [sid for sid, session in self._sessions.items()
+                     if session.get("last_seen", 0) < cutoff
+                     and sid not in streaming]
+            for session_id in stale:
+                del self._sessions[session_id]
+
         for session_id in stale:
-            self.terminate_session(session_id)
+            self._release_session_scoped_state(session_id)
 
     def _client_count(self):
         # type: () -> int

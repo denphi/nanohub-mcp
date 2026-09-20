@@ -637,8 +637,13 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         2026-07-28 caller needs.
         """
         if not self._accepts_event_stream():
+            # 406, not 405: POST *is* supported here, so 405 would assert
+            # the wrong thing (and owes an Allow header). A client running
+            # the transport spec's backwards-compatibility probe reads a
+            # 4xx on POST as "this is the legacy HTTP+SSE server" and
+            # downgrades, rather than fixing its Accept header.
             self.send_error(
-                405, "subscriptions/listen is answered with text/event-stream")
+                406, "subscriptions/listen is answered with text/event-stream")
             return
 
         owned = not session_id
