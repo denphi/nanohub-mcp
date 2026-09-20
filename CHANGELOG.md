@@ -115,6 +115,20 @@ Streamable HTTP requirement the transport did not meet.
   `allowed_origins`. Origin validation is a MUST precisely to stop DNS
   rebinding, and a library cannot guess the legitimate origins — so it now
   says so instead of passing everything silently.
+- **Branch enumeration for input-schema generation**
+  (`tests/test_schema_generation_invariants.py`). Every regression above came
+  from a guess the generator published and validation then enforced, and each
+  was found a review round after the last because each round checked examples
+  rather than branches. One case per branch of `_generate_input_schema` and of
+  both type converters, the invariant they exist to protect (a parameter with
+  no type information carries no `type`, and is accepted whatever JSON value
+  it is sent), and the complement (a real annotation is still enforced).
+  `test_every_branch_is_covered` traces the three functions while the corpus
+  runs and fails on any `return`/`continue` no case reached, so a branch added
+  without a case is a failure rather than a silent gap — confirmed by
+  injecting one. `test_the_coverage_check_can_fail` pins that the tracer
+  observes anything at all.
+
 - **Schema conformance tests for every advertised revision.** The vendored
   schemas now cover 2024-11-05, 2025-06-18 and 2025-11-25 alongside
   2026-07-28, and every list, read, get and call result is validated against
