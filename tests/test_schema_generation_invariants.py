@@ -488,3 +488,124 @@ def test_a_whole_float_reaches_an_integer_parameter():
     assert server._input_schema_violation("repeat", {"times": 5}) is None
     assert server._input_schema_violation("repeat", {"times": 5.5}) is not None
     assert server._input_schema_violation("repeat", {"times": "5"}) is not None
+
+
+# ---------------------------------------------------------------------------
+# Constraints beyond `type`: published to clients, so applied by the server.
+# ---------------------------------------------------------------------------
+
+BOUNDED_SCHEMAS = [
+    ("minimum", {"type": "integer", "minimum": 1}),
+    ("maximum", {"type": "integer", "maximum": 10}),
+    ("exclusiveMinimum", {"type": "number", "exclusiveMinimum": 0}),
+    ("exclusiveMaximum", {"type": "number", "exclusiveMaximum": 1}),
+    ("maxLength", {"type": "string", "maxLength": 3}),
+    ("minLength", {"type": "string", "minLength": 2}),
+    ("pattern-anchored", {"type": "string", "pattern": "^ws_[a-f0-9]{4}$"}),
+    ("pattern-unanchored", {"type": "string", "pattern": "[A-Z]"}),
+    ("minItems", {"type": "array", "minItems": 1}),
+    ("maxItems", {"type": "array", "maxItems": 2}),
+    ("minProperties", {"type": "object", "minProperties": 1}),
+    ("maxProperties", {"type": "object", "maxProperties": 1}),
+    ("additionalProperties-false",
+     {"type": "object", "properties": {"a": {"type": "integer"}},
+      "additionalProperties": False}),
+    ("additionalProperties-schema",
+     {"type": "object", "properties": {"a": {"type": "integer"}},
+      "additionalProperties": {"type": "string"}}),
+    ("const-number", {"const": 7}),
+    ("const-string", {"const": "x"}),
+    ("ref-root", {"$defs": {"H": {"type": "string", "pattern": "^ws_"}},
+                  "$ref": "#/$defs/H"}),
+    ("ref-nested",
+     {"$defs": {"N": {"type": "integer", "minimum": 5}}, "type": "object",
+      "properties": {"n": {"$ref": "#/$defs/N"}}, "required": ["n"]}),
+    ("ref-definitions",
+     {"definitions": {"S": {"type": "string", "maxLength": 2}},
+      "$ref": "#/definitions/S"}),
+]
+
+BOUNDED_VALUES = [
+    0, 1, 5, 7, 10, 11, -1, 0.5, 1.0, 2.5, "", "x", "xy", "xyz", "wxyz",
+    "ws_ab12", "ws_zz", "ABC", "abc", [], [1], [1, 2], [1, 2, 3], {},
+    {"a": 1}, {"a": 1, "b": "s"}, {"a": 1, "b": 2}, {"n": 5}, {"n": 1},
+    True, None,
+]
+
+
+@pytest.mark.parametrize("label,schema", BOUNDED_SCHEMAS,
+                         ids=[c[0] for c in BOUNDED_SCHEMAS])
+def test_bounded_keywords_match_the_reference_implementation(label, schema):
+    """Each keyword, against every JSON shape, compared with jsonschema.
+
+    These were published and ignored: a `pattern` on a handle or a `minimum`
+    on a count is a control the author wrote and the client is told about, so
+    trusting it and skipping the handler-side check was reasonable.
+    """
+    jsonschema = pytest.importorskip("jsonschema")
+    validator = jsonschema.Draft202012Validator(schema)
+
+    from nanohubmcp.server import MCPServer
+
+    mismatches = []
+    for value in BOUNDED_VALUES:
+        expected = validator.is_valid(value)
+        actual = MCPServer._schema_violation(schema, value) is None
+        if expected != actual:
+            mismatches.append("{!r}: jsonschema={} nanohubmcp={}".format(
+                value, expected, actual))
+    assert not mismatches, "{}: {}".format(label, mismatches)
+
+
+def test_a_self_referential_ref_terminates():
+    """A schema that refers to itself is legal and must not recurse forever."""
+    from nanohubmcp.server import MCPServer
+
+    schema = {"$defs": {"Node": {"type": "object",
+                                 "properties": {"next": {"$ref": "#/$defs/Node"}}}},
+              "$ref": "#/$defs/Node"}
+    node = {}
+    for _ in range(40):
+        node = {"next": node}
+    assert MCPServer._schema_violation(schema, node) is None
+
+
+def test_an_unresolvable_ref_constrains_nothing():
+    """A reference out of the document is ignored, not treated as a failure."""
+    from nanohubmcp.server import MCPServer
+
+    for reference in ("https://example.com/s.json", "#/$defs/Missing", "#/x/y"):
+        schema = {"$ref": reference}
+        assert MCPServer._schema_violation(schema, {"anything": 1}) is None
+
+
+def test_an_uncompilable_pattern_does_not_reject_everything():
+    """A regex Python cannot compile must not fail every value."""
+    from nanohubmcp.server import MCPServer
+
+    schema = {"type": "string", "pattern": "([unclosed"}
+    assert MCPServer._schema_violation(schema, "anything") is None
+
+
+def test_bounds_apply_to_tool_arguments_end_to_end():
+    server = MCPServer("bounded")
+
+    @server.tool(input_schema={
+        "type": "object",
+        "properties": {"handle": {"type": "string", "pattern": "^ws_[a-f0-9]{4}$"},
+                       "limit": {"type": "integer", "minimum": 1}},
+        "required": ["handle"],
+        "additionalProperties": False,
+    })
+    def fetch(handle, limit=10, **extra):
+        """Bounded arguments"""
+        return {"handle": handle, "limit": limit}
+
+    assert server._input_schema_violation(
+        "fetch", {"handle": "ws_ab12", "limit": 5}) is None
+    assert "pattern" in server._input_schema_violation(
+        "fetch", {"handle": "nope"})
+    assert "minimum" in server._input_schema_violation(
+        "fetch", {"handle": "ws_ab12", "limit": 0})
+    assert "bogus" in server._input_schema_violation(
+        "fetch", {"handle": "ws_ab12", "bogus": 1})

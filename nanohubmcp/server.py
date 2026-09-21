@@ -495,8 +495,8 @@ class MCPServer(object):
     }
 
     @classmethod
-    def _schema_violation(cls, schema, value, path="$"):
-        # type: (Any, Any, str) -> Optional[str]
+    def _schema_violation(cls, schema, value, path="$", root=None, depth=0):
+        # type: (Any, Any, str, Any, int) -> Optional[str]
         """Describe how `value` fails `schema`, or None if it passes.
 
         A deliberately small subset of JSON Schema: `type`, `required`,
@@ -512,6 +512,20 @@ class MCPServer(object):
         """
         if not isinstance(schema, dict):
             return None
+        if root is None:
+            root = schema
+
+        # `$ref` first: without resolving it a schema whose constraints live
+        # behind one has no `type` here, so every value passes — validation
+        # silently switched off for that whole property rather than loosened.
+        reference = schema.get("$ref")
+        if isinstance(reference, str) and depth < cls._MAX_REF_DEPTH:
+            target = cls._resolve_ref(reference, root)
+            if target is not None:
+                found = cls._schema_violation(
+                    target, value, path, root, depth + 1)
+                if found:
+                    return found
 
         expected = schema.get("type")
         if isinstance(expected, str):
@@ -530,7 +544,8 @@ class MCPServer(object):
                 for key, subschema in properties.items():
                     if key in value:
                         found = cls._schema_violation(
-                            subschema, value[key], "{}.{}".format(path, key))
+                            subschema, value[key], "{}.{}".format(path, key),
+                            root, depth)
                         if found:
                             return found
 
@@ -541,14 +556,131 @@ class MCPServer(object):
             if isinstance(items, dict):
                 for index, item in enumerate(value):
                     found = cls._schema_violation(
-                        items, item, "{}[{}]".format(path, index))
+                        items, item, "{}[{}]".format(path, index),
+                        root, depth)
                     if found:
                         return found
+
+        found = cls._bounds_violation(schema, value, path, root, depth)
+        if found:
+            return found
+
+        if "const" in schema and not cls._json_equal(schema["const"], value):
+            return "{} must equal the const value".format(path)
 
         allowed = schema.get("enum")
         if isinstance(allowed, list) and allowed:
             if not any(cls._json_equal(item, value) for item in allowed):
                 return "{} is not one of the permitted values".format(path)
+
+        return None
+
+    # How far `$ref` is followed before giving up. A schema that refers to
+    # itself is legal and would otherwise recurse forever.
+    _MAX_REF_DEPTH = 32
+
+    @staticmethod
+    def _resolve_ref(reference, root):
+        # type: (str, Any) -> Optional[Dict[str, Any]]
+        """Resolve a local `#/...` JSON pointer against the schema document.
+
+        Only same-document references, which is every `$ref` a tool schema
+        here uses; anything external constrains nothing rather than being
+        guessed at.
+        """
+        if reference == "#":
+            return root if isinstance(root, dict) else None
+        if not reference.startswith("#/"):
+            return None
+        node = root
+        for token in reference[2:].split("/"):
+            token = token.replace("~1", "/").replace("~0", "~")
+            if not isinstance(node, dict) or token not in node:
+                return None
+            node = node[token]
+        return node if isinstance(node, dict) else None
+
+    @classmethod
+    def _bounds_violation(cls, schema, value, path, root, depth):
+        # type: (Dict[str, Any], Any, str, Any, int) -> Optional[str]
+        """Check the size, range and shape keywords a schema declares.
+
+        These were published to clients and never applied, which is the worst
+        of both: a `pattern` on a handle or a `minimum` on a count is a
+        control the author wrote and the client is told about, so trusting it
+        and skipping the handler-side check was reasonable and wrong.
+        """
+        def number(keyword):
+            found = schema.get(keyword)
+            if isinstance(found, bool) or not isinstance(found, (int, float)):
+                return None
+            return found
+
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            minimum = number("minimum")
+            if minimum is not None and value < minimum:
+                return "{} is less than the minimum {}".format(path, minimum)
+            maximum = number("maximum")
+            if maximum is not None and value > maximum:
+                return "{} is greater than the maximum {}".format(path, maximum)
+            exclusive_min = number("exclusiveMinimum")
+            if exclusive_min is not None and value <= exclusive_min:
+                return "{} must be greater than {}".format(path, exclusive_min)
+            exclusive_max = number("exclusiveMaximum")
+            if exclusive_max is not None and value >= exclusive_max:
+                return "{} must be less than {}".format(path, exclusive_max)
+
+        if isinstance(value, str):
+            max_length = number("maxLength")
+            if max_length is not None and len(value) > max_length:
+                return "{} is longer than {} characters".format(path, max_length)
+            min_length = number("minLength")
+            if min_length is not None and len(value) < min_length:
+                return "{} is shorter than {} characters".format(path, min_length)
+            pattern = schema.get("pattern")
+            if isinstance(pattern, str):
+                try:
+                    # JSON Schema `pattern` is unanchored: a match anywhere.
+                    matched = re.search(pattern, value) is not None
+                except re.error:
+                    # A regex Python cannot compile constrains nothing here
+                    # rather than failing every value.
+                    matched = True
+                if not matched:
+                    return "{} does not match the required pattern".format(path)
+
+        if isinstance(value, list):
+            max_items = number("maxItems")
+            if max_items is not None and len(value) > max_items:
+                return "{} has more than {} items".format(path, max_items)
+            min_items = number("minItems")
+            if min_items is not None and len(value) < min_items:
+                return "{} has fewer than {} items".format(path, min_items)
+
+        if isinstance(value, dict):
+            max_properties = number("maxProperties")
+            if max_properties is not None and len(value) > max_properties:
+                return "{} has more than {} properties".format(
+                    path, max_properties)
+            min_properties = number("minProperties")
+            if min_properties is not None and len(value) < min_properties:
+                return "{} has fewer than {} properties".format(
+                    path, min_properties)
+
+            additional = schema.get("additionalProperties")
+            if additional is False or isinstance(additional, dict):
+                declared = schema.get("properties")
+                declared = declared if isinstance(declared, dict) else {}
+                for key in sorted(value):
+                    if key in declared:
+                        continue
+                    if additional is False:
+                        return "{} has no property {!r}".format(path, key)
+                    found = cls._schema_violation(
+                        additional, value[key], "{}.{}".format(path, key),
+                        root, depth)
+                    if found:
+                        return found
 
         return None
 

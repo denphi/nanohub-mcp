@@ -31,12 +31,13 @@ Streamable HTTP requirement the transport did not meet.
   schema and a breach is reported as a tool error instead of contradicting
   what `tools/list` advertised.
 - **Tool arguments were not validated.** "Servers MUST validate all tool
-  inputs." (Scope, stated plainly because the first version of this entry did
-  not: `type`, `required`, `properties`, `items` and `enum` are enforced.
-  Other keywords — `pattern`, `minimum`/`maximum`, `maxLength`,
-  `minItems`/`maxItems`, `additionalProperties`, `$ref` — are published and
-  **not** enforced, so a bound written for untrusted input still needs
-  checking inside the handler.) A missing or mistyped argument reached the handler, raised a Python
+  inputs." Enforced: `type`, `required`, `properties`, `items`, `enum`,
+  `const`, `minimum`/`maximum`, `exclusiveMinimum`/`exclusiveMaximum`,
+  `minLength`/`maxLength`, `pattern`, `minItems`/`maxItems`,
+  `minProperties`/`maxProperties`, `additionalProperties`, and same-document
+  `$ref`. Not enforced, and left to the handler: the composition keywords
+  (`allOf`/`anyOf`/`oneOf`/`not`/`if`), `uniqueItems`, `patternProperties`,
+  `format`, and cross-document `$ref`. A missing or mistyped argument reached the handler, raised a Python
   `TypeError`, and came back as `isError` — telling the model the tool ran and
   failed when the call never happened, in a message that leaked the handler's
   signature. Malformed calls are now `-32602`. Genuine tool failures are still
