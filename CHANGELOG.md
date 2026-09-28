@@ -9,6 +9,12 @@ an older revision whose capability was advertised and then not backed, or a
 Streamable HTTP requirement the transport did not meet.
 
 ### Fixed
+- **`skills/get` and `resources/directory/read` rejected a gateway-prefixed
+  URI.** `resources/read` recovered the real URI; these two looked theirs up
+  raw, so a skill served through com_mcp — which prepends its own origin —
+  came back "not a skill" / "Not a directory resource". Found by testing
+  against a live nanoHUB session; the local suite could not see it.
+
 - **Errors on the JSON-RPC routes returned HTML.** The parse-error path
   already avoided `send_error` -- "an HTML 400 is not something a JSON-RPC
   client, or the proxy in front of it, can interpret, and was observed wrapped

@@ -1385,7 +1385,8 @@ class MCPServer(object):
             return uri
 
         # Exact-match fast path.
-        if uri in self._resources or uri in self._skill_resources:
+        if (uri in self._resources or uri in self._skill_resources
+                or uri in self._skill_directories):
             return uri
 
         # Try common normalizations before suffix matching.
@@ -1421,7 +1422,9 @@ class MCPServer(object):
         # gateway-prefixed `skill://` URI was left unstripped and came back
         # "Resource not found", as was every template instance below.
         for candidate in normalized_candidates:
-            if candidate in self._resources or candidate in self._skill_resources:
+            if (candidate in self._resources
+                    or candidate in self._skill_resources
+                    or candidate in self._skill_directories):
                 return candidate
 
         # Fallback: match by registered URI suffix (prefer longest match),
@@ -1430,7 +1433,8 @@ class MCPServer(object):
         # ending in a registered URI — to that resource, which is a wider
         # door than a proxy prefix needs.
         resource_uris = sorted(
-            list(self._resources.keys()) + list(self._skill_resources.keys()),
+            list(self._resources.keys()) + list(self._skill_resources.keys())
+            + list(self._skill_directories.keys()),
             key=len, reverse=True)
         for candidate in normalized_candidates:
             for resource_uri in resource_uris:

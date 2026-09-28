@@ -520,6 +520,12 @@ def rpc_skills_get(server, ctx):
     error = None
 
     skill_uri = params.get("uri")
+    if isinstance(skill_uri, str):
+        # The gateway prepends its own origin to resource URIs, so a skill
+        # arrives as `https://nanohub.org/skill://x/SKILL.md`. `resources/read`
+        # already recovered the real URI; these two did not, and answered
+        # "not a skill" / "not a directory" for a skill the server serves.
+        skill_uri = server._strip_proxy_prefix(skill_uri)
     if not isinstance(skill_uri, str) or not skill_uri:
         error = {"code": -32602,
                  "message": "skills/get requires a string uri"}
@@ -548,6 +554,8 @@ def rpc_resources_directory_read(server, ctx):
     error = None
 
     dir_uri = params.get("uri")
+    if isinstance(dir_uri, str):
+        dir_uri = server._strip_proxy_prefix(dir_uri)
     if not isinstance(dir_uri, str) or not dir_uri:
         error = {"code": -32602,
                  "message": "resources/directory/read requires a string uri"}

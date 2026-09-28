@@ -661,3 +661,39 @@ def test_prompt_arguments_must_be_strings():
     assert "result" in server._handle_request(
         {"jsonrpc": "2.0", "id": 2, "method": "prompts/get",
          "params": {"name": "greet", "arguments": {"who": "bob"}}})
+
+
+def test_skills_get_and_directory_read_accept_a_gateway_prefixed_uri(tmp_path):
+    """`resources/read` recovered the real URI; these two looked theirs up raw.
+
+    Found by testing against a live nanoHUB session rather than locally: a
+    gateway-prefixed skill URI came back "not a skill" / "Not a directory
+    resource" for a skill the server was serving.
+    """
+    skill_dir = tmp_path / "unit-conversion"
+    (skill_dir / "references").mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: unit-conversion\ndescription: A skill\n---\n\n# S\n")
+    (skill_dir / "references" / "UNITS.md").write_text("units\n")
+
+    server = MCPServer("skills")
+    server.skill("unit-conversion", skill_dir)
+    prefix = "https://nanohub.org/"
+
+    def ok(method, uri):
+        return "result" in server._handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": method, "params": {"uri": uri}})
+
+    cases = [
+        ("skills/get", "skill://unit-conversion/SKILL.md"),
+        ("resources/read", "skill://unit-conversion/references/UNITS.md"),
+        ("resources/directory/read", "skill://unit-conversion/references"),
+        ("resources/directory/read", "skill://unit-conversion"),
+    ]
+    for method, uri in cases:
+        assert ok(method, uri), (method, uri)
+        assert ok(method, prefix + uri), (method, prefix + uri)
+
+    # A prefixed URI that names nothing is still refused.
+    assert not ok("resources/directory/read", prefix + "skill://unit-conversion/nope")
+    assert not ok("skills/get", prefix + "skill://other/SKILL.md")
