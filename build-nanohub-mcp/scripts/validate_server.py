@@ -341,8 +341,13 @@ def validate(server, render_apps=False, limit_mb=8.0, app_path="."):
         if input_schema.get("type") != "object":
             report.error("{} inputSchema: top-level type must be object".format(label))
         if d.get("outputSchema") is None:
-            report.warn("{}: no output_schema — clients get no structuredContent "
-                        "contract".format(label))
+            # An async tool answers with the task/job envelope the framework
+            # shapes, not with its own payload, so an output_schema here would
+            # describe a reply the tool never sends. The result arrives later
+            # through tasks/get, which carries its own shape.
+            if not entry.get("is_async"):
+                report.warn("{}: no output_schema — clients get no structuredContent "
+                            "contract".format(label))
         else:
             check_schema(report, label + " outputSchema", d.get("outputSchema"))
 
