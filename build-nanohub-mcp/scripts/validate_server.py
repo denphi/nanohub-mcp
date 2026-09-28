@@ -240,6 +240,46 @@ def check_elicitation_usage(report, tools):
 MIN_INSTRUCTIONS_CHARS = 200
 
 
+def check_invoke(report, app_path):
+    """`middleware/invoke` must keep ~/.local off the tool's path.
+
+    Without `PYTHONNOUSERSITE=1` a stale package in the user's `~/.local`
+    silently shadows the hub's copy, and the failure names neither the package
+    nor the reason. It cost a debugging session on mcp4jupyter70: the right
+    library was installed into anaconda-7, the tool kept importing an older one
+    from ~/.local, and the symptom was a capability that half worked rather
+    than an import error.
+    """
+    here = os.path.dirname(os.path.abspath(app_path))
+    invoke = None
+    for _ in range(4):                       # bin/tool.py, bin/pkg/app.py, ...
+        candidate = os.path.join(here, "middleware", "invoke")
+        if os.path.isfile(candidate):
+            invoke = candidate
+            break
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    if invoke is None:
+        # Not every server is a published nanoHUB tool; an example run locally
+        # has no middleware/ at all. Nothing to check.
+        return
+    text = open(invoke, "r").read()
+    if "PYTHONNOUSERSITE" not in text:
+        report.error(
+            "middleware/invoke does not set PYTHONNOUSERSITE=1. The user's "
+            "~/.local packages then shadow the hub's, so the tool can import "
+            "a different library than the one installed for it and the failure "
+            "names neither. Add: -e \"PYTHONNOUSERSITE=1\"")
+    elif not re.search(r"PYTHONNOUSERSITE\s*=\s*1", text):
+        report.error(
+            "middleware/invoke mentions PYTHONNOUSERSITE but does not set it "
+            "to 1; any other value leaves ~/.local on the path")
+    else:
+        report.info("invoke: PYTHONNOUSERSITE=1")
+
+
 def check_instructions(report, server):
     """Require `instructions`, and require it to say something."""
     text = (getattr(server, "instructions", None) or "").strip()
@@ -265,7 +305,7 @@ def check_instructions(report, server):
     report.info("instructions: {} chars".format(len(text)))
 
 
-def validate(server, render_apps=False, limit_mb=8.0):
+def validate(server, render_apps=False, limit_mb=8.0, app_path="."):
     report = Report()
     tools = getattr(server, "_tools", {}) or {}
     resources = getattr(server, "_resources", {}) or {}
@@ -275,6 +315,7 @@ def validate(server, render_apps=False, limit_mb=8.0):
         report.error("no tools registered")
 
     check_instructions(report, server)
+    check_invoke(report, app_path)
 
     n_async = 0
     for name, entry in sorted(tools.items()):
@@ -412,7 +453,8 @@ def main():
         print("ERROR  could not load {}: {}".format(args.app, exc))
         return 2
 
-    return validate(server, render_apps=args.render_apps, limit_mb=args.limit_mb).dump()
+    return validate(server, render_apps=args.render_apps, limit_mb=args.limit_mb,
+                    app_path=args.app).dump()
 
 
 if __name__ == "__main__":

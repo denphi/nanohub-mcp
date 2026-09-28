@@ -61,6 +61,7 @@ Minimal (padremcp):
 ```sh
 #!/bin/sh
 /usr/bin/invoke_app "$@" -t padremcp \
+                         -e "PYTHONNOUSERSITE=1" \
                          -C "start_mcp --app @tool/bin/padremcp.py" \
                          -u anaconda-6 \
                          -u padre-2.4E-r15 \
@@ -70,6 +71,7 @@ Minimal (padremcp):
 
 | Flag | Meaning |
 |---|---|
+| `-e "PYTHONNOUSERSITE=1"` | **required.** Keeps `~/.local` off the path, so the tool imports the hub's copy of a library and only that. Without it a stale `pip install --user` package silently shadows the hub's, and the failure names neither the package nor the reason. `validate_server.py` fails a project whose invoke omits it |
 | `-t yourtool` | tool name — must match the published tool (and the gateway URL `/api/mcp/{yourtool}/mcp`) |
 | `-C "start_mcp --app @tool/bin/yourtool.py"` | the command to run; `@tool` expands to the installed tool directory |
 | `-u <env>` | environment module(s) to load — repeatable; load your conda distribution AND your solver (e.g. `anaconda-6` + `padre-2.4E-r15`) |
