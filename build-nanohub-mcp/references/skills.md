@@ -7,9 +7,16 @@ skill from its own filesystem.
 
 Ship a skill when your tools need *procedure* the schemas cannot carry: which
 tool to call first, what a physically sensible parameter range is, how to read
-the output, when to refuse. Server `instructions` is the wrong place for this —
-it is delivered on every connection and is practically size-bounded. A skill is
-fetched only when the model decides it is relevant.
+the output, when to refuse. Server `instructions` is the wrong place for the
+*whole* of it — it is delivered on every connection and is practically
+size-bounded — while a skill is fetched only when the model decides it is
+relevant.
+
+That is a division of labour, not a choice between them. Both are required:
+`instructions` carries the load-bearing few lines every client gets, including
+the many that cannot read skills yet; the skill carries the reasoning, the
+error codes and the limits. Say the critical facts in both. A fact that appears
+only in a skill does not exist for a client without SEP-2640.
 
 Do **not** ship a skill to restate tool descriptions. If the content is one
 sentence per tool, it belongs in the tool's `description`.

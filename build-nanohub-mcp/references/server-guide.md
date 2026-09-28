@@ -46,10 +46,33 @@ Two rules:
 
 ## Anatomy of a tool
 
+## `instructions` is required
+
+`MCPServer(instructions=...)` is returned in the `initialize` result, on every
+connection, to every client. It is the **only** channel that reaches a client
+which has not implemented SEP-2640 skills — which today is most of them,
+including claude.ai. A server whose procedural knowledge lives only in skills
+is telling it to nobody.
+
+`validate_server.py` fails a server without it, and fails one under 200
+characters.
+
+Write the few things a model gets *wrong* without being told, not a summary of
+the tool descriptions it already has:
+
+* the call order the tools require, and what has to happen before what;
+* what a refusal means, and that it is the design rather than a fault;
+* which calls destroy something the user can see;
+* what a call spends, when it spends the user's quota or money.
+
+End it by naming the skills, so a skills-aware client knows a longer form
+exists. Keep it to a few hundred words — it is paid for on every connection.
+
 ```python
 from nanohubmcp import MCPServer, ToolResult
 
-server = MCPServer("mysolver", version="0.1.0")   # `server` name is the contract
+server = MCPServer("mysolver", version="0.1.0",   # `server` name is the contract
+                   instructions=_INSTRUCTIONS)   # required; see below
 
 _CREATE_OUTPUT_SCHEMA = {
     "type": "object",

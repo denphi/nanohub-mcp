@@ -232,6 +232,39 @@ def check_elicitation_usage(report, tools):
                         "RuntimeError; degrade to a chat fallback".format(name))
 
 
+# `instructions` is delivered in the `initialize` result, on every connection,
+# to every client. It is the only channel that reaches a client which has not
+# implemented SEP-2640 skills -- which today is most of them, including
+# claude.ai -- so a server whose procedural knowledge lives only in skills is
+# telling it to nobody.
+MIN_INSTRUCTIONS_CHARS = 200
+
+
+def check_instructions(report, server):
+    """Require `instructions`, and require it to say something."""
+    text = (getattr(server, "instructions", None) or "").strip()
+    if not text:
+        report.error(
+            "server has no `instructions`. It is returned by `initialize` to "
+            "every client on every connection, and it is the only place a "
+            "client that does not implement SEP-2640 skills can read how to "
+            "use this server. Pass instructions= to MCPServer(...)")
+        return
+    if len(text) < MIN_INSTRUCTIONS_CHARS:
+        report.error(
+            "server `instructions` is {} chars; under {} is not enough to "
+            "carry call order, refusals and anything destructive. Say what a "
+            "model gets wrong without it, not what the tool descriptions "
+            "already say".format(len(text), MIN_INSTRUCTIONS_CHARS))
+        return
+    lowered = text.lower()
+    if getattr(server, "_skills", None) and "skills/list" not in lowered:
+        report.warn(
+            "server publishes skills but `instructions` never points at them; "
+            "a skills-aware client cannot tell there is a longer form")
+    report.info("instructions: {} chars".format(len(text)))
+
+
 def validate(server, render_apps=False, limit_mb=8.0):
     report = Report()
     tools = getattr(server, "_tools", {}) or {}
@@ -240,6 +273,8 @@ def validate(server, render_apps=False, limit_mb=8.0):
     report.info("server: {} tools, {} resources".format(len(tools), len(resources)))
     if not tools:
         report.error("no tools registered")
+
+    check_instructions(report, server)
 
     n_async = 0
     for name, entry in sorted(tools.items()):
