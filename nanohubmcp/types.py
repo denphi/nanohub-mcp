@@ -435,7 +435,13 @@ class ResourceResult(object):
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
-        return {"contents": [c.to_dict() for c in self._contents]}
+        result = {"contents": [c.to_dict() for c in self._contents]}  # type: Dict[str, Any]
+        if self.meta:
+            # Same defect `ToolResult` had: accepted by `__init__` and then
+            # dropped here, so every `ResourceResult(meta=...)` silently lost
+            # its metadata on the wire.
+            result["_meta"] = self.meta
+        return result
 
 
 # Backwards compatibility alias
@@ -490,6 +496,10 @@ class Message(object):
         if isinstance(content, str):
             self._content = TextContent(text=content)
         else:
+            # A dict is already a wire-shaped content block (image, audio,
+            # resource_link, resource). Kept as-is: it used to be flattened
+            # with `str()`, which put a Python repr on the wire and destroyed
+            # everything that was not text.
             self._content = content
 
         self.role = role
@@ -501,9 +511,10 @@ class Message(object):
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
+        content = self._content
         return {
             "role": self.role,
-            "content": self._content.to_dict()
+            "content": content if isinstance(content, dict) else content.to_dict()
         }
 
 
@@ -573,8 +584,13 @@ class PromptResult(object):
                     # Handle dict format {"role": "user", "content": "..."}
                     role = msg.get("role", "user")
                     content = msg.get("content", "")
-                    if isinstance(content, dict):
-                        content = content.get("text", str(content))
+                    if isinstance(content, dict) and set(content) == {"text"}:
+                        # The one dict that is not a content block: `{"text":
+                        # ...}` from a handler that meant a plain string.
+                        content = content["text"]
+                    # Any other dict is a wire-shaped content block and is
+                    # passed through. It used to be `str(content)`, which
+                    # turned an image block into its Python repr.
                     self._messages.append(Message(content, role=role))
 
         self.description = description
@@ -587,9 +603,12 @@ class PromptResult(object):
 
     def to_dict(self):
         # type: () -> Dict[str, Any]
-        result = {"messages": [m.to_dict() for m in self._messages]}
+        result = {"messages": [m.to_dict() for m in self._messages]}  # type: Dict[str, Any]
         if self.description:
             result["description"] = self.description
+        if self.meta:
+            # As above: accepted and then dropped.
+            result["_meta"] = self.meta
         return result
 
 

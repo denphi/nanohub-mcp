@@ -196,10 +196,33 @@ victim's browser (DNS rebinding):
 
    server.run(allowed_origins=["https://claude.ai", "https://nanohub.org"])
 
-A browser request from an origin outside the list gets HTTP 403. It is off by
-default because a library cannot know which origins a deployment considers
-legitimate, and requests with no ``Origin`` — every non-browser client — are
-never affected. **Configure it wherever a browser can reach the server.** Values that are not plain ASCII arrive
+A browser request from an origin outside the list gets HTTP 403. Requests with
+no ``Origin`` at all — every non-browser client, which is nearly all of them —
+are never affected. Three forms are accepted:
+
+``None`` (default) or ``"*"``
+   Every origin is accepted.
+``["https://a", "https://b"]``
+   Only those; anything else is 403.
+``"loopback"``
+   Only ``localhost``, ``127.0.0.0/8`` and ``::1`` — the one-word form of the
+   spec's DNS-rebinding defence.
+
+**The check is off by default, deliberately.** Behind the com_mcp gateway this
+process is not browser-reachable, the gateway authenticates every request, and
+it builds its upstream cURL call from an explicit header list that does not
+include ``Origin`` — so the header never arrives and the check could not fire
+either way. A refusing default would only break the gateway's own clients.
+
+Set it wherever a browser *can* reach the server directly: no gateway in
+front, a local dev server a page talks to, a port published from a container.
+There the check is a real boundary. A warning is printed at start-up when no
+policy is set and the bind is not loopback.
+
+The response names the request's origin rather than blanket-starring it, with
+``Vary: Origin``.
+
+Values that are not plain ASCII arrive
 Base64-wrapped as ``=?base64?…?=`` and are decoded before comparison; integers
 compare numerically. Only properties reachable by a chain of ``properties``
 keys may be annotated — an annotation behind ``items``, ``oneOf`` or ``$ref``
@@ -238,9 +261,16 @@ id; a session on an earlier revision has no way to opt in, so it receives them
 because the server advertised ``listChanged``. A ``2026-07-28`` session that did
 not subscribe receives nothing, as that revision requires.
 
-``listChanged`` is advertised as ``false`` until the first registration or
-removal happens while serving — a static server must not claim it will send a
-notification it never sends.
+``listChanged`` is decided once, at construction, and never changes afterwards.
+It used to be inferred — advertised ``false`` until the first runtime
+registration, then flipped ``true`` — which meant the *first* notification
+always went to clients that had been told at ``initialize`` that none would
+come, with no way to correct a handshake already made.
+
+Pass ``MCPServer(..., list_changed=False)`` for a server whose registries are
+fixed at import time and that would rather advertise nothing: the capability is
+then withheld **and** no notification is ever sent, so the two agree either
+way.
 
 Registration and listing are guarded by a re-entrant lock, so a background
 thread may register while requests are being served. Single-key lookups on the

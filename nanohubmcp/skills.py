@@ -344,6 +344,24 @@ def register_skill_directory(server, skill_path, directory):
 
     files = []  # type: List[tuple]
     subdirs = []  # type: List[str]
+    # Every served path is checked against this, not against the directory as
+    # written: a symlink inside the skill resolves to wherever it points, and
+    # following one published files from outside the skill as ordinary
+    # `skill://` resources. Traversal *through the URI*
+    # (`skill://demo/../../etc/passwd`) was already refused; this is the same
+    # escape by another route.
+    skill_root = Path(directory).resolve()
+
+    def escapes(path):
+        # type: (Path) -> bool
+        try:
+            resolved = path.resolve()
+        except OSError:                      # broken symlink, unreadable link
+            return True
+        if resolved == skill_root:
+            return False
+        return skill_root not in resolved.parents
+
     for dirpath, dirnames, filenames in os.walk(str(directory)):
         # Dotfiles are editor state, VCS metadata, and secrets — a skill
         # directory that is a git checkout would otherwise publish
@@ -351,6 +369,12 @@ def register_skill_directory(server, skill_path, directory):
         # connected client. Pruning `dirnames` in place also stops the
         # walk from descending into them.
         dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for dirname in list(dirnames):
+            if escapes(Path(dirpath) / dirname):
+                warnings.warn(
+                    "Skill '{}': directory '{}' resolves outside the skill "
+                    "and is not served".format(skill_path, dirname))
+                dirnames.remove(dirname)
         for dirname in dirnames:
             rel_dir = (Path(dirpath) / dirname).relative_to(directory).as_posix()
             subdirs.append(rel_dir)
@@ -358,6 +382,13 @@ def register_skill_directory(server, skill_path, directory):
             if filename.startswith("."):
                 continue
             abs_path = Path(dirpath) / filename
+            if escapes(abs_path):
+                warnings.warn(
+                    "Skill '{}': '{}' resolves outside the skill and is not "
+                    "served".format(
+                        skill_path,
+                        abs_path.relative_to(directory).as_posix()))
+                continue
             rel_path = abs_path.relative_to(directory).as_posix()
             files.append((rel_path, abs_path))
 

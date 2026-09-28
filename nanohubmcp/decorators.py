@@ -5,6 +5,7 @@ Compatible with Python 3.7+ and aligned with FastMCP API.
 
 from __future__ import print_function
 
+import enum
 import inspect
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -32,6 +33,57 @@ def _allow_null(schema):
     widened = dict(schema)
     widened["type"] = list(names) + ["null"]
     return widened
+
+
+def _is_json_scalar(value):
+    # type: (Any) -> bool
+    """Whether this value can be written to a schema as-is."""
+    if value is None or isinstance(value, (bool, str)):
+        return True
+    if isinstance(value, int):
+        return True
+    if isinstance(value, float):
+        # NaN and the infinities have no JSON spelling, whatever json.dumps
+        # will happily emit for them.
+        return value == value and value not in (float("inf"), float("-inf"))
+    return False
+
+
+def _json_safe(value, depth=0):
+    # type: (Any, int) -> bool
+    """Whether a default value can be published in a schema."""
+    if depth > 8:
+        return False
+    if _is_json_scalar(value):
+        return True
+    if isinstance(value, (list, tuple)):
+        return all(_json_safe(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(k, str) and _json_safe(v, depth + 1)
+                   for k, v in value.items())
+    return False
+
+
+def _closed_set_values(py_type, origin):
+    # type: (Any, Any) -> Optional[List[Any]]
+    """The permitted values of a `Literal[...]` or `enum.Enum`, or None.
+
+    None means "not a closed set", which is also the answer for one whose
+    members are not JSON values — an enum of objects constrains nothing a
+    client could send.
+    """
+    values = None
+    if origin is not None and getattr(origin, "_name", None) == "Literal":
+        values = list(getattr(py_type, "__args__", ()) or ())
+    elif str(origin).endswith("Literal"):
+        values = list(getattr(py_type, "__args__", ()) or ())
+    elif isinstance(py_type, type) and issubclass(py_type, enum.Enum):
+        values = [member.value for member in py_type]
+    if not values:
+        return None
+    if not all(_is_json_scalar(value) for value in values):
+        return None
+    return values
 
 
 def _python_type_to_json_schema(py_type):
@@ -69,6 +121,31 @@ def _python_type_to_json_schema(py_type):
             return _allow_null(inner) if optional else inner
         # Union of several concrete types (or a bare Union) -> accept anything.
         return {}
+
+    # `Literal["fast", "slow"]` and an `enum.Enum` both name a closed set of
+    # values. They used to fall through to "nothing known", so a constraint the
+    # author wrote in the signature was never published — the model was not
+    # told the allowed values, and nothing rejected a wrong one.
+    literal_values = _closed_set_values(py_type, origin)
+    if literal_values is not None:
+        schema = {"enum": literal_values}
+        kinds = set()
+        for value in literal_values:
+            if isinstance(value, bool):
+                kinds.add("boolean")
+            elif isinstance(value, int):
+                kinds.add("integer")
+            elif isinstance(value, float):
+                kinds.add("number")
+            elif isinstance(value, str):
+                kinds.add("string")
+            elif value is None:
+                kinds.add("null")
+            else:
+                kinds.add("?")
+        if len(kinds) == 1 and "?" not in kinds:
+            schema["type"] = kinds.pop()
+        return schema
 
     if py_type is str:
         return {"type": "string"}
@@ -301,8 +378,16 @@ def _generate_input_schema(func, exclude_params=None):
             prop = _python_type_to_json_schema(param.annotation)
         elif name in comment_schemas:
             prop = comment_schemas[name]
-        elif param.default is not inspect.Parameter.empty and param.default is not None:
+        elif (param.default is not inspect.Parameter.empty
+                and param.default is not None
+                and _json_safe(param.default)):
             # Publish the default itself, not a type inferred from it.
+            #
+            # `_json_safe` guards it: a sentinel object, a Path, a datetime —
+            # any default with no JSON spelling — was published verbatim, and
+            # `tools/list` then raised TypeError inside `json.dumps` and
+            # answered HTTP 500. One such tool took the whole listing down, so
+            # no client could see *any* tool on the server.
             # `def scale(factor=1)` used to advertise `"type": "integer"`
             # purely because the default happened to be an int, which
             # enforcement then used to reject `factor=2.5`. `default` is
@@ -319,6 +404,19 @@ def _generate_input_schema(func, exclude_params=None):
             # one would reject it. Declaring nothing is honest and lets any
             # JSON value through, which is what the handler actually accepts.
             prop = {}
+
+        # The default belongs in the schema whether or not the parameter was
+        # annotated. It used to appear only when nothing else described the
+        # parameter, so `def t(b: int = 3)` published the type and dropped the
+        # 3 — the one part of the signature a model most wants to read.
+        if (param.default is not inspect.Parameter.empty
+                and param.default is not None
+                and "default" not in prop
+                and _json_safe(param.default)):
+            prop = dict(prop)
+            prop["default"] = (list(param.default)
+                               if isinstance(param.default, tuple)
+                               else param.default)
 
         properties[name] = prop
 

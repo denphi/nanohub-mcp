@@ -265,17 +265,44 @@ def test_an_invalid_annotation_keeps_the_tool_out_of_the_registry():
 # Origin validation (DNS rebinding)
 # ---------------------------------------------------------------------------
 
-def test_origin_policy_is_opt_in_and_ignores_non_browser_clients():
-    server = MCPServer("o")
+def test_origin_policy_is_off_by_default_and_ignores_non_browser_clients():
+    """Deliberately permissive: behind the com_mcp gateway this process is not
+    browser-reachable, the gateway authenticates every request, and it builds
+    its upstream call from an explicit header list that omits `Origin` — so
+    the header never arrives and a refusing default would only break the
+    gateway's own clients. The policy belongs here only where a browser can
+    reach the server directly.
+    """
+    from nanohubmcp.server import _ANY_ORIGIN, _LOOPBACK_ONLY
 
-    # No allowlist configured: a library cannot guess valid origins.
+    server = MCPServer("o")
     assert server.origin_allowed("https://evil.example") is True
+    server._allowed_origins = _ANY_ORIGIN
+    assert server.origin_allowed("https://evil.example") is True
+
+    # "loopback" is the one-word form of the spec's rebinding defence, for a
+    # server with no gateway in front. A page's own origin is never loopback,
+    # however its name resolves, which is what makes comparing it work.
+    server._allowed_origins = _LOOPBACK_ONLY
+    assert server.origin_allowed("http://localhost:3000") is True
+    assert server.origin_allowed("http://127.0.0.1:8000") is True
+    assert server.origin_allowed("http://127.0.0.2") is True     # all of /8
+    assert server.origin_allowed("http://[::1]:8000") is True
+    assert server.origin_allowed("HTTP://LocalHost:3000/") is True
+    assert server.origin_allowed("https://evil.example") is False
+    # A name that merely *contains* a loopback host is a different origin.
+    assert server.origin_allowed("https://localhost.evil.example") is False
+    assert server.origin_allowed("null") is False
+    # Still not a browser, still not policed.
+    assert server.origin_allowed(None) is True
 
     server._allowed_origins = {"https://claude.ai"}
     assert server.origin_allowed("https://claude.ai") is True
     assert server.origin_allowed("https://claude.ai/") is True   # trailing slash
     assert server.origin_allowed("HTTPS://Claude.AI") is True    # case
     assert server.origin_allowed("https://evil.example") is False
+    # An allowlist replaces the default; loopback is not implicitly added.
+    assert server.origin_allowed("http://localhost:3000") is False
     # A request with no Origin is not a browser and is not policed.
     assert server.origin_allowed(None) is True
     assert server.origin_allowed("") is True

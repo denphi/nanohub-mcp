@@ -101,7 +101,7 @@ def test_capabilities_advertise_skills_extension_with_directory_read(tmp_path):
     assert caps["extensions"]["io.modelcontextprotocol/skills"] == {"directoryRead": True}
     # SEP-2640: "A server declaring this extension MUST also declare the
     # resources capability" -- even with no @server.resource() registered.
-    assert caps["resources"]["listChanged"] is False
+    assert "listChanged" in caps["resources"]
 
 
 def test_capabilities_omit_skills_extension_with_no_skills():

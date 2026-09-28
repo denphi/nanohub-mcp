@@ -1897,11 +1897,44 @@ def test_remove_tool_notifies_and_makes_it_uncallable():
     assert s.remove_tool("alpha") is False
 
 
-def test_list_changed_is_advertised_only_once_the_registry_is_dynamic():
-    """A static server must not claim it will send notifications it never sends."""
-    from nanohubmcp.server import MCPServer
+def test_list_changed_is_fixed_at_construction_not_inferred_later():
+    """The capability a client was handed must not change under it.
 
-    s = MCPServer("static")
+    It used to be inferred: advertised False until the first runtime
+    registration, then flipped True. The first notification therefore always
+    went to clients told at `initialize` that none would come.
+    """
+    from nanohubmcp.server import MCPServer, _SSEQueue
+
+    s = MCPServer("dynamic")
+
+    @s.tool()
+    def only():
+        """The one tool this server starts with."""
+        return 1
+
+    assert s._get_capabilities().to_dict()["tools"]["listChanged"] is True
+
+    s._serving = True
+    probe = _SSEQueue()
+    with s._clients_lock:
+        s._clients["D"] = [probe]
+
+    @s.tool()
+    def later():
+        """Registered after start-up."""
+        return 2
+
+    # Same answer as before the registration, and the notification was sent.
+    assert s._get_capabilities().to_dict()["tools"]["listChanged"] is True
+    assert any("notifications/tools/list_changed" in m for m in probe)
+
+
+def test_list_changed_opted_out_advertises_nothing_and_sends_nothing():
+    """`list_changed=False` withholds the capability *and* the notification."""
+    from nanohubmcp.server import MCPServer, _SSEQueue
+
+    s = MCPServer("static", list_changed=False)
 
     @s.tool()
     def only():
@@ -1911,13 +1944,17 @@ def test_list_changed_is_advertised_only_once_the_registry_is_dynamic():
     assert s._get_capabilities().to_dict()["tools"]["listChanged"] is False
 
     s._serving = True
+    probe = _SSEQueue()
+    with s._clients_lock:
+        s._clients["S"] = [probe]
 
     @s.tool()
     def later():
-        """Registered after start-up, which makes the claim true."""
+        """Registered after start-up, but this server promised silence."""
         return 2
 
-    assert s._get_capabilities().to_dict()["tools"]["listChanged"] is True
+    assert s._get_capabilities().to_dict()["tools"]["listChanged"] is False
+    assert not any("list_changed" in m for m in probe)
 
 
 def test_unsubscribed_modern_session_gets_no_list_changed():
@@ -2075,11 +2112,66 @@ def test_supported_protocol_version_header_passes():
     assert "tools" in body["result"]
 
 
-def test_get_without_event_stream_accept_is_405():
-    """"MUST either return Content-Type: text/event-stream ... or 405"."""
-    status, _headers, _body = _request_raw(
+def test_get_without_event_stream_accept_is_405_with_an_allow_header():
+    """"MUST either return Content-Type: text/event-stream ... or 405".
+
+    And RFC 9110: "The origin server MUST generate an Allow header field in a
+    405 response." `send_error` cannot carry one, so the response had none --
+    on the very status the transport spec's compatibility probe reads.
+    """
+    status, headers, _body = _request_raw(
         "GET", "/mcp", headers={"Accept": "application/json"})
     assert status == 405
+    assert headers.get("Allow") == "GET, POST, DELETE, OPTIONS"
+
+
+def test_no_origin_policy_is_configured_by_default():
+    """Deliberate: behind the com_mcp gateway no browser `Origin` ever reaches
+    this process, and refusing by default would break the gateway's clients.
+    `run(allowed_origins=...)` is where a directly-reachable server puts it.
+    """
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+    status, _headers, _parsed = _request_raw(
+        "POST", "/mcp", body=body,
+        headers={"Content-Type": "application/json",
+                 "Origin": "https://anywhere.example"})
+    assert status == 200
+
+
+def test_a_deeply_nested_body_is_a_parse_error_not_an_html_500():
+    """`RecursionError` is a RuntimeError, not a ValueError, so it slipped past
+    the JSON parse handler: a few KB of brackets came back as HTTP 500 with an
+    HTML body -- "not something a JSON-RPC client, or the proxy in front of it,
+    can interpret", which is the reason that handler exists.
+    """
+    body = (b"[" * 20000) + (b"]" * 20000)
+    status, headers, parsed = _request_raw(
+        "POST", "/mcp", body=body, headers={"Content-Type": "application/json"})
+
+    assert status == 400
+    assert headers.get("Content-Type") == "application/json"
+    assert parsed["error"]["code"] == -32700
+
+
+def test_cors_names_the_request_origin_rather_than_blanket_starring_it():
+    """A blanket `*` told every origin it could read the response even where
+    an allowlist had been configured. `Vary` keeps a cache from handing one
+    origin's response to another."""
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+
+    status, headers, _parsed = _request_raw(
+        "POST", "/mcp", body=body,
+        headers={"Content-Type": "application/json",
+                 "Origin": "http://localhost:3000"})
+    assert status == 200
+    assert headers.get("Access-Control-Allow-Origin") == "http://localhost:3000"
+    assert headers.get("Vary") == "Origin"
+
+    # No Origin at all -- every CLI and SDK client, and the gateway itself.
+    status, headers, _parsed = _request_raw(
+        "POST", "/mcp", body=body, headers={"Content-Type": "application/json"})
+    assert status == 200
+    assert headers.get("Access-Control-Allow-Origin") == "*"
 
 
 def test_response_is_not_echoed_onto_the_sse_stream():
@@ -2174,3 +2266,47 @@ def test_listen_with_a_json_only_accept_is_406_not_405():
                  "Mcp-Method": "subscriptions/listen",
                  "Accept": "application/json"})
     assert status == 406
+
+
+def test_every_error_on_the_json_rpc_routes_has_a_json_body():
+    """`send_error` writes an HTML page. The parse-error path already avoided
+    it -- "an HTML 400 is not something a JSON-RPC client, or the proxy in
+    front of it, can interpret, and was observed wrapped into a bogus 'Proxy
+    error' downstream" -- but the wrong-path, bad-length and oversize paths
+    still produced one.
+    """
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+
+    cases = [
+        ("POST", "/nope", body, {"Content-Type": "application/json"}, 404),
+        ("GET", "/nope", None, {}, 404),
+        ("POST", "/mcp", body,
+         {"Content-Type": "application/json", "Content-Length": "-1"}, 400),
+    ]
+    for method, path, payload, headers, expected in cases:
+        status, response_headers, parsed = _request_raw(
+            method, path, body=payload, headers=headers)
+        assert status == expected, (method, path, status)
+        assert response_headers.get("Content-Type") == "application/json", (
+            method, path)
+        assert isinstance(parsed, dict) and "error" in parsed, (method, path)
+
+
+def test_the_rest_tool_endpoint_validates_like_tools_call_does():
+    """It published each tool's `inputSchema` as the request-body schema in
+    /openapi.json and enforced none of it, so a bad argument reached the
+    handler and its Python TypeError -- signature and all -- was returned to
+    the caller."""
+    def post(payload):
+        return _request_raw(
+            "POST", "/tools/add", body=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+
+    for payload in ({"a": 1, "b": 2, "zzz": 3}, {"a": 1}, {"a": "x", "b": 2}):
+        status, _headers, parsed = post(payload)
+        assert status == 400, payload
+        assert "unexpected keyword argument" not in parsed["error"], payload
+        assert "positional argument" not in parsed["error"], payload
+
+    status, _headers, parsed = post({"a": 1, "b": 2})
+    assert status == 200

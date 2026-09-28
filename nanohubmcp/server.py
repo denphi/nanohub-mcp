@@ -151,6 +151,11 @@ _RAW_RESPONSE = _Sentinel("_RAW_RESPONSE")
 # Distinguishes "this tool produced no structured result" from one that
 # produced `null`, which a 2026-07-28 outputSchema may well permit.
 _NO_STRUCTURED = _Sentinel("_NO_STRUCTURED")
+# The two `run(allowed_origins=...)` policies that are not a list of origins.
+# `"*"` states the default outright; `"loopback"` is the DNS-rebinding
+# defence for a server a browser can reach without a gateway in front.
+_ANY_ORIGIN = _Sentinel("ANY_ORIGIN")
+_LOOPBACK_ONLY = _Sentinel("LOOPBACK_ONLY")
 
 
 class _RequestContext(object):
@@ -163,11 +168,12 @@ class _RequestContext(object):
 
     __slots__ = ("request", "method", "msg_id", "params", "session_id",
                  "headers", "version", "modern", "is_notification", "meta",
-                 "progress_token")
+                 "progress_token", "stream")
 
     def __init__(self, request=None, method="", msg_id=None, params=None,
                  session_id=None, headers=None, version="", modern=False,
-                 is_notification=False, meta=None, progress_token=None):
+                 is_notification=False, meta=None, progress_token=None,
+                 stream=None):
         # type: (...) -> None
         self.request = request
         self.method = method
@@ -180,6 +186,53 @@ class _RequestContext(object):
         self.is_notification = is_notification
         self.meta = meta
         self.progress_token = progress_token
+        # The SSE queue this request is being answered on, when the transport
+        # is holding one open for it (`subscriptions/listen`). A subscription
+        # records it so its notifications go to that stream and no other.
+        self.stream = stream
+
+
+class _PendingSkill(object):
+    """The decorator `MCPServer.skill(path)` returns.
+
+    A plain closure was returned before, so ``server.skill("demo")`` written
+    as a statement — the obvious guess at a registration call — registered
+    nothing, raised nothing, and left `skills/list` empty and the extension
+    unadvertised. This is the same decorator, and it says so when it is
+    dropped without ever being applied.
+    """
+
+    __slots__ = ("_server", "_skill_path", "_applied")
+
+    def __init__(self, server, skill_path):
+        # type: (Any, str) -> None
+        self._server = server
+        self._skill_path = skill_path
+        self._applied = False
+
+    def __call__(self, func):
+        # type: (Callable) -> Callable
+        self._applied = True
+        self._server._register_skill_directory(self._skill_path, func())
+        return func
+
+    def __del__(self):
+        if not self._applied:
+            try:
+                self._warn()
+            except Exception:  # pragma: no cover - interpreter teardown
+                # `__del__` can run while the interpreter is tearing down, with
+                # `sys.stderr` already gone. A warning is not worth an
+                # "Exception ignored in __del__" on the way out.
+                pass
+
+    def _warn(self):
+        # type: () -> None
+        print("WARNING: server.skill({!r}) was never used as a decorator, "
+                  "so no skill was registered. Either decorate a function "
+                  "returning the skill directory, or pass the directory: "
+                  "server.skill({!r}, <directory>)."
+                  .format(self._skill_path, self._skill_path), file=sys.stderr)
 
 
 class InvalidParams(Exception):
@@ -247,7 +300,8 @@ class MCPServer(object):
         name,  # type: str
         version="1.0.0",  # type: str
         instructions=None,  # type: Optional[str]
-        list_page_size=None  # type: Optional[int]
+        list_page_size=None,  # type: Optional[int]
+        list_changed=True  # type: bool
     ):
         # type: (...) -> None
         """
@@ -260,6 +314,24 @@ class MCPServer(object):
                 returned by ``server/discover`` so hosts can prime a model.
                 Describe when to reach for this server; don't restate tool
                 descriptions.
+            list_page_size: Page size for the list methods. ``None`` returns
+                every entry in one response and mints no cursors.
+            list_changed: Whether to advertise the `listChanged` capability on
+                tools, resources and prompts, and to emit the corresponding
+                notifications when a registry changes after start-up.
+
+                This is decided once, here, and never changes afterwards.
+                It used to be inferred — advertised ``false`` until the first
+                runtime registration, then flipped ``true`` — which meant the
+                *first* `notifications/tools/list_changed` always went to
+                clients that had been told, at `initialize`, that none would
+                come. A client that checks the capability drops it and goes
+                stale, and there is no way to correct a handshake already made.
+
+                Pass ``False`` for a server whose registries are fixed at
+                import time and that would rather advertise nothing: the
+                capability is then withheld *and* no notification is ever
+                sent, so the two agree either way.
         """
         self.name = name
         self.version = version
@@ -290,10 +362,11 @@ class MCPServer(object):
         # under the GIL, and tools/call is the hot path. Re-entrant because
         # registering an async tool registers get_job_result underneath.
         self._registry_lock = threading.RLock()
-        # Flipped the first time something is registered or removed after the
-        # server starts serving. Until then listChanged is advertised False,
-        # because a static server never sends one.
-        self._dynamic_registry = False  # type: bool
+        # Whether this server advertises `listChanged` and emits those
+        # notifications. Fixed at construction so the capability a client was
+        # handed at `initialize` stays true for the life of the session — see
+        # the `list_changed` argument above.
+        self._dynamic_registry = bool(list_changed)  # type: bool
         self._serving = False  # type: bool
         self._clients = {}  # type: Dict[str, List[_SSEQueue]]
         self._clients_lock = threading.Lock()
@@ -333,6 +406,19 @@ class MCPServer(object):
         # get_job_result is registered lazily the first time an async tool is
         # registered, so servers without any async tools don't advertise it.
         self._job_polling_registered = False  # type: bool
+
+    def _drop_stream_subscriptions(self, session_id, client_queue):
+        # type: (str, Any) -> None
+        """Forget the subscriptions opened on one closing stream."""
+        with self._subs_lock:
+            session_subs = self._subscriptions.get(session_id)
+            if not session_subs:
+                return
+            for sub_id in [sub_id for sub_id, sub in session_subs.items()
+                           if sub.get("stream") is client_queue]:
+                session_subs.pop(sub_id, None)
+            if not session_subs:
+                self._subscriptions.pop(session_id, None)
 
     def _drop_subscriptions(self, session_id):
         # type: (str) -> None
@@ -758,6 +844,38 @@ class MCPServer(object):
             return None
         return self._schema_violation(schema, arguments, path="arguments")
 
+    def _unexpected_arguments(self, handler, arguments):
+        # type: (Callable, Dict[str, Any]) -> List[str]
+        """Argument names the handler has nowhere to put.
+
+        The published `inputSchema` does not set `additionalProperties: false`
+        — the generator never emitted it, and a hand-written schema need not
+        either — so an argument the tool does not declare passes validation,
+        reaches `handler(**arguments)`, and dies there with a Python
+        ``TypeError``. That was then reported as ``isError``, which tells the
+        model the tool *ran and failed* when the call never happened, and the
+        message leaked the handler's signature verbatim. Hallucinated argument
+        names are routine, so this is a common path, not an exotic one.
+
+        A handler taking ``**kwargs`` accepts anything, so nothing is
+        unexpected there.
+        """
+        try:
+            params = inspect.signature(handler).parameters
+        except (ValueError, TypeError):
+            # No introspectable signature: let the call proceed rather than
+            # reject arguments we cannot prove are wrong.
+            return []
+        for param in params.values():
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                return []
+        accepted = set(params)
+        # The context parameter is injected by the server, never published in
+        # `inputSchema`. A client naming it is naming something that is not an
+        # input — and the value would be silently overwritten anyway.
+        accepted.discard(self._context_param_name(handler))
+        return sorted(key for key in arguments if key not in accepted)
+
     def _apply_output_schema(self, tool_name, result, call_result):
         # type: (Optional[str], Dict[str, Any], Any) -> Dict[str, Any]
         """Hold a tool's result to the `outputSchema` it published.
@@ -844,16 +962,59 @@ class MCPServer(object):
         for job_id in targets:
             self.cancel_job(job_id)
 
+    # Origins `run(allowed_origins="loopback")` accepts. DNS rebinding works
+    # by pointing an attacker-controlled name at the loopback address, so the
+    # page's *origin* is never one of these however the name resolves — which
+    # is exactly why comparing it is a defence.
+    _LOOPBACK_HOSTS = frozenset(["localhost", "127.0.0.1", "::1", "[::1]"])
+
+    @classmethod
+    def _is_loopback_origin(cls, origin):
+        # type: (str) -> bool
+        """Whether this Origin names the local machine."""
+        host = origin.split("://", 1)[-1]
+        # Strip any path, then the port — but not the colons inside a
+        # bracketed IPv6 literal.
+        host = host.split("/", 1)[0]
+        if host.startswith("["):
+            host = host.split("]", 1)[0] + "]"
+        else:
+            host = host.split(":", 1)[0]
+        if host in cls._LOOPBACK_HOSTS:
+            return True
+        # The whole 127.0.0.0/8 block is loopback, not just 127.0.0.1.
+        parts = host.split(".")
+        return (len(parts) == 4 and parts[0] == "127"
+                and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts))
+
     def origin_allowed(self, origin):
         # type: (Optional[str]) -> bool
         """Whether a browser Origin may talk to this server.
 
-        No ``Origin`` means a non-browser client, which this cannot protect
-        and does not try to. No configured allowlist means no policy, so
-        everything passes — a library cannot guess a deployment's origins.
+        No ``Origin`` means a non-browser client — every CLI and SDK client —
+        which this cannot protect and does not try to.
+
+        The transport spec makes Origin validation a MUST, to block DNS
+        rebinding. It is nonetheless **off unless configured**, because the
+        deployment this library was written for does not place the check here:
+        the server sits behind a gateway that authenticates every request and
+        builds its upstream call from an explicit header list, so no browser
+        `Origin` ever reaches this process and no browser reaches this port.
+        A check that cannot see the header cannot enforce anything, and a
+        default that refused would only break the gateway's own clients.
+
+        Put the policy here — with an allowlist, or ``"loopback"`` — for any
+        deployment where a browser *can* reach this server directly. Then it
+        is the boundary, and it is a real one.
+
+        See :meth:`run` for the accepted forms.
         """
-        if not origin or self._allowed_origins is None:
+        if not origin:
             return True
+        if self._allowed_origins is None or self._allowed_origins is _ANY_ORIGIN:
+            return True
+        if self._allowed_origins is _LOOPBACK_ONLY:
+            return self._is_loopback_origin(origin.rstrip("/").lower())
         return origin.rstrip("/").lower() in self._allowed_origins
 
     def _route_headers_required(self, version):
@@ -1224,7 +1385,7 @@ class MCPServer(object):
             return uri
 
         # Exact-match fast path.
-        if uri in self._resources:
+        if uri in self._resources or uri in self._skill_resources:
             return uri
 
         # Try common normalizations before suffix matching.
@@ -1247,9 +1408,20 @@ class MCPServer(object):
                 if value and value not in normalized_candidates:
                     normalized_candidates.append(value)
 
-        # Exact match after normalization.
+        # The com_mcp gateway prepends its own origin to resource URIs, so
+        # `ui://tool/app` arrives as `https://nanohub.org/ui://tool/app`. The
+        # canonical form is "keep from the last non-http scheme marker
+        # onward", which is what this recovers.
+        for candidate in list(normalized_candidates):
+            embedded = self._embedded_uri(candidate)
+            if embedded and embedded not in normalized_candidates:
+                normalized_candidates.append(embedded)
+
+        # Exact match after normalization. Skill files are registries too: a
+        # gateway-prefixed `skill://` URI was left unstripped and came back
+        # "Resource not found", as was every template instance below.
         for candidate in normalized_candidates:
-            if candidate in self._resources:
+            if candidate in self._resources or candidate in self._skill_resources:
                 return candidate
 
         # Fallback: match by registered URI suffix (prefer longest match),
@@ -1257,13 +1429,39 @@ class MCPServer(object):
         # `https://elsewhere/config://settings` — and any other string
         # ending in a registered URI — to that resource, which is a wider
         # door than a proxy prefix needs.
-        resource_uris = sorted(self._resources.keys(), key=len, reverse=True)
+        resource_uris = sorted(
+            list(self._resources.keys()) + list(self._skill_resources.keys()),
+            key=len, reverse=True)
         for candidate in normalized_candidates:
             for resource_uri in resource_uris:
                 if candidate.endswith("/" + resource_uri):
                     return resource_uri
 
+        # A template instance names no registered URI, so nothing above can
+        # match one. Ask the templates themselves, which is the only way a
+        # gateway-prefixed `weather://paris/current` is ever readable.
+        for candidate in normalized_candidates:
+            if candidate != uri and self._match_resource_template(candidate):
+                return candidate
+
         return uri
+
+    @staticmethod
+    def _embedded_uri(candidate):
+        # type: (str) -> Optional[str]
+        """`https://host/skill://demo/SKILL.md` -> `skill://demo/SKILL.md`.
+
+        Returns None when there is no embedded scheme to recover, which is
+        every URI a client sent unprefixed.
+        """
+        marker = candidate.rfind("://")
+        if marker <= 0:
+            return None
+        start = candidate.rfind("/", 0, marker)
+        if start == -1:
+            return None
+        recovered = candidate[start + 1:]
+        return recovered if recovered != candidate else None
 
     def _register_tool_function(self, func):
         # type: (Callable) -> None
@@ -1427,14 +1625,18 @@ class MCPServer(object):
         # prompts start advertising listChanged over a registry that did not
         # change.
 
-    def skill(self, skill_path):
-        # type: (str) -> Callable
+    def skill(self, skill_path, directory=None):
+        # type: (str, Any) -> Any
         """
-        Decorator to register a skill (SEP-2640 Skills Extension), served
-        from a directory containing a SKILL.md.
+        Register a skill (SEP-2640 Skills Extension), served from a directory
+        containing a SKILL.md.
 
-        The decorated function is called once, at registration, and must
-        return the skill's directory (a path or pathlib.Path):
+        Pass the directory to register it outright::
+
+            server.skill("git-workflow", Path(__file__).parent / "skills" / "git-workflow")
+
+        or use it as a decorator, where the decorated function is called once,
+        at registration, and must return the skill's directory::
 
             @server.skill("git-workflow")        # -> skill://git-workflow/SKILL.md
             def git_workflow():
@@ -1455,13 +1657,14 @@ class MCPServer(object):
                 namespace (e.g. "git-workflow" or "acme/billing/refunds").
                 Its final segment must equal the `name` field of the
                 skill's SKILL.md frontmatter.
+            directory: The skill's directory. Given, the skill is registered
+                immediately and nothing is returned. Omitted, a decorator is
+                returned for the form above.
         """
-        def decorator(func):
-            # type: (Callable) -> Callable
-            directory = func()
+        if directory is not None:
             self._register_skill_directory(skill_path, directory)
-            return func
-        return decorator
+            return None
+        return _PendingSkill(self, skill_path)
 
     def _register_skill_directory(self, skill_path, directory):
         # type: (str, Any) -> None
@@ -1566,9 +1769,9 @@ class MCPServer(object):
         """Persist accumulated answers; return the state id to hand the client."""
         return _tasks.mrtr_save(self, request_state, responses, session_id)
 
-    def _mrtr_discard(self, request_state):
+    def _mrtr_discard(self, request_state, session_id=None):
         """Drop state once the request has finally completed or failed."""
-        return _tasks.mrtr_discard(self, request_state)
+        return _tasks.mrtr_discard(self, request_state, session_id)
 
     def _prune_expired_mrtr_states(self):
         """Expire abandoned round-trips so memory can't grow unbounded."""
@@ -1747,12 +1950,16 @@ class MCPServer(object):
         method = self._LIST_CHANGED_METHODS.get(kind)
         if method is None or not self._serving:
             return
+        if not self._dynamic_registry:
+            # The capability was withheld at `initialize`; sending the
+            # notification anyway is the contradiction this guard exists for.
+            return
         filter_name = self._LIST_CHANGED_FILTERS[kind]
 
         with self._subs_lock:
             subscribed = {
                 session_id: [
-                    sub_id for sub_id, sub in (subs or {}).items()
+                    (sub_id, sub.get("stream")) for sub_id, sub in (subs or {}).items()
                     if (sub.get("filters") or {}).get(filter_name)
                 ]
                 for session_id, subs in self._subscriptions.items()
@@ -1763,11 +1970,11 @@ class MCPServer(object):
         for session_id in sessions:
             subs = subscribed.get(session_id) or []
             if subs:
-                for sub_id in subs:
+                for sub_id, sub_stream in subs:
                     self._broadcast({
                         "jsonrpc": "2.0", "method": method,
                         "params": {"_meta": {MCP_SUBSCRIPTION_ID_KEY: sub_id}},
-                    }, session_id=session_id)
+                    }, session_id=session_id, stream=sub_stream)
             elif not self._session_is_stateless(session_id):
                 # Handshake-era session: no subscription exists to opt in with.
                 self._broadcast({"jsonrpc": "2.0", "method": method, "params": {}},
@@ -1782,9 +1989,7 @@ class MCPServer(object):
 
     def _mark_dynamic(self, kind):
         # type: (str) -> None
-        """Record that the registry can change, then announce this change."""
-        if self._serving and not self._dynamic_registry:
-            self._dynamic_registry = True
+        """Announce that a registry changed, if this server said it would."""
         self._notify_list_changed(kind)
 
     def resource_updated(self, uri):
@@ -1803,7 +2008,7 @@ class MCPServer(object):
         sent = 0
         with self._subs_lock:
             targets = [
-                (session_id, sub_id)
+                (session_id, sub_id, sub.get("stream"))
                 for session_id, subs in self._subscriptions.items()
                 for sub_id, sub in (subs or {}).items()
                 if uri in (sub.get("resource_uris") or ())
@@ -1811,13 +2016,13 @@ class MCPServer(object):
             legacy = [session_id
                       for session_id, uris in self._resource_subs.items()
                       if uri in uris]
-        for session_id, sub_id in targets:
+        for session_id, sub_id, sub_stream in targets:
             self._broadcast({
                 "jsonrpc": "2.0",
                 "method": "notifications/resources/updated",
                 "params": {"uri": uri,
                            "_meta": {MCP_SUBSCRIPTION_ID_KEY: sub_id}},
-            }, session_id=session_id)
+            }, session_id=session_id, stream=sub_stream)
             sent += 1
         for session_id in legacy:
             # No subscriptionId: these revisions have no such concept, and a
@@ -2190,12 +2395,21 @@ class MCPServer(object):
         that key, which tools, resources and prompts all are.
         """
         page_size = self.list_page_size
+        cursor = params.get("cursor") if isinstance(params, dict) else None
+
         if not page_size or page_size <= 0:
+            # Paging off: every entry comes back in one response and no cursor
+            # is ever minted — so any cursor presented here is one this server
+            # did not issue. "If the server receives a cursor it does not
+            # recognize, it SHOULD return error -32602." Validating only on
+            # the paging path left this check unreachable in the default
+            # configuration, where a junk cursor silently returned page one.
+            if cursor is not None:
+                raise InvalidParams("Invalid cursor")
             result[result_key] = items
             return result
 
         start = 0
-        cursor = params.get("cursor") if isinstance(params, dict) else None
         if cursor is not None:
             if not isinstance(cursor, str):
                 raise InvalidParams("Invalid cursor")
@@ -2377,12 +2591,14 @@ class MCPServer(object):
             "error": {"code": -32600, "message": message},
         }
 
-    def _handle_jsonrpc_message(self, message, session_id=None, headers=None):
-        # type: (Any, Optional[str], Optional[Any]) -> Optional[Dict[str, Any]]
+    def _handle_jsonrpc_message(self, message, session_id=None, headers=None,
+                                stream=None):
+        # type: (Any, Optional[str], Optional[Any], Optional[Any]) -> Optional[Dict[str, Any]]
         """Handle one JSON-RPC message after top-level shape validation."""
         if not isinstance(message, dict):
             return self._invalid_request(None, "JSON-RPC message must be an object")
-        return self._handle_request(message, session_id=session_id, headers=headers)
+        return self._handle_request(message, session_id=session_id,
+                                    headers=headers, stream=stream)
 
     def _batch_allowed(self, session_id):
         # type: (Optional[str]) -> bool
@@ -2401,8 +2617,9 @@ class MCPServer(object):
             session = self._sessions.get(session_id) or {}
         return session.get("protocol_version") == "2024-11-05"
 
-    def _handle_jsonrpc_payload(self, payload, session_id=None, headers=None):
-        # type: (Any, Optional[str], Optional[Any]) -> Optional[Any]
+    def _handle_jsonrpc_payload(self, payload, session_id=None, headers=None,
+                                stream=None):
+        # type: (Any, Optional[str], Optional[Any], Optional[Any]) -> Optional[Any]
         """Handle a JSON-RPC message or batch payload."""
         if isinstance(payload, list):
             if not payload:
@@ -2415,15 +2632,16 @@ class MCPServer(object):
             responses = []
             for message in payload:
                 response = self._handle_jsonrpc_message(
-                    message, session_id=session_id, headers=headers)
+                    message, session_id=session_id, headers=headers,
+                    stream=stream)
                 if response is not None:
                     responses.append(response)
             return responses or None
         return self._handle_jsonrpc_message(
-            payload, session_id=session_id, headers=headers)
+            payload, session_id=session_id, headers=headers, stream=stream)
 
-    def _handle_request(self, request, session_id=None, headers=None):
-        # type: (Dict[str, Any], Optional[str], Optional[Any]) -> Optional[Dict[str, Any]]
+    def _handle_request(self, request, session_id=None, headers=None, stream=None):
+        # type: (Dict[str, Any], Optional[str], Optional[Any], Optional[Any]) -> Optional[Dict[str, Any]]
         """Handle a JSON-RPC request and return response."""
         if not isinstance(request, dict):
             return self._invalid_request(None, "JSON-RPC message must be an object")
@@ -2432,13 +2650,43 @@ class MCPServer(object):
 
         method = request.get("method", "")
         msg_id = request.get("id")
-        is_notification = msg_id is None
+        # A *missing* id is a notification; an id that is present and null is
+        # neither. The base spec says so outright — "Unlike base JSON-RPC, the
+        # ID MUST NOT be `null`" — and conflating the two ran the request and
+        # answered 202, so a `tools/call` with side effects executed and the
+        # caller was never told what happened.
+        has_id = "id" in request
+        is_notification = not has_id
         params = request.get("params")
         if params is None:
             params = {}
 
         if not method and self._receive_client_response(request, session_id):
             return None
+
+        # JSON-RPC 2.0: the `jsonrpc` member "MUST be exactly '2.0'", and MCP
+        # requires every message to follow that spec. A body declaring another
+        # version — or none at all — is an Invalid Request, not something to
+        # serve on the assumption it meant 2.0.
+        if request.get("jsonrpc") != "2.0":
+            if is_notification:
+                return None
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {"code": -32600,
+                          "message": "jsonrpc must be exactly \"2.0\""},
+            }
+
+        if has_id and msg_id is None:
+            # Answered with a null id because there is no usable one to echo,
+            # which is what JSON-RPC prescribes for an Invalid Request.
+            return {
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32600,
+                          "message": "Request id must not be null"},
+            }
 
         # Per JSON-RPC 2.0, params (when present) must be an object or array.
         # We only accept objects since every method consumes named params.
@@ -2477,6 +2725,14 @@ class MCPServer(object):
         # it per request; older revisions inherit the session's negotiation.
         version = self._request_protocol_version(params, session_id)
         modern = self._is_stateless(version)
+        if modern and session_id and meta and meta.get(META_PROTOCOL_VERSION):
+            # Remember it against the stream this caller is using. Nothing
+            # else can: 2026-07-28 removed `initialize`, so the only place the
+            # revision was ever recorded is never reached by the one revision
+            # that needs it — and `_session_is_stateless` then read a stateless
+            # client as handshake-era and pushed it the unsolicited
+            # list_changed notifications that revision forbids.
+            self._set_session_protocol_version(session_id, version)
         if version not in SUPPORTED_PROTOCOL_VERSIONS:
             if is_notification:
                 return None
@@ -2504,7 +2760,7 @@ class MCPServer(object):
             request=request, method=method, msg_id=msg_id, params=params,
             session_id=session_id, headers=headers, version=version,
             modern=modern, is_notification=is_notification, meta=meta,
-            progress_token=progress_token)
+            progress_token=progress_token, stream=stream)
 
         result = None
         error = None
@@ -2710,7 +2966,11 @@ class MCPServer(object):
                     else:
                         session_subs[msg_id] = {"task_ids": set(accepted),
                                             "filters": filters,
-                                            "resource_uris": set(resource_uris)}
+                                            "resource_uris": set(resource_uris),
+                                            # The stream this subscription's
+                                            # notifications belong to; never
+                                            # any other one of the session's.
+                                            "stream": ctx.stream}
                 if session_subs is None:
                     # Over the cap: fall through to the error response.
                     return _RAW_RESPONSE, {"jsonrpc": "2.0", "id": msg_id, "error": error}
@@ -2726,7 +2986,7 @@ class MCPServer(object):
                             resourceSubscriptions=resource_uris),
                         "_meta": {MCP_SUBSCRIPTION_ID_KEY: msg_id},
                     },
-                }, session_id=session_id)
+                }, session_id=session_id, stream=ctx.stream)
 
                 # The listen stream is long-lived: its response is sent
                 # only on graceful teardown, so return nothing now.
@@ -2770,6 +3030,9 @@ class MCPServer(object):
         bad_arguments = (
             self._input_schema_violation(tool_name, arguments)
             if tool_entry is not None and isinstance(arguments, dict) else None)
+        unexpected = (
+            self._unexpected_arguments(tool_entry["handler"], arguments)
+            if tool_entry is not None and isinstance(arguments, dict) else [])
 
         if not isinstance(arguments, dict):
             error = {"code": -32602,
@@ -2781,6 +3044,10 @@ class MCPServer(object):
             error = {"code": -32602,
                      "message": "Invalid arguments for tool {}: {}".format(
                          tool_name, bad_arguments)}
+        elif unexpected:
+            error = {"code": -32602,
+                     "message": "Unknown argument(s) for tool {}: {}".format(
+                         tool_name, ", ".join(unexpected))}
         else:
             handler = tool_entry["handler"]
 
@@ -2850,7 +3117,7 @@ class MCPServer(object):
                         input_responses=collected,
                         request_state=request_state,
                     )
-                    self._mrtr_discard(request_state)
+                    self._mrtr_discard(request_state, session_id)
 
                     # Wrap result in proper format
                     if isinstance(call_result, ToolResult):
@@ -2873,7 +3140,7 @@ class MCPServer(object):
                         ),
                     }
                 except Exception as e:
-                    self._mrtr_discard(request_state)
+                    self._mrtr_discard(request_state, session_id)
                     traceback.print_exc()
                     result = {
                         "content": [{"type": "text", "text": str(e)}],
@@ -3135,10 +3402,24 @@ class MCPServer(object):
 
         prompt_name = params.get("name")
         arguments = params.get("arguments", {})
+        known_prompt = (isinstance(prompt_name, str)
+                        and prompt_name in self._prompts
+                        and isinstance(arguments, dict))
         missing_arguments = (
             self._missing_prompt_arguments(prompt_name, arguments)
-            if (isinstance(prompt_name, str) and prompt_name in self._prompts
-                and isinstance(arguments, dict)) else [])
+            if known_prompt else [])
+        unexpected_arguments = (
+            self._unexpected_arguments(
+                self._prompts[prompt_name]["handler"], arguments)
+            if known_prompt else [])
+        # `GetPromptRequest.params.arguments` is typed `{[key: string]:
+        # string}`. A non-string reached the handler and raised there, so the
+        # caller's malformed request came back as -32603 with the handler's
+        # own TypeError in it -- "can only concatenate str (not NoneType)".
+        non_string_arguments = (
+            sorted(key for key, value in arguments.items()
+                   if not isinstance(value, str))
+            if known_prompt else [])
 
         if not isinstance(prompt_name, str) or not prompt_name:
             error = {"code": -32602,
@@ -3149,6 +3430,22 @@ class MCPServer(object):
         elif prompt_name not in self._prompts:
             error = {"code": ERR_NOT_FOUND,
                      "message": "Unknown prompt: {}".format(prompt_name)}
+        elif non_string_arguments:
+            error = {
+                "code": -32602,
+                "message": "prompts/get argument(s) must be strings: "
+                           "{}".format(", ".join(non_string_arguments)),
+            }
+        elif unexpected_arguments:
+            # Same defect `tools/call` had: it reached the handler, raised a
+            # Python TypeError, and came back as -32603 -- the server blamed
+            # for the caller's request, with the handler's signature in the
+            # message and a traceback in the log per bad call.
+            error = {
+                "code": -32602,
+                "message": "Unknown argument(s) for prompt {}: {}".format(
+                    prompt_name, ", ".join(unexpected_arguments)),
+            }
         elif missing_arguments:
             # Omitting a required argument reached the handler and raised a
             # Python TypeError, reported as -32603 — blaming the server for
@@ -3276,6 +3573,12 @@ class MCPServer(object):
                 del self._clients[session_id]
                 session_empty = True
 
+        # A subscription belongs to the stream that opened it, so it dies with
+        # that stream — not only when the session's last one goes. Otherwise a
+        # closed `subscriptions/listen` left its entry behind holding a dead
+        # queue, and every notification it matched was built and then dropped.
+        self._drop_stream_subscriptions(session_id, client_queue)
+
         if not session_empty:
             return
 
@@ -3389,20 +3692,41 @@ class MCPServer(object):
         with self._clients_lock:
             return sum(len(queues) for queues in self._clients.values())
 
-    def _broadcast(self, message, session_id=None):
-        # type: (Dict[str, Any], Optional[str]) -> None
-        """Send message to SSE clients for one session."""
+    def _broadcast(self, message, session_id=None, stream=None):
+        # type: (Dict[str, Any], Optional[str], Optional[Any]) -> bool
+        """Send one message to exactly one of a session's SSE streams.
+
+        The transport spec is a MUST: "The server MUST send each of its
+        JSON-RPC messages on only one of the connected streams; that is, it
+        MUST NOT broadcast the same message across multiple streams." A
+        session routinely has more than one — a GET stream plus the POST
+        stream held open for `subscriptions/listen` both register under the
+        same id — so fanning out delivered every notification twice and,
+        worse, delivered a server-to-client *request* twice: the user was
+        prompted twice for one `elicitation/create` and answered it with two
+        responses carrying the same id.
+
+        ``stream`` names the queue to use, for a message that belongs to one
+        particular stream (a subscription's notifications). Without it the
+        session's primary — its first-registered, longest-lived — stream is
+        used. Returns whether the message was queued anywhere.
+        """
         if not session_id:
-            return
-        json_str = json.dumps(message)
+            return False
         with self._clients_lock:
-            queues = list(self._clients.get(session_id, []))
-        for client_queue in queues:
-            client_queue.append(json_str)
-            # Wake any reader blocked on this queue
-            event = getattr(client_queue, "_wake_event", None)
-            if event is not None:
-                event.set()
+            queues = self._clients.get(session_id) or []
+            if stream is not None:
+                target = stream if stream in queues else None
+            else:
+                target = queues[0] if queues else None
+        if target is None:
+            return False
+        target.append(json.dumps(message))
+        # Wake any reader blocked on this queue
+        event = getattr(target, "_wake_event", None)
+        if event is not None:
+            event.set()
+        return True
 
     def run(self, host="0.0.0.0", port=8000, path_prefix="",
             require_session_header=False, max_request_bytes=MAX_REQUEST_BYTES,
@@ -3442,16 +3766,36 @@ class MCPServer(object):
 
                 A *contradicting* header is always rejected, whatever this is
                 set to — that is the point of a header a gateway routes on.
-            allowed_origins: Origins a browser may call this server from. The
-                transport spec requires servers to validate ``Origin`` to block
-                DNS rebinding — a page on any origin can otherwise script a
-                request to a server reachable from the victim's browser.
+            allowed_origins: Which browser origins may call this server.
 
-                A request carrying an ``Origin`` outside this list is refused
-                with HTTP 403. ``None`` (the default) accepts any origin,
-                because a library cannot know which are legitimate; **set it in
-                any deployment a browser can reach.** Requests with no
-                ``Origin`` at all — every non-browser client — are unaffected.
+                * ``None`` (default) or ``"*"`` — every origin is accepted.
+                * a list — only those origins; anything else gets HTTP 403.
+                * ``"loopback"`` — only ``localhost``, ``127.0.0.0/8`` and
+                  ``::1``.
+
+                Requests carrying no ``Origin`` at all — every non-browser
+                client, which is nearly all of them — are never affected by
+                any of these.
+
+                The transport spec makes validating ``Origin`` a MUST, to
+                block DNS rebinding: a page on any origin can otherwise script
+                requests to a server the victim's browser can reach, and
+                rebinding reaches even a server bound to 127.0.0.1 by pointing
+                an attacker-controlled name at the loopback address.
+
+                It is nonetheless off by default, because the deployment this
+                library serves does not place the check here. Behind the
+                com_mcp gateway this process is not browser-reachable, the
+                gateway authenticates every request, and it builds its
+                upstream call from an explicit header list that does not
+                include ``Origin`` — so the header never arrives and the check
+                could not fire either way. Defaulting to refuse would only
+                break that gateway's own clients.
+
+                **Set this wherever a browser can reach the server directly**
+                — no gateway in front, a local dev server a page talks to, a
+                port published from a container. ``"loopback"`` is the
+                one-word form of the spec's protection.
         """
         self._serving = True
         self._path_prefix = path_prefix.rstrip("/") if path_prefix else ""
@@ -3462,19 +3806,24 @@ class MCPServer(object):
         self._max_request_bytes = int(max_request_bytes)
         self._require_route_headers = (
             "auto" if require_route_headers == "auto" else bool(require_route_headers))
-        self._allowed_origins = (
-            None if allowed_origins is None
-            else {str(o).rstrip("/").lower() for o in allowed_origins})
+        if allowed_origins is None or allowed_origins in ("*", ["*"]):
+            self._allowed_origins = _ANY_ORIGIN
+        elif allowed_origins in ("loopback", ["loopback"]):
+            self._allowed_origins = _LOOPBACK_ONLY
+        else:
+            self._allowed_origins = {
+                str(o).rstrip("/").lower() for o in allowed_origins}
 
-        if allowed_origins is None and host not in ("127.0.0.1", "localhost", "::1"):
-            # The transport spec makes Origin validation a MUST, precisely
-            # to block DNS rebinding — and a wildcard bind is the exposure
-            # that attack needs. A library cannot guess the legitimate
-            # origins, so it says so loudly instead of failing silently.
-            print("WARNING: no allowed_origins set while bound to {}. Any web "
-                  "page can reach this server from a victim's browser. Pass "
-                  "allowed_origins=[...] to run(), or bind to 127.0.0.1."
-                  .format(host), file=sys.stderr)
+        if (self._allowed_origins is _ANY_ORIGIN
+                and host not in ("127.0.0.1", "localhost", "::1")):
+            # No Origin policy, bound where a browser can reach it. Correct
+            # behind a gateway that is the real boundary, and a hole without
+            # one — which this cannot tell apart, so it says so once.
+            print("WARNING: no allowed_origins set while bound to {}. If a "
+                  "browser can reach this server directly, any web page can "
+                  "drive it. Pass allowed_origins=[...] or "
+                  "allowed_origins='loopback' to run().".format(host),
+                  file=sys.stderr)
 
         server = ThreadingHTTPServer((host, port), MCPRequestHandler)
         # Set before serve_forever(), so no handler can be constructed without it.

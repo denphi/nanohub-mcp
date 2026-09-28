@@ -29,6 +29,7 @@ gap.
 
 from __future__ import print_function
 
+import enum
 import inspect
 import os
 import sys
@@ -37,7 +38,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from typing import Any, Dict, List, Optional, Union  # noqa: E402
+from typing import Any, Dict, List, Literal, Optional, Union  # noqa: E402
 
 from nanohubmcp import MCPServer  # noqa: E402
 from nanohubmcp.decorators import (  # noqa: E402
@@ -94,10 +95,62 @@ def _h_self_like(self, cls, context, a: int):
     """Skip branch: the remaining excluded names."""
 
 
+class _Colour(enum.Enum):
+    """A closed set of JSON-valued members."""
+
+    RED = "red"
+    BLUE = "blue"
+
+
+class _Opaque(enum.Enum):
+    """A closed set whose members are not JSON values, so not publishable."""
+
+    A = object()
+    B = object()
+
+
+def _h_literal(mode: Literal["fast", "slow"] = "fast"):
+    """Branch: Literal names the permitted values, and the default is one."""
+
+
+def _h_enum(colour: _Colour):
+    """Branch: an enum.Enum names them too, via member values."""
+
+
+def _h_mixed_literal(x: Literal[1, "a"]):
+    """Branch: a closed set of more than one JSON type gets no `type`."""
+
+
+def _h_opaque_enum(x: _Opaque):
+    """Branch: a closed set of non-JSON members constrains nothing."""
+
+
+def _h_annotated_default(limit: int = 10, tags: tuple = ("a",)):
+    """Branch: the default is published *alongside* a known type."""
+
+
+def _h_unpublishable_default(sink=object(), broken: float = float("nan")):
+    """Branch: a default with no JSON spelling is left out entirely."""
+
+
 BRANCH_CASES = [
     ("resolved-hint", _h_resolved_hint,
      {"a": {"type": "integer"}, "b": {"type": "string"}}, ["a", "b"]),
-    ("raw-annotation", _h_raw_annotation, {"a": {}}, []),
+    # The annotation is unresolvable, but the default is not — and a real
+    # default is worth more to a reader than the silence this used to publish.
+    ("raw-annotation", _h_raw_annotation, {"a": {"default": "x"}}, []),
+    ("literal", _h_literal,
+     {"mode": {"enum": ["fast", "slow"], "type": "string",
+               "default": "fast"}}, []),
+    ("enum-class", _h_enum,
+     {"colour": {"enum": ["red", "blue"], "type": "string"}}, ["colour"]),
+    ("mixed-literal", _h_mixed_literal, {"x": {"enum": [1, "a"]}}, ["x"]),
+    ("opaque-enum", _h_opaque_enum, {"x": {}}, ["x"]),
+    ("annotated-default", _h_annotated_default,
+     {"limit": {"type": "integer", "default": 10},
+      "tags": {"default": ["a"]}}, []),
+    ("unpublishable-default", _h_unpublishable_default,
+     {"sink": {}, "broken": {"type": "number"}}, []),
     ("type-comment", _h_type_comment,
      {"a": {"type": "integer"}, "b": {"type": "array"}}, ["a", "b"]),
     ("informative-default", _h_informative_default,
@@ -214,7 +267,10 @@ def _known_typed_parameters(handler):
     """
     schema = _generate_input_schema(handler)
     return {name for name, prop in schema["properties"].items()
-            if "type" in prop}
+            # `enum` is type information too: a `Literal` or an `enum.Enum`
+            # names the permitted values outright, which constrains the
+            # parameter whether or not a single JSON `type` covers them.
+            if "type" in prop or "enum" in prop}
 
 
 @pytest.mark.parametrize("label,handler", [(c[0], c[1]) for c in BRANCH_CASES],

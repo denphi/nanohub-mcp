@@ -154,12 +154,12 @@ def notify_task_status(server, job_id):
 
     with server._subs_lock:
         subscriptions = [
-            sub_id
+            (sub_id, sub.get("stream"))
             for sub_id, sub in (server._subscriptions.get(session_id) or {}).items()
             if job_id in sub.get("task_ids", ())
         ]
 
-    for sub_id in subscriptions:
+    for sub_id, sub_stream in subscriptions:
         params = dict(task)
         meta = dict(params.get("_meta") or {})
         meta[MCP_SUBSCRIPTION_ID_KEY] = sub_id
@@ -168,7 +168,7 @@ def notify_task_status(server, job_id):
             "jsonrpc": "2.0",
             "method": "notifications/tasks",
             "params": params,
-        }, session_id=session_id)
+        }, session_id=session_id, stream=sub_stream)
 
 
 def start_async_tool_job(server, handler, msg_id, arguments, session_id=None,
@@ -498,12 +498,22 @@ def mrtr_save(server, request_state, responses, session_id=None):
     return state_id
 
 
-def mrtr_discard(server, request_state):
-    # type: (Optional[str]) -> None
-    """Drop state once the request has finally completed or failed."""
+def mrtr_discard(server, request_state, session_id=None):
+    # type: (Optional[str], Optional[str]) -> None
+    """Drop state once the request has finally completed or failed.
+
+    Session-scoped like `mrtr_load` and `mrtr_save`. It was the one of the
+    three that was not, so any session could destroy another's in-flight
+    request just by naming its `requestState` and completing a call — which
+    is precisely the attack `mrtr_save` refuses to rebind for. The owner then
+    lost every answer it had accumulated and was asked again from scratch.
+    """
     if not request_state:
         return
     with server._mrtr_lock:
+        entry = server._mrtr_states.get(request_state)
+        if entry is None or entry.get("session_id") != session_id:
+            return
         server._mrtr_states.pop(request_state, None)
 
 

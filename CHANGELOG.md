@@ -9,6 +9,144 @@ an older revision whose capability was advertised and then not backed, or a
 Streamable HTTP requirement the transport did not meet.
 
 ### Fixed
+- **Errors on the JSON-RPC routes returned HTML.** The parse-error path
+  already avoided `send_error` -- "an HTML 400 is not something a JSON-RPC
+  client, or the proxy in front of it, can interpret, and was observed wrapped
+  into a bogus 'Proxy error' downstream" -- but the wrong-path, bad-length,
+  oversize and listen-Accept paths still produced one. All of them answer with
+  a JSON-RPC error body now.
+- **The REST `/tools/{name}` endpoint enforced none of the schema it
+  published.** `/openapi.json` advertises each tool's `inputSchema` as the
+  request-body schema; a bad argument reached the handler anyway and its Python
+  TypeError -- signature included -- was returned to the caller. It now
+  validates exactly as `tools/call` does.
+- **A non-string `prompts/get` argument was a `-32603`.** The spec types
+  `arguments` as `{[key: string]: string}`; a non-string reached the handler
+  and raised there, so the caller's malformed request was reported as the
+  server's fault with the handler's own TypeError in the message.
+
+- **A tool with a non-JSON default broke `tools/list` for the whole server.**
+  The default was published verbatim, so `json.dumps` raised inside the
+  response and every listing came back HTTP 500 — one tool with a sentinel,
+  `Path` or `datetime` default and no client could see *any* tool.
+- **`ResourceResult` and `PromptResult` accepted `meta=` and dropped it**, the
+  same defect already fixed in `ToolResult`, so the metadata never reached the
+  wire.
+- **A non-text prompt message given as a dict was flattened with `str()`**,
+  putting a Python repr on the wire in place of the image, audio or resource
+  block.
+- **One session could destroy another's in-flight MRTR state.**
+  `mrtr_discard` was the only one of the three state functions that was not
+  session-scoped, so naming another session's `requestState` and completing a
+  call deleted every answer that session had accumulated — precisely the
+  attack `mrtr_save` refuses to rebind for.
+- **A symlink in a skill directory served files from outside it.** The walk
+  followed it, so anything it pointed at became an ordinary `skill://`
+  resource; traversal through the URI was already refused, and this was the
+  same escape by another route. Symlinks that stay inside the skill still work.
+- **`Literal` and `enum.Enum` published no constraint at all.** Both name a
+  closed set of values in the signature, and the schema said nothing — so the
+  model was never told the permitted values and nothing refused a wrong one.
+  They are now published as `enum`, with `type` when the values share one.
+- **A parameter's default was published only when it was *un*annotated**, so
+  `def t(limit: int = 10)` advertised the type and dropped the 10 — the part
+  of the signature a model most wants to read.
+
+- **A 2026-07-28 client could not be recognised as one.** That revision
+  removed `initialize`, and `initialize` was the only place the negotiated
+  revision was ever recorded — so `_session_is_stateless` read a genuinely
+  stateless client as handshake-era and pushed it the unsolicited
+  `list_changed` notifications the revision forbids. The declared revision is
+  now recorded from the request that declares it.
+- **A gateway-prefixed URI was unreadable for templates and skill files.**
+  com_mcp prepends its own origin (`https://nanohub.org/ui://tool/app`), and
+  the stripping only ever consulted `_resources` — so a literal resource was
+  recovered while every `skill://` file and every template instance came back
+  "Resource not found". Skill files and templates are now consulted too, via
+  the canonical "keep from the last non-http scheme marker onward" rule.
+- **`prompts/get` with an unknown argument was a `-32603`.** The same defect
+  `tools/call` had, and worse: it reached the handler, raised a Python
+  `TypeError`, and was reported as the *server's* fault, with the handler's
+  signature in the message and a traceback in the log for every bad call. It
+  is now `-32602`, named, before the handler runs.
+- **A deeply nested request body returned an HTML 500.** `RecursionError` is a
+  `RuntimeError`, not a `ValueError`, so a few KB of brackets slipped past the
+  JSON parse handler — "an HTML 400 is not something a JSON-RPC client, or the
+  proxy in front of it, can interpret" is the reason that handler exists. It
+  is now `-32700` with HTTP 400, and any other unexpected transport error
+  answers with a JSON-RPC `-32603` rather than an HTML page.
+- **A subscription outlived the stream that opened it.** It was dropped only
+  when the session's *last* stream closed, so a closed `subscriptions/listen`
+  left an entry holding a dead queue and every notification it matched was
+  built and then silently discarded.
+- **A client could name the context parameter as a tool argument.** `ctx` is
+  injected by the server and never published in `inputSchema`, so naming it
+  named something that is not an input — and the value was silently
+  overwritten rather than refused.
+
+- **Every server-to-client message was broadcast to all of a session's
+  streams.** "The server MUST send each of its JSON-RPC messages on only one
+  of the connected streams; that is, it MUST NOT broadcast the same message
+  across multiple streams." A session routinely has more than one — a GET
+  stream plus the POST stream held open for `subscriptions/listen` register
+  under the same id — so every notification arrived twice and one
+  `elicitation/create` prompted the user twice and was answered twice with the
+  same request id. `_broadcast` now targets exactly one stream, and a
+  subscription's notifications go to the stream that opened it.
+- **A request with `"id": null` was executed as a notification.** "Unlike base
+  JSON-RPC, the ID MUST NOT be `null`", but a missing id and a null one were
+  the same test, so a `tools/call` carrying `"id": null` ran — side effects
+  and all — and was answered with 202 and no body. It is now `-32600`, and the
+  tool does not run.
+- **The `jsonrpc` member was never read.** `{"jsonrpc": "1.0", ...}` and a body
+  with no `jsonrpc` at all were both served as if they had said `"2.0"`, which
+  JSON-RPC 2.0 requires them to. Both are now `-32600`.
+- **`listChanged` was advertised `false` and then contradicted.** It was
+  inferred: `false` until the first runtime registration, then flipped `true`.
+  The *first* `notifications/tools/list_changed` therefore always went to
+  clients told at `initialize` that none would come, and a handshake already
+  made cannot be corrected. It is now decided once, at construction —
+  `MCPServer(..., list_changed=False)` withholds the capability *and* sends no
+  notification, so the two agree either way.
+- **`Access-Control-Allow-Origin` was always `*`**, telling every origin it
+  could read the response even where an allowlist had been configured.
+  Responses now name the request's origin, with `Vary: Origin` so a cache
+  cannot hand one origin's response to another.
+
+### Changed
+
+- `run(allowed_origins=...)` accepts `"loopback"` (only `localhost`,
+  `127.0.0.0/8`, `::1`) and `"*"` alongside a list of origins. The **default
+  is unchanged and still accepts every origin**: behind the com_mcp gateway
+  this process is not browser-reachable, the gateway authenticates every
+  request, and it builds its upstream call from an explicit header list that
+  omits `Origin` — so the header never arrives and the check cannot fire
+  either way. `"loopback"` is the one-word form of the spec's DNS-rebinding
+  defence for a server with no gateway in front. The start-up warning for an
+  unset policy on a non-loopback bind now names both forms.
+- **An unknown tool argument was reported as a tool failure.** The published
+  `inputSchema` does not forbid extra properties, so the argument reached
+  `handler(**arguments)` and died there with a Python `TypeError` — returned
+  as `isError`, which tells the model the tool ran and failed when the call
+  never happened, and leaking the handler's signature verbatim. It is now
+  `-32602`, named, before anything runs.
+- **An unrecognized cursor was accepted when paging was off.** `_paginate`
+  returned before the cursor was looked at unless `list_page_size` was set, so
+  the rejection below it was unreachable in the default configuration and a
+  junk cursor silently returned page one. Any cursor is now `-32602` where
+  none is ever minted.
+- **A 405 carried no `Allow` header**, which RFC 9110 requires of that status —
+  and it is the status the transport spec's backwards-compatibility probe
+  reads.
+- **`report_progress` emitted a logging notification beside the progress
+  one**, so every tick cost two messages on the stream. The console line
+  stays; the `notifications/message` about it is gone. The per-request log
+  buffer it fed is now bounded rather than growing for the life of a job.
+- **`server.skill("name")` written as a statement registered nothing** and
+  said nothing — `skills/list` came back empty and the extension was never
+  advertised. It now warns when the decorator is dropped unapplied, and
+  `server.skill("name", directory)` registers outright.
+
 
 - **`resources.subscribe` was advertised with no method behind it.** Every
   revision before 2026-07-28 backs that capability with `resources/subscribe`

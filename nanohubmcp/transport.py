@@ -123,6 +123,22 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         return any(isinstance(m, dict) and m.get("method") == "initialize"
                    for m in messages)
 
+    def _send_cors_origin(self):
+        """Echo the validated request Origin, or `*` when there is none.
+
+        A blanket `*` told every origin it could read the response even where
+        an allowlist had been configured. By the time this runs the Origin has
+        already passed `origin_allowed`, so naming it is both narrower and the
+        only form a credentialed request can use. `Vary` keeps a cache from
+        handing one origin's response to another.
+        """
+        origin = self.headers.get("Origin")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        else:
+            self.send_header("Access-Control-Allow-Origin", "*")
+
     def _send_session_headers(self, minted_session):
         """Return a session minted on this request, and let browsers see it.
 
@@ -137,7 +153,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, payload, status=200):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -249,7 +265,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         elif path_only == "/favicon.ico":
             # Browsers probe for this; respond cheaply without payload.
             self.send_response(204)
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._send_cors_origin()
             self.end_headers()
         elif path_only in ("/", ""):
             # Root: server info / health page.
@@ -269,12 +285,15 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             body = json.dumps(info).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._send_cors_origin()
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
         else:
-            self.send_error(404, "No GET endpoint at {}".format(path_only))
+            self._send_json({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32601, "message": "No GET endpoint at {}".format(path_only)},
+            }, status=404)
 
     def _sse_pump_loop(self, client_queue):
         """Drain queued messages and emit periodic heartbeats.
@@ -307,7 +326,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         self.send_header("Mcp-Session-Id", session_id)
         self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
         self.end_headers()
@@ -351,7 +370,14 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             # buffer a large payload only to 404 it.
             is_direct_tool = path_only.startswith("/tools/")
             if not is_direct_tool and path_only not in ("/", "/mcp", "/mcp/"):
-                self.send_error(404, "No JSON-RPC endpoint at {}".format(path_only))
+                self._send_json({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {
+                        "code": -32601,
+                        "message": "No JSON-RPC endpoint at {}".format(
+                            path_only),
+                    },
+                }, status=404)
                 return
 
             # Parse Content-Length defensively — a non-integer header
@@ -360,13 +386,26 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             try:
                 content_length = int(raw_len)
             except (TypeError, ValueError):
-                self.send_error(400, "Invalid Content-Length header")
+                self._send_json({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32600, "message": "Invalid Content-Length header"},
+                }, status=400)
                 return
             if content_length < 0:
-                self.send_error(400, "Negative Content-Length")
+                self._send_json({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32600, "message": "Negative Content-Length"},
+                }, status=400)
                 return
             if content_length > self._max_bytes:
-                self.send_error(413, "Request body exceeds {} bytes".format(self._max_bytes))
+                self._send_json({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": "Request body exceeds {} bytes".format(
+                            self._max_bytes),
+                    },
+                }, status=413)
                 return
 
             post_data = self.rfile.read(content_length)
@@ -380,9 +419,15 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             # into a bogus "Proxy error" downstream.
             try:
                 request = json.loads(post_data.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError) as e:
+            except (UnicodeDecodeError, ValueError, RecursionError) as e:
+                # `RecursionError` is a RuntimeError, not a ValueError, so a
+                # deeply nested body — a few KB of brackets — slipped past
+                # this handler into the 500 below and came back as HTML with
+                # a traceback logged per request. It is a parse failure like
+                # any other.
                 if is_direct_tool:
-                    self.send_error(400, "Malformed JSON: {}".format(e))
+                    self._send_json_error(
+                        400, "Malformed JSON: {}".format(e))
                     return
                 self._send_json({
                     "jsonrpc": "2.0", "id": None,
@@ -418,7 +463,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 # Reject nested paths like /tools/foo/bar — only the
                 # bare name is a valid tool identifier.
                 if "/" in tool_name or not tool_name:
-                    self.send_error(404, "Tool not found: {}".format(tool_name))
+                    self._send_json_error(
+                        404, "Tool not found: {}".format(tool_name))
                     return
                 self._handle_direct_tool_call(tool_name, request)
                 return
@@ -477,7 +523,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                     self.send_response(202)
                     self.send_header("Content-Length", "0")
 
-                self.send_header("Access-Control-Allow-Origin", "*")
+                self._send_cors_origin()
                 self._send_session_headers(minted_session)
                 self.end_headers()
                 if body:
@@ -505,7 +551,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(202)
                 self.send_header("Content-Length", "0")
 
-            self.send_header("Access-Control-Allow-Origin", "*")
+            self._send_cors_origin()
             self._send_session_headers(minted_session)
             self.end_headers()
             if body:
@@ -514,12 +560,24 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         except Exception as e:
             print("Error handling POST: {}".format(e))
             traceback.print_exc()
-            self.send_error(500, str(e))
+            # A JSON-RPC caller gets a JSON-RPC error. `send_error` writes an
+            # HTML page, which is not something a JSON-RPC client -- or the
+            # proxy in front of it -- can interpret; the same reasoning as the
+            # parse-error path above, which is where that lesson came from.
+            try:
+                self._send_json({
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32603,
+                              "message": "Internal error: {}".format(e)},
+                }, status=500)
+            except Exception:  # pragma: no cover - client already gone
+                pass
 
     def _handle_direct_tool_call(self, tool_name, arguments):
         """Handle direct REST-style tool call (OpenAPI compatible)."""
         if tool_name not in self.server_instance._tools:
-            self.send_error(404, "Tool not found: {}".format(tool_name))
+            self._send_json_error(
+                404, "Tool not found: {}".format(tool_name))
             return
 
         # The body must be a JSON object whose keys are the tool's
@@ -531,6 +589,27 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return
 
         handler = self.server_instance._tools[tool_name]["handler"]
+
+        # The same validation `tools/call` does, for the same reasons. This
+        # endpoint published the tool's `inputSchema` as its request-body
+        # schema in /openapi.json and then enforced none of it: a bad argument
+        # reached the handler, raised a Python TypeError, and came back as
+        # `{"error": "add() got an unexpected keyword argument 'zzz'"}` — the
+        # handler's signature, to any caller.
+        violation = self.server_instance._input_schema_violation(
+            tool_name, arguments)
+        if violation:
+            self._send_json_error(
+                400, "Invalid arguments for tool {}: {}".format(
+                    tool_name, violation))
+            return
+        unexpected = self.server_instance._unexpected_arguments(
+            handler, arguments)
+        if unexpected:
+            self._send_json_error(
+                400, "Unknown argument(s) for tool {}: {}".format(
+                    tool_name, ", ".join(unexpected)))
+            return
 
         # Direct REST has no SSE channel, so server-to-client requests
         # (elicit/sample/list_roots/progress) cannot work here. Refuse
@@ -588,7 +667,31 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # Methods the MCP endpoints answer. Sent as `Allow` on a 405, which
+    # RFC 9110 requires: "The origin server MUST generate an Allow header
+    # field in a 405 response."
+    _ALLOWED_METHODS = "GET, POST, DELETE, OPTIONS"
+
+    def _send_method_not_allowed(self, message):
+        """Refuse with 405 and the `Allow` header that status requires.
+
+        `send_error` cannot carry extra headers, so the response it wrote had
+        none — and this is the very status the transport spec's
+        backwards-compatibility probe reads.
+        """
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": None,
+            "error": {"code": -32600, "message": message},
+        }).encode("utf-8")
+        self.send_response(405)
+        self.send_header("Allow", self._ALLOWED_METHODS)
+        self._send_cors_origin()
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -613,7 +716,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             # than losing the whole error response to a serialize bug.
             error_body = json.dumps({"error": message}).encode("utf-8")
         self.send_response(status)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(error_body)))
         self.end_headers()
@@ -642,8 +745,12 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             # the transport spec's backwards-compatibility probe reads a
             # 4xx on POST as "this is the legacy HTTP+SSE server" and
             # downgrades, rather than fixing its Accept header.
-            self.send_error(
-                406, "subscriptions/listen is answered with text/event-stream")
+            self._send_json({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600,
+                          "message": "subscriptions/listen is answered with "
+                                     "text/event-stream"},
+            }, status=406)
             return
 
         owned = not session_id
@@ -659,11 +766,15 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             # JSON — opening an empty stream would leave the client waiting
             # forever for notifications it was never subscribed to.
             refusal = self.server_instance._handle_request(
-                request, session_id=stream_id, headers=self.headers)
+                request, session_id=stream_id, headers=self.headers,
+                stream=client_queue)
         except Exception:
             traceback.print_exc()
             self.server_instance._unregister_client(stream_id, client_queue)
-            self.send_error(500, "subscriptions/listen failed")
+            self._send_json({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32603, "message": "subscriptions/listen failed"},
+            }, status=500)
             return
 
         if refusal is not None:
@@ -678,7 +789,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         # 2026-07-28 removed sessions and this header, and a caller speaking
         # it correlates by the stream itself. Only a handshake-era client
         # that arrived without a session is told the id we minted.
@@ -716,8 +827,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     def _handle_streamable_http_get(self):
         """Handle Streamable HTTP GET - returns SSE stream for async responses."""
         if not self._accepts_event_stream():
-            self.send_error(
-                405, "This endpoint answers GET with text/event-stream only")
+            self._send_method_not_allowed(
+                "This endpoint answers GET with text/event-stream only")
             return
         if self._reject_unknown_session():
             return
@@ -727,7 +838,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "keep-alive")
         self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         self.send_header("Mcp-Session-Id", session_id)
         self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
         self.end_headers()
@@ -826,7 +937,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         body = json.dumps(openapi).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -854,7 +965,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         body = json.dumps(discovery).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -872,7 +983,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return
         path_only = self._strip_prefix().split("?")[0]
         if path_only.rstrip("/") not in ("/mcp", "/sse", ""):
-            self.send_error(404, "No endpoint at {}".format(path_only))
+            self._send_json({
+                "jsonrpc": "2.0", "id": None,
+                "error": {"code": -32601, "message": "No endpoint at {}".format(path_only)},
+            }, status=404)
             return
 
         session_id = self._session_id()
@@ -892,13 +1006,13 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             return
 
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_origin()
         self.send_header("Access-Control-Allow-Methods",
                          "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers",

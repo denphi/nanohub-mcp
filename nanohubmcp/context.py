@@ -8,12 +8,19 @@ from __future__ import print_function
 
 import threading
 import traceback
+from collections import deque
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from .types import InputRequired
 
 if TYPE_CHECKING:
     from .server import MCPServer
+
+
+# How many log lines one request's context keeps. The buffer is a debugging
+# convenience read by `get_log_messages()`; it is not the operator's log
+# (that is the console) and nothing downstream needs the whole history.
+MAX_BUFFERED_LOG_MESSAGES = 1000
 
 
 class Context(object):
@@ -52,7 +59,11 @@ class Context(object):
         self._meta = meta or {}
         self._progress_token = progress_token
         self._job_id = job_id
-        self._log_messages = []  # type: List[Dict[str, Any]]
+        # Bounded: an async tool that logs per iteration ran for as long as
+        # the job did, and this list grew for all of it while nothing but
+        # `get_log_messages()` ever read it. The newest entries are the ones
+        # worth keeping.
+        self._log_messages = deque(maxlen=MAX_BUFFERED_LOG_MESSAGES)  # type: Any
         # Standalone fallback so is_cancelled()/cancel_event stay usable in
         # sync tools and in unit tests that build a Context by hand.
         self._detached_cancel_event = threading.Event()
@@ -278,14 +289,7 @@ class Context(object):
         request that did not carry one. So the console line is unconditional
         (it is the operator's log) while the notification is not.
         """
-        log_entry = {
-            "level": level,
-            "message": message,
-            "data": data
-        }
-        self._log_messages.append(log_entry)
-        # Also print to console
-        print("[{}] {}".format(level.upper(), message))
+        self._record(level, message, data)
 
         requested = self._requested_log_level()
         if requested is None or self._server is None:
@@ -307,6 +311,20 @@ class Context(object):
             "method": "notifications/message",
             "params": params,
         }, session_id=self._session_id)
+
+    def _record(self, level, message, data):
+        # type: (str, str, Dict[str, Any]) -> None
+        """Keep a log line for this request, and put it on the console.
+
+        The operator's log, which is unconditional. Whether the *client* also
+        hears about it is `_log`'s decision.
+        """
+        self._log_messages.append({
+            "level": level,
+            "message": message,
+            "data": data,
+        })
+        print("[{}] {}".format(level.upper(), message))
 
     def _requested_log_level(self):
         # type: () -> Optional[str]
@@ -336,8 +354,11 @@ class Context(object):
 
     def get_log_messages(self):
         # type: () -> List[Dict[str, Any]]
-        """Get all logged messages for this context."""
-        return self._log_messages
+        """Get the buffered log messages for this context.
+
+        At most ``MAX_BUFFERED_LOG_MESSAGES``, newest kept.
+        """
+        return list(self._log_messages)
 
     # ── Multi Round-Trip Requests (2026-07-28) ────────────────────────────
 
@@ -496,7 +517,13 @@ class Context(object):
         if message:
             progress_info["message"] = message
 
-        self.info("Progress: {}".format(progress_info))
+        # Recorded and printed, but deliberately *not* routed through
+        # `self.info`: that emitted a `notifications/message` beside the
+        # `notifications/progress` below, so every tick cost two notifications
+        # on the stream and a second entry in this context's log buffer. A
+        # progress report is already a notification; it does not need a log
+        # line about itself.
+        self._record("info", "Progress: {}".format(progress_info), {})
 
         # MCP spec: notifications/progress must carry the progressToken that
         # the client originally sent in the request's _meta.progressToken so
