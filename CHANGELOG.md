@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.5
+
+One fix, which the servers built on this library now depend on.
+
+### Fixed
+
+- **`instructions` never reached a client that uses `initialize`.**
+  `InitializeResult.instructions` is standard in every revision that has a
+  handshake, but it was only ever returned from `server/discover`, which exists
+  solely in 2026-07-28. So a server could pass `instructions=` and no
+  handshake-era client — which today is all of them — would ever see it.
+
+A server could already pass `instructions=`; nothing carried it to a client
+that speaks any revision with a handshake, which in practice is all of them.
+Servers whose procedural knowledge lives in SEP-2640 skills are invisible to a
+client that has not implemented the extension — it never calls `skills/list`,
+and the SEP keeps skill files out of `resources/list` — so `instructions` is
+the only channel that reaches it. `validate_server.py` in the build skill now
+requires one.
+
 ## 0.4.4
 
 A conformance audit of every revision this server advertises, against the
@@ -9,11 +29,6 @@ an older revision whose capability was advertised and then not backed, or a
 Streamable HTTP requirement the transport did not meet.
 
 ### Fixed
-- **`instructions` never reached a client that uses `initialize`.**
-  `InitializeResult.instructions` is standard in every revision that has a
-  handshake, but it was only ever returned from `server/discover`, which exists
-  solely in 2026-07-28. So a server could pass `instructions=` and no
-  handshake-era client — which today is all of them — would ever see it.
 
 
 - **`skills/get` and `resources/directory/read` rejected a gateway-prefixed
