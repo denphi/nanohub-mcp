@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.4
 
 A conformance audit of every revision this server advertises, against the
 published specifications and the machine-readable schemas that accompany
@@ -9,6 +9,7 @@ an older revision whose capability was advertised and then not backed, or a
 Streamable HTTP requirement the transport did not meet.
 
 ### Fixed
+
 - **`skills/get` and `resources/directory/read` rejected a gateway-prefixed
   URI.** `resources/read` recovered the real URI; these two looked theirs up
   raw, so a skill served through com_mcp — which prepends its own origin —
@@ -152,7 +153,6 @@ Streamable HTTP requirement the transport did not meet.
   said nothing — `skills/list` came back empty and the extension was never
   advertised. It now warns when the decorator is dropped unapplied, and
   `server.skill("name", directory)` registers outright.
-
 
 - **`resources.subscribe` was advertised with no method behind it.** Every
   revision before 2026-07-28 backs that capability with `resources/subscribe`
@@ -361,7 +361,7 @@ never published — but they were on `main`.
   clients, which is where those revisions put non-standard features.
   `capabilities.extensions` is still sent, so existing clients are unaffected.
 
-## 0.4.4
+### Originally in 0.4.4
 
 Completes the 2026-07-28 transport surface, fixes three header-validation
 bugs introduced with it in 0.4.0, and adds the SEP-2640 Skills Extension.
