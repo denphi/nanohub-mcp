@@ -2854,6 +2854,13 @@ class MCPServer(object):
             "serverInfo": ServerInfo(self.name, self.version).to_dict(),
             "capabilities": self._get_capabilities().to_dict(negotiated)
         }
+        if self.instructions:
+            # `InitializeResult.instructions` is standard in every revision
+            # that has an `initialize` at all. It was only ever returned from
+            # `server/discover`, which exists solely in 2026-07-28 -- so a
+            # server could set `instructions=` and no handshake-era client,
+            # which today is all of them, would ever see it.
+            result["instructions"] = self.instructions
         return result, None
 
     def _rpc_initialized(self, ctx):

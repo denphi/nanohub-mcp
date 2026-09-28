@@ -697,3 +697,32 @@ def test_skills_get_and_directory_read_accept_a_gateway_prefixed_uri(tmp_path):
     # A prefixed URI that names nothing is still refused.
     assert not ok("resources/directory/read", prefix + "skill://unit-conversion/nope")
     assert not ok("skills/get", prefix + "skill://other/SKILL.md")
+
+
+def test_initialize_carries_the_server_instructions():
+    """`InitializeResult.instructions` is standard in every revision that has
+    an `initialize`. It was only ever returned from `server/discover`, which
+    exists solely in 2026-07-28 — so a server could set `instructions=` and no
+    handshake-era client, which today is all of them, would ever see it.
+    """
+    server = MCPServer("guided", instructions="Create a workspace first.")
+
+    for revision in ("2024-11-05", "2025-06-18", "2025-11-25"):
+        result = server._handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": revision, "capabilities": {}}})["result"]
+        assert result["instructions"] == "Create a workspace first.", revision
+
+    # Still offered on the 2026-07-28 discovery method it was already on.
+    discover = server._handle_request(
+        {"jsonrpc": "2.0", "id": 2, "method": "server/discover",
+         "params": {"_meta": {"io.modelcontextprotocol/protocolVersion":
+                              "2026-07-28"}}},
+        headers={"Mcp-Method": "server/discover"})["result"]
+    assert discover["instructions"] == "Create a workspace first."
+
+    # A server that set none must not emit the key at all.
+    plain = MCPServer("plain")._handle_request(
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"protocolVersion": "2025-06-18", "capabilities": {}}})["result"]
+    assert "instructions" not in plain

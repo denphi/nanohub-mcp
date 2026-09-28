@@ -9,6 +9,12 @@ an older revision whose capability was advertised and then not backed, or a
 Streamable HTTP requirement the transport did not meet.
 
 ### Fixed
+- **`instructions` never reached a client that uses `initialize`.**
+  `InitializeResult.instructions` is standard in every revision that has a
+  handshake, but it was only ever returned from `server/discover`, which exists
+  solely in 2026-07-28. So a server could pass `instructions=` and no
+  handshake-era client — which today is all of them — would ever see it.
+
 
 - **`skills/get` and `resources/directory/read` rejected a gateway-prefixed
   URI.** `resources/read` recovered the real URI; these two looked theirs up
