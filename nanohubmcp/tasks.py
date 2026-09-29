@@ -99,9 +99,24 @@ def register_get_job_result(server):
         ),
         input_schema={
             "type": "object",
-            "properties": {"job_id": {"type": "string"}},
+            "properties": {"job_id": {
+                "type": "string",
+                "description": ("The job_id an async tool returned when it "
+                                "started. Not a tool name and not a task id."),
+            }},
             "required": ["job_id"]
-        }
+        },
+        # Polling is the one call a host should never hesitate over: it reads a
+        # result and changes nothing, and a client may make it many times for
+        # one job. Unannotated, a cautious host treats every poll as it would a
+        # tool that might write something.
+        annotations={
+            "title": "Poll an async job",
+            "readOnlyHint": True,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
     )(get_job_result)
     server._register_tool_function(decorated)
 
