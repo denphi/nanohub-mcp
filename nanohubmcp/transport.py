@@ -596,6 +596,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         # reached the handler, raised a Python TypeError, and came back as
         # `{"error": "add() got an unexpected keyword argument 'zzz'"}` — the
         # handler's signature, to any caller.
+        # Same null-means-absent normalisation tools/call does, so the two
+        # entry points cannot disagree about whether a call is valid.
+        arguments = self.server_instance._drop_null_optionals(
+            tool_name, arguments)
         violation = self.server_instance._input_schema_violation(
             tool_name, arguments)
         if violation:

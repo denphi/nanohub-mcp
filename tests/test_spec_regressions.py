@@ -726,3 +726,63 @@ def test_initialize_carries_the_server_instructions():
         {"jsonrpc": "2.0", "id": 1, "method": "initialize",
          "params": {"protocolVersion": "2025-06-18", "capabilities": {}}})["result"]
     assert "instructions" not in plain
+
+
+def test_an_explicit_null_reads_as_an_omitted_optional_argument():
+    """Models and UI layers send `null` for "I have no value for this".
+
+    Strictly it is invalid -- `{"type": "string"}` does not admit null -- so
+    the call was refused with -32602 and the user was told
+    "arguments.label should be string, got NoneType" about a field they had
+    simply left blank. The key is dropped rather than coerced, so the
+    handler's own default applies, which is what absence means.
+    """
+    server = MCPServer("nulls")
+
+    @server.tool()
+    def start(tool_name, label="untitled"):
+        """Start something.
+
+        Args:
+            tool_name: which tool.
+            label: a name for the run.
+        """
+        return {"tool_name": tool_name, "label": label}
+
+    @server.tool(input_schema={
+        "type": "object",
+        "properties": {"clear": {"type": ["string", "null"]},
+                       "name": {"type": "string"}},
+        "required": ["name"]})
+    def nullable(name, clear="unset"):
+        """Takes an argument that is genuinely nullable.
+
+        Args:
+            name: required.
+            clear: null means clear it.
+        """
+        return {"name": name, "clear": clear}
+
+    def call(tool, arguments):
+        return server._handle_request(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": tool, "arguments": arguments}})
+
+    # The reported failure: an optional string sent as null.
+    reply = call("start", {"tool_name": "pntoy", "label": None})
+    assert "error" not in reply, reply
+    assert reply["result"]["structuredContent"]["label"] == "untitled"
+
+    # Absent and null now agree, which is the whole point.
+    assert (call("start", {"tool_name": "pntoy"})["result"]["structuredContent"]
+            == reply["result"]["structuredContent"])
+
+    # A property that asked for null keeps it: the tool wanted that value.
+    kept = call("nullable", {"name": "x", "clear": None})
+    assert "error" not in kept, kept
+    assert kept["result"]["structuredContent"]["clear"] is None
+
+    # An argument the tool does not declare is still named, not swallowed.
+    unknown = call("start", {"tool_name": "pntoy", "nope": None})
+    assert unknown["error"]["code"] == -32602
+    assert "nope" in unknown["error"]["message"]

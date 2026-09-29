@@ -821,6 +821,53 @@ class MCPServer(object):
                 if isinstance(spec, dict) and spec.get("required")
                 and spec.get("name") not in arguments]
 
+    def _drop_null_optionals(self, tool_name, arguments):
+        # type: (Any, Dict[str, Any]) -> Dict[str, Any]
+        """Treat an explicit `null` as "not supplied", for optional arguments.
+
+        Models emit `null` for "I have no value for this" constantly, and so do
+        UI layers that serialise an empty form field. Strictly they are wrong:
+        `{"type": "string"}` does not admit null, so the call was refused with
+        -32602 and the user saw "arguments.label should be string, got
+        NoneType" for an argument they had simply not filled in. Reported from
+        the nanoHUB chat client, which now strips nulls before sending -- a
+        workaround every other client would have to write too.
+
+        Dropping the key rather than coercing it is what makes this safe: the
+        handler's own default then applies, which is exactly what absence
+        means. Three cases are deliberately left alone:
+
+          * a `required` argument -- absence is a real error, and silently
+            turning it into one about a missing property would be no clearer;
+          * a property whose declared type includes "null", where null is a
+            value the tool asked for and means something;
+          * an argument the schema does not declare, so the "unknown argument"
+            error still names it instead of the call quietly losing it.
+        """
+        if not arguments or not any(value is None for value in arguments.values()):
+            return arguments
+        entry = self._tools.get(tool_name) or {}
+        definition = entry.get("definition")
+        schema = getattr(definition, "inputSchema", None)
+        if not isinstance(schema, dict):
+            return arguments
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            return arguments
+        required = schema.get("required")
+        required = set(required) if isinstance(required, (list, tuple)) else set()
+
+        cleaned = {}
+        for key, value in arguments.items():
+            if value is None and key in properties and key not in required:
+                declared = (properties.get(key) or {}).get("type")
+                if isinstance(declared, str):
+                    declared = [declared]
+                if not (isinstance(declared, list) and "null" in declared):
+                    continue
+            cleaned[key] = value
+        return cleaned
+
     def _input_schema_violation(self, tool_name, arguments):
         # type: (Any, Dict[str, Any]) -> Optional[str]
         """Check a call's arguments against the tool's published inputSchema.
@@ -3038,6 +3085,8 @@ class MCPServer(object):
         # `in` test before the validation below ever runs.
         tool_entry = (self._tools.get(tool_name)
                       if isinstance(tool_name, str) else None)
+        if tool_entry is not None and isinstance(arguments, dict):
+            arguments = self._drop_null_optionals(tool_name, arguments)
         bad_arguments = (
             self._input_schema_violation(tool_name, arguments)
             if tool_entry is not None and isinstance(arguments, dict) else None)

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.6
+
+One fix, from a report by a client driving a deployed server: a call refused
+for a reason the person on the other end could not act on.
+
+### Fixed
+
+- **An explicit `null` was refused where an omitted argument was accepted.**
+  Models emit `null` for "I have no value for this" constantly, and so does any
+  UI layer that serialises an empty form field. Strictly they are wrong --
+  `{"type": "string"}` does not admit null -- so the call came back -32602 and
+  the user was told `arguments.label should be string, got NoneType` about a
+  field they had simply left blank. An optional argument sent as `null` is now
+  read as absent, so the handler's own default applies.
+
+  Three cases are deliberately unchanged: a `required` argument, a property
+  whose declared type includes `"null"` (the tool asked for that value, so it
+  means something), and an argument the schema never declared (which still
+  earns the "unknown argument" error rather than being quietly dropped).
+  `tools/call` and the REST endpoint share the normalisation, so they cannot
+  disagree about whether a call is valid.
+
 ## 0.4.5
 
 One fix, which the servers built on this library now depend on.
