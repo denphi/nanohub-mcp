@@ -13,6 +13,7 @@ module named ``http`` inside this package shadows the standard library's
 
 from __future__ import print_function
 
+import gzip
 import json
 import threading
 import traceback
@@ -150,12 +151,72 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Mcp-Session-Id", minted_session)
         self.send_header("Access-Control-Expose-Headers", "Mcp-Session-Id")
 
+    # Below this, gzip's own header costs more than it saves and the CPU is
+    # spent for nothing. Above it the win is large: an MCP App is one
+    # self-contained HTML document -- a conformant host gives the frame an
+    # empty CSP, so nothing can be fetched and everything is inlined -- and
+    # rappturemcp's catalog shell is 5.95 MB of mostly plotly, which gzip
+    # takes to 1.72 MB. tools/list for a large server compresses similarly.
+    _GZIP_MIN_BYTES = 1400
+
+    def _accepts_gzip(self):
+        """True when the client said it can decode gzip.
+
+        Absent header means no. HTTP lets `gzip;q=0` mean "explicitly not
+        gzip", so a zero quality is honoured rather than pattern-matched past.
+        """
+        header = self.headers.get("Accept-Encoding") or ""
+        for item in header.split(","):
+            parts = item.strip().split(";")
+            if parts[0].strip().lower() not in ("gzip", "*"):
+                continue
+            for parameter in parts[1:]:
+                name, _, value = parameter.partition("=")
+                if name.strip().lower() == "q":
+                    try:
+                        if float(value.strip()) == 0:
+                            return False
+                    except ValueError:
+                        pass
+            return True
+        return False
+
+    def _maybe_gzip(self, body):
+        """Return (body, encoding_or_None), compressing only when it pays.
+
+        Discrete responses only. An SSE stream must never be routed through
+        here: gzip buffers, and buffering a stream defeats the point of
+        streaming it -- events would arrive in blocks, or not until the
+        response ended.
+        """
+        if len(body) < self._GZIP_MIN_BYTES or not self._accepts_gzip():
+            return body, None
+        try:
+            packed = gzip.compress(body, 6)
+        except Exception:
+            return body, None
+        if len(packed) >= len(body):
+            return body, None          # already-compressed payload; leave it
+        return packed, "gzip"
+
+    def _json_body_headers(self, body):
+        """Emit Content-Type/Encoding/Length for `body`; return what to write.
+
+        Call after send_response and before end_headers. Returns the bytes to
+        write, which are the compressed ones when compression was negotiated.
+        """
+        body, encoding = self._maybe_gzip(body)
+        self.send_header("Content-Type", "application/json")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+            self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Content-Length", str(len(body)))
+        return body
+
     def _send_json(self, payload, status=200):
-        body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self._send_cors_origin()
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        body = self._json_body_headers(json.dumps(payload).encode("utf-8"))
         self.end_headers()
         self.wfile.write(body)
 
@@ -511,11 +572,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 # both, and left clients listening on both channels to
                 # dedupe by id.
                 if response:
-                    body = json.dumps(response).encode("utf-8")
                     self.send_response(
                         self.server_instance._http_status_for(response))
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", str(len(body)))
+                    body = self._json_body_headers(
+                        json.dumps(response).encode("utf-8"))
                 else:
                     # A notification or response was accepted. The spec
                     # asks for 202 *with no body*, so send none.
@@ -541,11 +601,10 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
             if response:
                 self.server_instance._broadcast(response, session_id=session_id)
-                body = json.dumps(response).encode("utf-8")
                 self.send_response(
                     self.server_instance._http_status_for(response))
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
+                body = self._json_body_headers(
+                    json.dumps(response).encode("utf-8"))
             else:
                 body = b""
                 self.send_response(202)
@@ -672,8 +731,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self._send_cors_origin()
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        body = self._json_body_headers(body)
         self.end_headers()
         self.wfile.write(body)
 

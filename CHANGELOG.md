@@ -2,8 +2,27 @@
 
 ## 0.4.6
 
-One fix, from a report by a client driving a deployed server: a call refused
-for a reason the person on the other end could not act on.
+Two fixes, both from a report by a client driving a deployed server.
+
+### Added
+
+- **Responses are gzipped when the client asks for it.** The transport never
+  offered `Content-Encoding` at all, so every response crossed the wire in
+  full. That is invisible on a small reply and expensive on a large one: an
+  MCP App is a single self-contained document -- a conformant host gives the
+  frame an empty CSP, so nothing can be fetched and every library is inlined
+  -- and one deployed catalog shell measures 5.95 MB, of which 4.6 MB is
+  plotly. Gzip takes that to 1.72 MB, and a large `tools/list` compresses
+  similarly.
+
+  Negotiated, never assumed: `Accept-Encoding` must offer gzip (a wildcard
+  counts, an explicit `q=0` does not), and bodies under 1400 bytes are left
+  alone because the header costs more than the saving. `Vary:
+  Accept-Encoding` goes out with every compressed reply so an intermediate
+  cache cannot serve gzip to a client that cannot read it.
+
+  **SSE streams are never compressed.** gzip buffers, and buffering a stream
+  defeats the point of streaming it.
 
 ### Fixed
 

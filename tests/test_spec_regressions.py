@@ -9,6 +9,7 @@ spec asks for.
 
 from __future__ import print_function
 
+import json
 import os
 import sys
 
@@ -16,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nanohubmcp import MCPServer  # noqa: E402
 from nanohubmcp.server import _SSEQueue  # noqa: E402
+from nanohubmcp.transport import MCPRequestHandler  # noqa: E402
 
 
 def _methods(queue):
@@ -786,3 +788,43 @@ def test_an_explicit_null_reads_as_an_omitted_optional_argument():
     unknown = call("start", {"tool_name": "pntoy", "nope": None})
     assert unknown["error"]["code"] == -32602
     assert "nope" in unknown["error"]["message"]
+
+
+def test_a_large_response_is_compressed_only_when_the_client_asked():
+    """An MCP App is one self-contained document, and it can be megabytes.
+
+    A conformant host gives the app frame an empty CSP, so nothing can be
+    fetched and every library is inlined -- rappturemcp's catalog shell is
+    5.95 MB, of which 4.6 MB is plotly. None of it was compressed, on a
+    transport that never offered Content-Encoding at all, so every read of it
+    crossed the proxy in full.
+    """
+    import gzip as _gzip
+
+    class _Fake(object):
+        """Just enough of the handler to exercise content negotiation."""
+
+        _GZIP_MIN_BYTES = MCPRequestHandler._GZIP_MIN_BYTES
+        _accepts_gzip = MCPRequestHandler._accepts_gzip
+        _maybe_gzip = MCPRequestHandler._maybe_gzip
+
+        def __init__(self, accept_encoding):
+            self.headers = {} if accept_encoding is None else {
+                "Accept-Encoding": accept_encoding}
+
+    big = json.dumps({"rows": ["lorem ipsum " * 12] * 400}).encode("utf-8")
+    small = b'{"ok":true}'
+
+    body, encoding = _Fake("gzip")._maybe_gzip(big)
+    assert encoding == "gzip"
+    assert len(body) < len(big) / 4
+    assert _gzip.decompress(body) == big
+
+    # A wildcard accepts it; silence, `identity`, and an explicit q=0 do not.
+    assert _Fake("*")._maybe_gzip(big)[1] == "gzip"
+    assert _Fake(None)._maybe_gzip(big)[1] is None
+    assert _Fake("identity")._maybe_gzip(big)[1] is None
+    assert _Fake("gzip;q=0")._maybe_gzip(big)[1] is None
+
+    # Below the threshold the header costs more than the saving.
+    assert _Fake("gzip")._maybe_gzip(small) == (small, None)
