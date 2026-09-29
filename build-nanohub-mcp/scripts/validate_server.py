@@ -137,33 +137,46 @@ def _calls_subprocess(source):
     return False
 
 
-def _body_with_local_helpers(handler, source):
+def _body_with_local_helpers(handler, source, depth=2):
     """`source` plus the source of the module-level helpers it calls.
 
     A tool that confines a path usually does it in a helper -- that is the
     shape worth encouraging -- so searching only the tool body reports every
-    careful implementation as careless. One level deep is enough to see the
-    helper and cheap enough to run over a whole server.
+    careful implementation as careless.
+
+    Two levels, not one, because the helper is often itself a wrapper: padremcp
+    reads through `_load`, which calls `_confined`, which does the realpath
+    comparison. At one level the check saw `_load` and stopped, and reported
+    eight correctly confined tools as unprotected.
     """
-    text = [source]
     module = sys.modules.get(getattr(handler, "__module__", "") or "")
     if module is None:
         return source
-    try:
-        tree = ast.parse(textwrap.dedent(source))
-    except (SyntaxError, ValueError):
-        return source
+    text = [source]
     seen = set()
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
-            continue
-        name = node.func.id
-        if name in seen:
-            continue
-        seen.add(name)
-        helper = getattr(module, name, None)
-        if inspect.isfunction(helper):
-            text.append(_source_of(helper))
+    frontier = [source]
+    for _ in range(max(1, depth)):
+        names = []
+        for body in frontier:
+            try:
+                tree = ast.parse(textwrap.dedent(body))
+            except (SyntaxError, ValueError):
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    names.append(node.func.id)
+        frontier = []
+        for name in names:
+            if name in seen:
+                continue
+            seen.add(name)
+            helper = getattr(module, name, None)
+            if inspect.isfunction(helper):
+                body = _source_of(helper)
+                text.append(body)
+                frontier.append(body)
+        if not frontier:
+            break
     return "\n".join(text)
 
 
