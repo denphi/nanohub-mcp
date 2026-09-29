@@ -17,11 +17,13 @@ from __future__ import print_function
 
 import argparse
 import importlib.util
+import ast
 import inspect
 import json
 import os
 import re
 import sys
+import textwrap
 
 # Shared invariants (same module the live check_conformance.py uses, so a rule
 # can't drift between pre-deploy and post-deploy). It sits next to this script.
@@ -106,18 +108,74 @@ def check_schema(report, label, schema):
             report.error("{}: invalid JSON Schema: {}".format(label, exc))
 
 
+def _source_of(handler):
+    try:
+        return inspect.getsource(handler)
+    except (OSError, TypeError):
+        return ""
+
+
+def _calls_subprocess(source):
+    """True when the body really calls subprocess, not merely mentions it.
+
+    A substring test counts the word wherever it appears, including inside a
+    string a tool returns to explain itself -- one tool was flagged twice for
+    the sentence "Current runner uses blocking subprocess.run". Parsing means
+    only an actual call counts.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return "subprocess." in source      # unparseable: fall back to the old test
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            if func.value.id == "subprocess":
+                return True
+    return False
+
+
+def _body_with_local_helpers(handler, source):
+    """`source` plus the source of the module-level helpers it calls.
+
+    A tool that confines a path usually does it in a helper -- that is the
+    shape worth encouraging -- so searching only the tool body reports every
+    careful implementation as careless. One level deep is enough to see the
+    helper and cheap enough to run over a whole server.
+    """
+    text = [source]
+    module = sys.modules.get(getattr(handler, "__module__", "") or "")
+    if module is None:
+        return source
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except (SyntaxError, ValueError):
+        return source
+    seen = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+            continue
+        name = node.func.id
+        if name in seen:
+            continue
+        seen.add(name)
+        helper = getattr(module, name, None)
+        if inspect.isfunction(helper):
+            text.append(_source_of(helper))
+    return "\n".join(text)
+
+
 def check_security_hints(report, label, handler, schema):
     """Flag common hazards for human review; this is not a security proof."""
-    try:
-        source = inspect.getsource(handler)
-    except (OSError, TypeError):
-        source = ""
+    source = _source_of(handler)
     lowered = source.lower()
     if "shell=true" in lowered:
         report.error("{}: subprocess uses shell=True; pass argv and shell=False".format(label))
     if re.search(r"\b(eval|exec)\s*\(", source) or "os.system(" in source:
         report.error("{}: dynamic command execution found; remove eval/exec/os.system".format(label))
-    if "subprocess." in source:
+    if _calls_subprocess(source):
         if "shell=false" not in lowered:
             report.warn("{}: subprocess call lacks an explicit shell=False guard".format(label))
         if "timeout=" not in lowered:
@@ -132,9 +190,10 @@ def check_security_hints(report, label, handler, schema):
         if not any(word in doc for word in ("opaque", "confined", "confin", "handle")):
             report.warn("{}: path-like inputs {} need an opaque-handle/confinement contract".format(
                 label, ", ".join(path_like)))
-        if not any(word in lowered for word in (
+        reachable = _body_with_local_helpers(handler, source).lower()
+        if not any(word in reachable for word in (
                 "realpath", "commonpath", "resolve_run_handle", "_load_json",
-                "_run_file", "_lock_for")):
+                "_run_file", "_lock_for", "_safe_source_name")):
             report.warn("{}: path-like inputs have no visible confinement helper".format(label))
 
     for name, definition in properties.items():
