@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0
+## 0.4.7
 
 A new call, and a fix for a task that outlives its own retention window.
 
