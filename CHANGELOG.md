@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0
+
+A new call, and a fix for a task that outlives its own retention window.
+
+### Added
+
+- **`MCPServer.unregister_skill(skill_path)`.** A registered skill could not be
+  removed, and registering a changed version of the same path merged into the
+  old registration, so files deleted from the skill were still served. The new
+  call removes the skill, all of its files and its directory listings, and prunes
+  prefix directories it leaves empty. Withdraw a skill with it, or call it before
+  registering a new version. mcp4gem5's instructor-written project skills are
+  the first user.
+
+### Fixed
+
+- **A task that runs longer than its TTL keeps its result.** The one-hour
+  retention window ran from creation and covered running jobs too, so a job
+  still working at the hour was pruned, its worker raised `KeyError` writing
+  the result, and the client's `tasks/get` returned not-found. A job that is
+  still working is never pruned now. When it finishes, fails or is cancelled,
+  its window starts again from that moment. A worker whose record is gone
+  anyway drops the result quietly.
+
 ## 0.4.6
 
 Two fixes, both from a report by a client driving a deployed server.

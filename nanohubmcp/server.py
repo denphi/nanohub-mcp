@@ -463,6 +463,7 @@ class MCPServer(object):
                 return False
             job["status"] = "cancelled"
             job["lastUpdatedAt"] = self._utc_now()
+            _tasks.retain_from_now(job)
             event = job.get("cancel_event")
             if event is not None:
                 event.set()
@@ -1716,6 +1717,18 @@ class MCPServer(object):
             self._register_skill_directory(skill_path, directory)
             return None
         return _PendingSkill(self, skill_path)
+
+    def unregister_skill(self, skill_path):
+        # type: (str) -> bool
+        """
+        Remove a skill registered with :meth:`skill`, with all of its files.
+
+        Use it to withdraw a skill, or before registering a changed version of the
+        same path: re-registering merges into the old registration, so files that
+        were deleted would otherwise still be served. Empty prefix directories are
+        pruned. Returns False if the path was not registered.
+        """
+        return _skills.unregister_skill_directory(self, skill_path)
 
     def _register_skill_directory(self, skill_path, directory):
         # type: (str, Any) -> None

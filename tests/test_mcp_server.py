@@ -1284,6 +1284,61 @@ def test_expired_task_records_are_pruned():
     assert "old" not in s._jobs
 
 
+def test_running_job_outlives_its_retention_window():
+    """A job still working is not pruned at the TTL, and its result is kept once it ends."""
+    from nanohubmcp.server import MCPServer
+    from nanohubmcp import tasks
+
+    s = MCPServer("longjob")
+    release = threading.Event()
+
+    @s.async_tool()
+    def slow():
+        release.wait(5)
+        return "finished"
+
+    job_id = s._start_async_tool_job(s._tools["slow"]["handler"], 1, {})
+    with s._jobs_lock:
+        s._jobs[job_id]["expires_at"] = 0          # the hour has passed while it runs
+    tasks.prune_expired_jobs(s)
+    assert job_id in s._jobs
+    release.set()
+    deadline = time.time() + 5
+    while time.time() < deadline and s._jobs.get(job_id, {}).get("status") == "running":
+        time.sleep(0.01)
+    job = s._jobs[job_id]
+    assert job["status"] == "done"
+    assert job["expires_at"] > time.time() + 60    # retention counts from the end
+    tasks.prune_expired_jobs(s)
+    assert job_id in s._jobs
+
+
+def test_worker_tolerates_a_record_removed_while_it_ran():
+    """Finishing a job whose record is gone must not raise in the worker thread."""
+    from nanohubmcp.server import MCPServer
+
+    s = MCPServer("gone")
+    release = threading.Event()
+    errors = []
+
+    @s.async_tool()
+    def slow():
+        release.wait(5)
+        return "finished"
+
+    original = threading.excepthook
+    threading.excepthook = lambda args: errors.append(args.exc_type)
+    try:
+        job_id = s._start_async_tool_job(s._tools["slow"]["handler"], 1, {})
+        with s._jobs_lock:
+            s._jobs.pop(job_id)
+        release.set()
+        time.sleep(0.2)
+    finally:
+        threading.excepthook = original
+    assert errors == []
+
+
 def test_get_job_result_not_registered_without_async_tools():
     """Servers without any @async_tool must not advertise get_job_result."""
     from nanohubmcp.server import MCPServer

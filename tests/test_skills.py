@@ -345,3 +345,33 @@ def test_resources_directory_read_rejects_a_file_uri(tmp_path):
     error = _rpc(server, "resources/directory/read",
                 {"uri": "skill://git-workflow/SKILL.md"})["error"]
     assert error["code"] == -32602
+
+
+def _skills_rpc(server, method, params=None):
+    return server._handle_request({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}})
+
+
+def test_unregister_skill_removes_it_and_prunes_empty_prefixes(tmp_path):
+    server = MCPServer("t", instructions="x")
+    server.skill("projects/ece437/lab3", _write_skill(tmp_path / "a", "lab3", files={"notes.md": "n"}))
+    server.skill("projects/ece437/lab4", _write_skill(tmp_path / "b", "lab4"))
+    server.skill("projects/other/lab9", _write_skill(tmp_path / "c", "lab9"))
+
+    assert server.unregister_skill("projects/ece437/lab3") is True
+    assert "skill://projects/ece437/lab3/SKILL.md" not in server._skills
+    assert not any(u.startswith("skill://projects/ece437/lab3/") for u in server._skill_resources)
+    assert [c["name"] for c in server._skill_directories["skill://projects/ece437"]] == ["lab4"]
+
+    assert server.unregister_skill("projects/ece437/lab4") is True
+    assert "skill://projects/ece437" not in server._skill_directories
+    assert [c["name"] for c in server._skill_directories["skill://projects"]] == ["other"]
+    assert server.unregister_skill("projects/ece437/lab4") is False
+
+
+def test_reregistering_after_unregister_serves_only_the_new_files(tmp_path):
+    server = MCPServer("t", instructions="x")
+    server.skill("lab3", _write_skill(tmp_path / "v1", "lab3", files={"answers.md": "old"}))
+    server.unregister_skill("lab3")
+    server.skill("lab3", _write_skill(tmp_path / "v2", "lab3"))
+    assert "skill://lab3/answers.md" not in server._skill_resources
+    assert "skill://lab3/SKILL.md" in server._skills

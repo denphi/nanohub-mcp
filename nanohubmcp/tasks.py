@@ -36,6 +36,18 @@ MRTR_STATE_TTL_SECONDS = 10 * 60
 MCP_TASKS_EXTENSION_ID = "io.modelcontextprotocol/tasks"
 
 MCP_TASK_TTL_MS = 60 * 60 * 1000
+# Statuses in which a worker may still write the record; such a job is never pruned.
+_LIVE_STATUSES = ("running", "input_required")
+
+
+def retain_from_now(job):
+    # type: (Dict[str, Any]) -> None
+    """Start a job's retention window at the moment it reaches a terminal state.
+
+    The window used to run from creation, so a job working longer than the TTL
+    was pruned mid-run and its result lost the moment it finished.
+    """
+    job["expires_at"] = time.time() + job.get("ttlMs", MCP_TASK_TTL_MS) / 1000.0
 
 MCP_TASK_POLL_INTERVAL_MS = 1000
 
@@ -256,6 +268,19 @@ def start_async_tool_job(server, handler, msg_id, arguments, session_id=None,
 
     server_instance = server
 
+    def _finish(status, result):
+        # A record pruned or dropped while the job ran has nobody left to read it,
+        # and a cancelled one keeps its status: neither is written.
+        with server_instance._jobs_lock:
+            job = server_instance._jobs.get(job_id)
+            if job is None or job.get("status") == "cancelled":
+                return False
+            job["status"] = status
+            job["result"] = result
+            job["lastUpdatedAt"] = server_instance._utc_now()
+            retain_from_now(job)
+            return True
+
     def _run():
         try:
             call_result = server._call_handler(
@@ -278,35 +303,20 @@ def start_async_tool_job(server, handler, msg_id, arguments, session_id=None,
                         if len(items) == 1 and "text" in items[0]
                         else payload
                     )
-                    with server_instance._jobs_lock:
-                        if server_instance._jobs[job_id].get("status") == "cancelled":
-                            return
-                        server_instance._jobs[job_id]["status"] = "error"
-                        server_instance._jobs[job_id]["result"] = message
-                        server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
-                    # Outside the lock: notifying takes other locks.
-                    server_instance._notify_task_status(job_id)
+                    if _finish("error", message):
+                        # Outside the lock: notifying takes other locks.
+                        server_instance._notify_task_status(job_id)
                     return
                 result = payload
             elif isinstance(call_result, dict):
                 result = call_result
             else:
                 result = str(call_result)
-            with server_instance._jobs_lock:
-                if server_instance._jobs[job_id].get("status") == "cancelled":
-                    return
-                server_instance._jobs[job_id]["status"] = "done"
-                server_instance._jobs[job_id]["result"] = result
-                server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
-            server_instance._notify_task_status(job_id)
+            if _finish("done", result):
+                server_instance._notify_task_status(job_id)
         except Exception as e:
-            with server_instance._jobs_lock:
-                if server_instance._jobs[job_id].get("status") == "cancelled":
-                    return
-                server_instance._jobs[job_id]["status"] = "error"
-                server_instance._jobs[job_id]["result"] = str(e)
-                server_instance._jobs[job_id]["lastUpdatedAt"] = server_instance._utc_now()
-            server_instance._notify_task_status(job_id)
+            if _finish("error", str(e)):
+                server_instance._notify_task_status(job_id)
             traceback.print_exc()
 
     t = threading.Thread(target=_run)
@@ -552,6 +562,7 @@ def prune_expired_jobs(server):
         expired = [
             job_id for job_id, job in server._jobs.items()
             if job.get("expires_at") is not None and job.get("expires_at") <= now
+            and job.get("status") not in _LIVE_STATUSES
         ]
         for job_id in expired:
             server._jobs.pop(job_id, None)
@@ -687,6 +698,7 @@ def rpc_tasks_cancel(server, ctx):
                     "running", "input_required"):
                 job["status"] = "cancelled"
                 job["lastUpdatedAt"] = server._utc_now()
+                retain_from_now(job)
                 event = job.get("cancel_event")
                 if event is not None:
                     event.set()

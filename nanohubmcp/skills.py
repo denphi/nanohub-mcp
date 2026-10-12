@@ -497,6 +497,40 @@ def register_skill_directory(server, skill_path, directory):
                 merged.values(), key=lambda c: c["name"])
 
 
+def unregister_skill_directory(server, skill_path):
+    # type: (Any, str) -> bool
+    """Remove a registered skill: its entry, every file, and its directory listings.
+
+    The inverse of register_skill_directory. Prefix directories that hold nothing else
+    afterwards (``acme/billing`` once its last skill is gone) are removed too, and the
+    skill disappears from its parent's listing. Returns False if no such skill was
+    registered. The extension defines no list_changed notification, so hosts that
+    already listed the skill see it gone at their next listing.
+    """
+    skill_path = skill_path.strip("/")
+    root_uri = "{}://{}".format(SKILL_URI_SCHEME, skill_path)
+    with server._registry_lock:
+        if server._skills.pop(root_uri + "/SKILL.md", None) is None:
+            return False
+        for uri in [u for u in server._skill_resources if u.startswith(root_uri + "/")]:
+            del server._skill_resources[uri]
+        for uri in [u for u in server._skill_directories
+                    if u == root_uri or u.startswith(root_uri + "/")]:
+            del server._skill_directories[uri]
+        node = root_uri
+        while True:
+            parent, _, name = node.rpartition("/")
+            if parent.endswith(":/"):          # above the first path segment
+                break
+            children = [c for c in server._skill_directories.get(parent, []) if c["name"] != name]
+            if children:
+                server._skill_directories[parent] = children
+                break
+            server._skill_directories.pop(parent, None)
+            node = parent
+    return True
+
+
 def rpc_skills_list(server, ctx):
     # type: (_RequestContext) -> tuple
     """Handle the JSON-RPC `skills/list` method."""
